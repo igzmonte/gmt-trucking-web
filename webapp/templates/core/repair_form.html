@@ -1,0 +1,10 @@
+{% extends "base.html" %}{% load static %}{% block content %}
+<form method="post" class="maintenance-form" data-repair-form>{% csrf_token %}{{ form.non_field_errors }}
+  <div class="maintenance-grid">
+    <section class="panel"><h3>Repair Overview</h3>{% for field in form %}{% if field.name == 'repair_date' or field.name == 'asset' or field.name == 'repair_description' or field.name == 'meter_value' or field.name == 'supplier' or field.name == 'status' %}<div class="maintenance-field{% if field.errors %} has-error{% endif %}">{{ field.label_tag }}{{ field }}{{ field.errors }}</div>{% endif %}{% endfor %}</section>
+    <section class="panel"><h3>Cost Breakdown</h3>{% for field in form %}{% if field.name == 'parts_cost' or field.name == 'labor_cost' or field.name == 'other_cost' or field.name == 'total_cost' %}<div class="maintenance-field{% if field.errors %} has-error{% endif %}">{{ field.label_tag }}{{ field }}{{ field.errors }}</div>{% endif %}{% endfor %}<p class="helper-guidance">Total cost is calculated from parts, labor, and other cost.</p></section>
+    <section class="panel maintenance-notes"><h3>Notes &amp; Payable</h3><div class="maintenance-field">{{ form.notes.label_tag }}{{ form.notes }}{{ form.notes.errors }}</div><label class="check-field">{{ form.auto_generate_payable }} <span>{{ form.auto_generate_payable.label }}</span></label><p class="helper-guidance">When enabled, one payable snapshot is created. Later repair edits do not overwrite it.</p>{% if repair.generated_payable %}<p class="linked-record">Linked payable: <a href="{% url 'payables_detail' repair.generated_payable.pk %}">{{ repair.generated_payable.reference_no }}</a></p>{% endif %}</section>
+  </div>
+  <div class="maintenance-actions"><a class="button secondary" href="{% if repair %}{% url 'repairs_detail' repair.pk %}{% else %}{% url 'repairs_list' %}{% endif %}">Cancel</a><button type="submit">Save Repair</button></div>
+</form><script src="{% static 'repair-form.js' %}" defer></script>
+{% endblock %}

@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="detail-toolbar">
+  <a class="button secondary" href="{% url 'payroll_list' %}">&larr; Payroll List</a>
+  <a class="button" href="{% url 'payroll_print' entry.pk %}" target="_blank">Printable Payroll</a>
+</div>
+<section class="panel detail-hero">
+  <div>
+    <span class="dialog-kicker">Payroll #{{ entry.pk }}</span>
+    <h3>{{ entry.employee }}</h3>
+    <p>{{ entry.period_from }} &ndash; {{ entry.period_to }} &middot; Paid {{ entry.pay_date }}</p>
+  </div>
+  <span class="status detail-status">&#8369; {{ entry.net_pay }}</span>
+</section>
+<div class="detail-grid">
+  <section class="panel">
+    <h3>Payroll Summary</h3>
+    <dl class="detail-list">
+      <dt>Employee Type</dt><dd>{{ entry.employee_type }}</dd>
+      <dt>Payroll Basis</dt><dd>{{ entry.payroll_basis }}</dd>
+      <dt>Work Description</dt><dd>{{ entry.unit_description }}</dd>
+      <dt>Trips</dt><dd>{{ entry.trips_count }}</dd>
+      <dt>Days</dt><dd>{{ entry.days_count }}</dd>
+    </dl>
+  </section>
+  <section class="panel">
+    <h3>Earnings</h3>
+    <dl class="detail-list">
+      <dt>Gross Pay</dt><dd>&#8369; {{ entry.gross_pay }}</dd>
+      <dt>Additional Pay</dt><dd>&#8369; {{ entry.additional_pay }}</dd>
+      <dt class="detail-total">Earnings Total</dt><dd class="detail-total">&#8369; {{ entry.gross_pay|add:entry.additional_pay }}</dd>
+    </dl>
+    {% for line in entry.additional_lines.all %}
+      <div class="detail-pay-row"><span>{{ line.label }} <small>{{ line.employee_type }}</small></span><strong>&#8369; {{ line.amount }}</strong></div>
+    {% endfor %}
+  </section>
+  <section class="panel">
+    <h3>Deductions</h3>
+    <dl class="detail-list">
+      {% for label,amount in deductions %}<dt>{{ label }}</dt><dd>&#8369; {{ amount }}</dd>{% endfor %}
+      <dt class="detail-total">Total Deductions</dt><dd class="detail-total">&#8369; {{ total_deductions }}</dd>
+    </dl>
+  </section>
+  <section class="panel">
+    <h3>Net Pay</h3>
+    <p class="detail-net-pay">&#8369; {{ entry.net_pay }}</p>
+    {% if entry.remarks %}<h4>Remarks</h4><p>{{ entry.remarks|linebreaksbr }}</p>{% endif %}
+  </section>
+</div>
+<section class="panel detail-notes">
+  <h3>Claimed Trips</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Date</th><th>Trip Ticket / Waybill</th><th>Route</th><th>Unit</th><th>Amount</th></tr></thead>
+      <tbody>
+        {% for row in trip_rows %}
+          <tr>
+            <td>{{ row.trip.trip_date }}</td>
+            <td><a href="{% url 'trips_detail' row.trip.pk %}">{{ row.trip.trip_ticket_no }}</a></td>
+            <td>{{ row.trip.origin }} &rarr; {{ row.trip.destination }}</td>
+            <td>{{ row.trip.asset|default:"" }}</td>
+            <td class="num">&#8369; {{ row.amount }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5">No trip claims for this Per-Day or Manual payroll.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% if can_edit_page %}
+  <section class="detail-danger">
+    <form method="post" action="{% url 'payroll_delete' entry.pk %}">
+      {% csrf_token %}
+      <button class="danger-button" onclick="return confirm('Delete this payroll? Claimed trips will be released and advance deductions restored.')">Delete and Reverse Payroll</button>
+    </form>
+  </section>
+{% endif %}
+{% endblock %}

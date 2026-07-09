@@ -1,0 +1,24 @@
+{% extends "base.html" %}{% load accounting %}{% block content %}
+<section class="panel report-filter-panel">
+  <form method="get" class="report-filters">
+    <div><label for="{{ form.client.id_for_label }}">Client</label>{{ form.client }}{{ form.client.errors }}</div>
+    <div><label for="{{ form.mode.id_for_label }}">Mode</label>{{ form.mode }}</div>
+    <div><label for="{{ form.as_of_date.id_for_label }}">As of Date</label>{{ form.as_of_date }}{{ form.as_of_date.errors }}</div>
+    <div><label for="{{ form.date_from.id_for_label }}">Billing Date From</label>{{ form.date_from }}</div>
+    <div><label for="{{ form.date_to.id_for_label }}">Billing Date To</label>{{ form.date_to }}{{ form.date_to.errors }}</div>
+    <button type="submit">Generate SOA</button>
+    {% if soa %}<a class="button secondary" href="{% url 'billing_soa_print' %}?{{ request.GET.urlencode }}" target="_blank">Printable SOA</a><a class="button secondary" href="{% url 'billing_soa_export' %}?{{ request.GET.urlencode }}">Export CSV</a>{% endif %}
+  </form>
+</section>
+{% if soa %}
+<section class="report-heading">
+  <div><span class="dialog-kicker">Client Receivables</span><h3>Statement of Account</h3><p>{{ soa.client }} &middot; {{ soa.mode|title }} &middot; As of {{ soa.as_of_date }}</p></div>
+  <div class="report-count"><strong>{{ soa.rows|length }}</strong><span>row{{ soa.rows|length|pluralize }}</span></div>
+</section>
+<section class="panel report-table-panel">
+  <div class="table-scroll"><table class="report-table"><thead><tr><th>Billing No.</th><th>Billing Date</th><th>Billing Period</th><th class="num">Grand Total</th><th class="num">Payments</th><th class="num">Balance</th><th>Status</th></tr></thead><tbody>{% for row in soa.rows %}<tr><td><a href="{% url 'billing_detail' row.statement.pk %}">{{ row.billing_no }}</a></td><td>{{ row.billing_date }}</td><td>{{ row.period_from|default:"" }}{% if row.period_to %} to {{ row.period_to }}{% endif %}</td><td class="num">{{ row.grand_total|accounting }}</td><td class="num">{{ row.payments|accounting }}</td><td class="num">{{ row.balance|accounting }}</td><td>{{ row.status }}</td></tr>{% empty %}<tr><td colspan="7" class="report-empty">No billing statements match this Statement of Account.</td></tr>{% endfor %}</tbody>{% if soa.rows %}<tfoot><tr><td colspan="3">Totals</td><td class="num">{{ soa.total_billed|accounting }}</td><td class="num">{{ soa.total_payments|accounting }}</td><td class="num">{{ soa.total_balance|accounting }}</td><td></td></tr></tfoot>{% endif %}</table></div>
+</section>
+{% else %}
+<section class="panel empty-workspace"><p>Select a client and generate a Statement of Account.</p></section>
+{% endif %}
+{% endblock %}

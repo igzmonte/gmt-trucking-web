@@ -1,0 +1,41 @@
+name: Django verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEBUG: "true"
+      GMT_WEB_DB: /tmp/gmt-ci.sqlite3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-web.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-web.txt
+      - name: Check migrations and application
+        run: |
+          python webapp/manage.py check
+          python webapp/manage.py makemigrations --check --dry-run
+      - name: Run Django tests
+        run: python webapp/manage.py test core --verbosity 2
+      - name: Check production settings and static assets
+        env:
+          DEBUG: "false"
+          SECRET_KEY: ci-only-secret-key-with-at-least-fifty-characters-123456789
+          ALLOWED_HOSTS: example.onrender.com
+          CSRF_TRUSTED_ORIGINS: https://example.onrender.com
+        run: |
+          python webapp/manage.py check --deploy
+          python webapp/manage.py collectstatic --no-input

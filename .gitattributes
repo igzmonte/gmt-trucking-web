@@ -1,0 +1,9 @@
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
+# Characterization snapshots are byte-for-byte regression controls.
+tests/characterization/artifacts/** binary

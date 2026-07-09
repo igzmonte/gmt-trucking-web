@@ -1,0 +1,40 @@
+{% extends "base.html" %}{% block content %}
+<section class="panel">
+  <div class="toolbar">
+    <form method="get">
+      <input name="q" value="{{ query }}" placeholder="Search users">
+      <select name="role">
+        <option value="">All roles</option>
+        {% for value,label in role_choices %}<option value="{{ value }}"{% if selected_role == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+      <select name="active">
+        <option value="">All statuses</option>
+        <option value="active"{% if selected_active == "active" %} selected{% endif %}>Active</option>
+        <option value="inactive"{% if selected_active == "inactive" %} selected{% endif %}>Inactive</option>
+      </select>
+      <button>Search</button>
+    </form>
+    <div><a class="button" href="{% url 'users_new' %}">New User</a><a class="button secondary" href="{% url 'users_export' %}?q={{ query }}&role={{ selected_role }}&active={{ selected_active }}">Export CSV</a></div>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for row in page_obj %}
+          <tr>
+            <td>{{ row.username }}</td>
+            <td>{{ row.get_full_name|default:"—" }}</td>
+            <td>{{ row.email|default:"—" }}</td>
+            <td>{% if row.is_superuser %}admin{% else %}{{ row.groups.all.0.name|default:"—" }}{% endif %}</td>
+            <td><span class="status">{% if row.is_active %}Active{% else %}Inactive{% endif %}</span></td>
+            <td><a href="{% url 'users_edit' row.pk %}">Edit</a> <a href="{% url 'users_password' row.pk %}">Reset Password</a>{% if row.is_active %} <form class="inline" method="post" action="{% url 'users_deactivate' row.pk %}">{% csrf_token %}<button class="link danger" onclick="return confirm('Deactivate this user?')">Deactivate</button></form>{% endif %}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6">No users found.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pagination">{% if page_obj.has_previous %}<a href="?q={{ query }}&role={{ selected_role }}&active={{ selected_active }}&page={{ page_obj.previous_page_number }}">Previous</a>{% endif %}<span>Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a href="?q={{ query }}&role={{ selected_role }}&active={{ selected_active }}&page={{ page_obj.next_page_number }}">Next</a>{% endif %}</div>
+</section>
+{% endblock %}

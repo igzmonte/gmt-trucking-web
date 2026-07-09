@@ -1,0 +1,18 @@
+{% extends "base.html" %}{% block content %}
+<section class="panel">
+  <div class="toolbar">
+    <form method="get"><input name="q" value="{{ query }}" placeholder="Search trips"><select name="status"><option value="">All statuses</option>{% for value,label in status_choices %}<option value="{{ value }}"{% if selected_status == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select><button>Search</button></form>
+    <div>{% if can_edit_page %}<a class="button" href="{% url 'trips_new' %}">New Trip</a>{% endif %}<a class="button secondary" href="{% url 'trips_export' %}">Export CSV</a></div>
+  </div>
+  <div class="table-scroll"><table>
+    <thead><tr><th><a href="?sort=ticket">Trip Ticket / Waybill</a></th><th>Ref. No.</th><th><a href="?sort=date&dir=desc">Date</a></th><th><a href="?sort=client">Client</a></th><th>Route</th><th>Driver / Helpers</th><th>Unit</th><th><a href="?sort=status">Status</a></th><th>Base</th><th>Extra</th><th>Total</th><th>Actions</th></tr></thead>
+    <tbody>{% for row in page_obj %}<tr>
+      <td><a href="{% url 'trips_detail' row.pk %}">{{ row.trip_ticket_no }}</a></td><td>{{ row.reference_no|default:"—" }}</td><td>{{ row.trip_date }}</td><td>{{ row.client|default:"" }}</td><td>{{ row.origin }} &rarr; {{ row.destination }}</td>
+      <td>{{ row.driver|default:"" }}{% if row.helper_names %}<small class="cell-detail">{{ row.helper_names }}</small>{% endif %}</td><td>{{ row.asset|default:"" }}</td><td><span class="status">{{ row.status }}</span></td>
+      <td class="num">{{ row.base_trip_rate }}</td><td class="num">{{ row.extra_total }}</td><td class="num">{{ row.billable_total }}</td>
+      <td><a href="{% url 'trips_detail' row.pk %}">View</a> <a href="{% url 'trips_print' row.pk %}" target="_blank">Print</a>{% if can_edit_page %} <a href="{% url 'trips_edit' row.pk %}">Edit</a>{% endif %}</td>
+    </tr>{% empty %}<tr><td colspan="12">No trips found.</td></tr>{% endfor %}</tbody>
+  </table></div>
+  <div class="pagination">{% if page_obj.has_previous %}<a href="?q={{ query }}&status={{ selected_status }}&page={{ page_obj.previous_page_number }}">Previous</a>{% endif %}<span>Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a href="?q={{ query }}&status={{ selected_status }}&page={{ page_obj.next_page_number }}">Next</a>{% endif %}</div>
+</section>
+{% endblock %}

@@ -1,0 +1,58 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+
+# Python and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Local environments and downloaded dependencies
+.venv/
+venv/
+env/
+.web-deps/
+
+# Databases and sensitive migration material
+*.sqlite
+*.sqlite3
+*.db
+/data/
+/backup-files/
+**/*anonymization*map*
+/assets/
+
+# Legacy desktop reference (keep locally until migration parity is complete)
+/app.py
+/tests/
+/requirements-dev.txt
+/pytest.ini
+/scripts/GMT_TruckOps.spec
+/scripts/build_exe.bat
+/scripts/capture_characterization.py
+/scripts/run_app.bat
+/scripts/verify_characterization.py
+/webapp/core/management/commands/ensure_demo_data.py
+/docs/AI_WORKING_RULES.md
+/docs/PATCH_NOTES_COMPILED_v0.2.4_to_v0.2.30.txt
+/docs/README.md
+/docs/RELEASE_NOTES_*.txt
+/docs/migration/PHASE0_BASELINE.md
+
+# Generated or packaged output
+/artifacts/
+/output/
+webapp/staticfiles/
+*.7z
+*.zip
+*.pdf
+
+# Local scratch files
+webapp/write-test.tmp
+desktop.ini
+.DS_Store

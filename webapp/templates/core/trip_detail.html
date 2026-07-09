@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="detail-toolbar">
+  <a class="button secondary" href="{% url 'trips_list' %}">&larr; Trips List</a>
+  <div>
+    <a class="button secondary" href="{% url 'trips_print' trip.pk %}" target="_blank">Print Ticket</a>
+    {% if can_edit_page %}<a class="button" href="{% url 'trips_edit' trip.pk %}">Edit Details</a>{% endif %}
+  </div>
+</div>
+<section class="panel detail-hero">
+  <div>
+    <span class="dialog-kicker">{{ trip.trip_type }} &middot; Trip Ticket / Waybill</span>
+    <h3>{{ trip.trip_ticket_no }}</h3>
+    <p>{{ trip.client|default:"No client" }} &middot; {{ trip.trip_date }} &middot; Ref. No.: {{ trip.reference_no|default:"—" }}</p>
+  </div>
+  <span class="status detail-status">{{ trip.status }}</span>
+</section>
+<div class="detail-grid">
+  <section class="panel">
+    <h3>Route &amp; Schedule</h3>
+    <dl class="detail-list">
+      <dt>Item / Job</dt><dd>{{ trip.job_description|default:"—" }}</dd>
+      <dt>Origin</dt><dd>{{ trip.origin|default:"—" }}</dd>
+      <dt>Destination</dt><dd>{{ trip.destination|default:"—" }}</dd>
+      <dt>Dispatch</dt><dd>{{ trip.dispatch_time|default:"—" }}</dd>
+      <dt>Arrival</dt><dd>{{ trip.arrival_time|default:"—" }}</dd>
+      <dt>Recurring Master</dt><dd>{{ trip.recurring_master|default:"—" }}</dd>
+    </dl>
+  </section>
+  <section class="panel">
+    <h3>Unit &amp; Crew</h3>
+    <dl class="detail-list">
+      <dt>Asset</dt><dd>{{ trip.asset|default:"—" }}</dd>
+      <dt>Driver</dt><dd>{{ trip.driver|default:"—" }}</dd>
+      <dt>Helpers</dt><dd>{{ trip.helper_names|default:"None" }}</dd>
+      <dt>Driver Pay Rate</dt><dd>&#8369; {{ trip.driver_pay_rate }}</dd>
+      <dt>Helper Pay Pool</dt><dd>&#8369; {{ trip.helper_pay_rate }}</dd>
+    </dl>
+  </section>
+  <section class="panel">
+    <h3>Billing Breakdown</h3>
+    <dl class="detail-list">
+      <dt>Base Trip Rate</dt><dd>&#8369; {{ trip.base_trip_rate }}</dd>
+      {% for label,amount in extra_lines %}<dt>{{ label }}</dt><dd>&#8369; {{ amount }}</dd>{% endfor %}
+      <dt class="detail-total">Billable Total</dt><dd class="detail-total">&#8369; {{ trip.billable_total }}</dd>
+    </dl>
+  </section>
+  <section class="panel">
+    <h3>Employee Pay Items</h3>
+    {% for item in trip.employee_pay_items.all %}
+      <div class="detail-pay-row"><span>{{ item.label }} <small>{{ item.employee_type }}</small></span><strong>&#8369; {{ item.amount }}</strong></div>
+    {% empty %}
+      <p class="muted">No additional pay items.</p>
+    {% endfor %}
+  </section>
+</div>
+{% if trip.notes %}<section class="panel detail-notes"><h3>Notes</h3><p>{{ trip.notes|linebreaksbr }}</p></section>{% endif %}
+{% if can_edit_page %}
+  <section class="detail-danger">
+    <form method="post" action="{% url 'trips_delete' trip.pk %}">
+      {% csrf_token %}
+      <button class="danger-button" onclick="return confirm('Delete this trip? This cannot be undone.')">Delete Trip</button>
+    </form>
+  </section>
+{% endif %}
+{% endblock %}

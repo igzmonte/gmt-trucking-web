@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ trip.trip_ticket_no }}</title>
+  <style>
+    @page{size:A4 portrait;margin:12mm}
+    body{font:12px Arial,sans-serif;color:#111}
+    .header{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:14px;padding-bottom:8px}
+    h1{margin:0;font-size:22px}
+    table{width:100%;border-collapse:collapse;margin:10px 0}
+    td,th{border:1px solid #333;padding:6px;vertical-align:top}
+    .label{font-weight:bold;width:22%;background:#f3f3f3}
+    .num{text-align:right}
+    .signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:70px}
+    .signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}
+    @media print{button{display:none}}
+  </style>
+</head>
+<body>
+  <button onclick="window.print()">Print</button>
+  <div class="header">
+    <div><h1>GMT Trucking</h1><strong>Trip Ticket / Waybill</strong></div>
+    <div><strong>{{ trip.trip_ticket_no }}</strong><br>{{ trip.trip_date }}</div>
+  </div>
+  <table>
+    <tr><td class="label">Trip Ticket / Waybill</td><td>{{ trip.trip_ticket_no }}</td><td class="label">Ref. No.</td><td>{{ trip.reference_no|default:"—" }}</td></tr>
+    <tr><td class="label">Date</td><td>{{ trip.trip_date }}</td><td class="label">Type / Status</td><td>{{ trip.trip_type }} / {{ trip.status }}</td></tr>
+    <tr><td class="label">Client</td><td colspan="3">{{ trip.client|default:"" }}</td></tr>
+    <tr><td class="label">Item / Job</td><td colspan="3">{{ trip.job_description }}</td></tr>
+    <tr><td class="label">Origin</td><td>{{ trip.origin }}</td><td class="label">Destination</td><td>{{ trip.destination }}</td></tr>
+    <tr><td class="label">Unit</td><td>{{ trip.asset|default:"" }}</td><td class="label">Driver</td><td>{{ trip.driver|default:"" }}</td></tr>
+    <tr><td class="label">Helpers</td><td colspan="3">{{ trip.helper_names|default:"None" }}</td></tr>
+    <tr><td class="label">Dispatch</td><td>{{ trip.dispatch_time|default:"" }}</td><td class="label">Arrival</td><td>{{ trip.arrival_time|default:"" }}</td></tr>
+  </table>
+  <table>
+    <thead><tr><th>Charge</th><th class="num">Amount</th></tr></thead>
+    <tbody>
+      <tr><td>Base Trip Rate</td><td class="num">&#8369; {{ trip.base_trip_rate }}</td></tr>
+      {% for label,amount in extra_lines %}<tr><td>{{ label }}</td><td class="num">&#8369; {{ amount }}</td></tr>{% endfor %}
+      <tr><th>Total</th><th class="num">&#8369; {{ trip.billable_total }}</th></tr>
+    </tbody>
+  </table>
+  <table>
+    <thead><tr><th>Employee Pay Item</th><th>Type</th><th class="num">Amount</th></tr></thead>
+    <tbody>
+      {% for item in trip.employee_pay_items.all %}
+        <tr><td>{{ item.label }}</td><td>{{ item.employee_type }}</td><td class="num">&#8369; {{ item.amount }}</td></tr>
+      {% empty %}
+        <tr><td colspan="3">No additional employee pay items.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if trip.notes %}<p><strong>Notes:</strong><br>{{ trip.notes|linebreaksbr }}</p>{% endif %}
+  <div class="signatures"><div>Prepared By</div><div>Driver</div><div>Client / Receiver</div></div>
+</body>
+</html>

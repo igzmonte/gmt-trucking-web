@@ -1,0 +1,41 @@
+{% extends "base.html" %}{% load static %}{% block content %}
+<form method="post" class="trip-page-form" data-trip-form>
+  {% csrf_token %}
+  {% for hidden in form.hidden_fields %}{{ hidden }}{% endfor %}
+  {% if form.non_field_errors %}<div class="alert error">{{ form.non_field_errors }}</div>{% endif %}
+  <div class="trip-section-grid">
+    {% for section in trip_sections %}
+    <section class="panel trip-form-section {{ section.css_class }}">
+      <h3>{{ section.title }}</h3>
+      <div class="compact-fields">
+        {% for field in section.fields %}
+        <div class="compact-field{% if field.errors %} has-error{% endif %}">
+          <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+          {{ field }}
+          {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+          {{ field.errors }}
+        </div>
+        {% endfor %}
+      </div>
+      {% if section.css_class == "trip-crew-card" %}<p class="helper-guidance" data-helper-guidance></p>{% endif %}
+    </section>
+    {% endfor %}
+  </div>
+  <div class="trip-bottom-grid">
+    <section class="panel trip-pay-card">
+      <div class="pay-item-columns">
+        <section><h4>Driver Pay Items</h4><div data-pay-items="driver"></div><button type="button" class="small-button" data-add-pay-item="driver">Add Driver Item</button></section>
+        <section><h4>Helper Pay Items</h4><div data-pay-items="helper"></div><button type="button" class="small-button" data-add-pay-item="helper">Add Helper Item</button></section>
+      </div>
+    </section>
+    <section class="panel trip-summary-card">
+      <div class="trip-totals"><span>Base <strong data-trip-base>0.00</strong></span><span>Extras <strong data-trip-extra>0.00</strong></span><span>Total <strong data-trip-total>0.00</strong></span></div>
+      <div class="trip-page-actions">
+        {% if cancel_detail_id %}<a class="button secondary" href="{% url 'trips_detail' cancel_detail_id %}">Cancel</a>{% else %}<a class="button secondary" href="{% url 'trips_list' %}">Cancel</a>{% endif %}
+        <button type="submit">Save Trip</button>
+      </div>
+    </section>
+  </div>
+</form>
+{{ master_defaults|json_script:"trip-master-defaults" }}{{ asset_helper_limits|json_script:"asset-helper-limits" }}<script src="{% static 'trip-form.js' %}" defer></script>
+{% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block content %}
+<section class="panel">
+  <div class="toolbar">
+    <form method="get"><input name="q" value="{{ query }}" placeholder="Search recurring trips"><button>Search</button></form>
+    <div>{% if can_edit_page %}<a class="button" href="#" data-dialog-open="recurring-create-dialog">New Template</a>{% endif %}<a class="button secondary" href="{% url 'recurring_trips_export' %}">Export CSV</a></div>
+  </div>
+  <div class="table-scroll"><table>
+    <thead><tr><th><a href="?sort=code">Code</a></th><th><a href="?sort=client">Client</a></th><th>Route</th><th>Asset</th><th>Driver</th><th>Helpers</th><th><a href="?sort=rate&dir=desc">Base Rate</a></th><th>Driver Pay</th><th>Helper Pay</th><th>Actions</th></tr></thead>
+    <tbody>{% for row in page_obj %}<tr>
+      <td>{{ row.master_code }}</td><td>{{ row.client|default:"" }}</td><td>{{ row.origin }} &rarr; {{ row.destination }}</td>
+      <td>{{ row.default_asset|default:"" }}</td><td>{{ row.default_driver|default:"" }}</td><td>{{ row.default_helper_count }}</td>
+      <td class="num">{{ row.standard_base_rate }}</td><td class="num">{{ row.driver_pay_rate }}</td><td class="num">{{ row.helper_pay_rate }}</td>
+      <td>{% if can_edit_page %}<a href="{% url 'recurring_trips_edit' row.pk %}">Edit</a><form class="inline" method="post" action="{% url 'recurring_trips_delete' row.pk %}">{% csrf_token %}<button class="link danger" onclick="return confirm('Delete this recurring template? Existing trips will be kept.')">Delete</button></form>{% else %}<span class="muted">Read only</span>{% endif %}</td>
+    </tr>{% empty %}<tr><td colspan="10">No recurring trip templates found.</td></tr>{% endfor %}</tbody>
+  </table></div>
+  <div class="pagination">{% if page_obj.has_previous %}<a href="?q={{ query }}&page={{ page_obj.previous_page_number }}">Previous</a>{% endif %}<span>Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a href="?q={{ query }}&page={{ page_obj.next_page_number }}">Next</a>{% endif %}</div>
+</section>
+{% if can_edit_page %}<dialog id="recurring-create-dialog" class="record-dialog"{% if open_create_modal %} data-open-on-load{% endif %}>
+  <div class="dialog-header"><div><span class="dialog-kicker">Recurring Trips</span><h3>New Template</h3></div><button type="button" class="dialog-close" data-dialog-close aria-label="Close">&times;</button></div>
+  <form method="post" class="dialog-form">{% csrf_token %}{{ form.as_p }}<div class="form-actions dialog-actions"><button type="button" class="secondary" data-dialog-close>Cancel</button><button type="submit">Save Template</button></div></form>
+</dialog>{% endif %}
+{% endblock %}

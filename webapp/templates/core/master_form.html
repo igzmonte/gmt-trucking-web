@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block content %}<section class="panel form-panel"><form method="post">{% csrf_token %}{{ form.as_p }}<div class="form-actions"><button type="submit">Save</button><a class="button secondary" href="{% url spec.key|add:'_list' %}">Cancel</a></div></form></section>{% endblock %}

@@ -1,0 +1,11 @@
+{% load static %}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ page_title|default:"GMT Trucking" }} &middot; GMT Web</title><link rel="stylesheet" href="{% static 'app.css' %}"><link rel="stylesheet" href="{% static 'modal.css' %}"><script src="{% static 'modal.js' %}" defer></script><script src="{% static 'sidebar-scroll.js' %}" defer></script></head>
+<body><div class="shell">
+<aside><h1>GMT Trucking</h1><p class="user">{{ request.user.username }} &middot; {{ current_role }}</p>
+<div class="sidebar-menu-wrap"><nav class="sidebar-menu" aria-label="Main navigation" tabindex="0">{% for group,pages in navigation_groups %}<section><h2>{{ group }}</h2>{% for page in pages %}
+{% if page.url_name %}<a{% if page.is_subitem %} class="nav-subitem"{% endif %} href="{% url page.url_name %}">{{ page.label }}</a>{% else %}<span class="pending">{{ page.label }}</span>{% endif %}
+{% endfor %}</section>{% endfor %}</nav><div class="sidebar-scroll-controls" data-sidebar-scroll-controls><button type="button" data-sidebar-scroll-up aria-label="Scroll menu up">&#9650;</button><div class="sidebar-scroll-track" data-sidebar-scroll-track><div class="sidebar-scroll-thumb" data-sidebar-scroll-thumb></div></div><button type="button" data-sidebar-scroll-down aria-label="Scroll menu down">&#9660;</button></div></div>
+<form method="post" action="{% url 'logout' %}">{% csrf_token %}<button>Sign out</button></form></aside>
+<main><header><h2>{{ page_title }}</h2><span>GMT Web Migration</span></header>{% for message in messages %}<div class="alert {{ message.tags }}">{{ message }}</div>{% endfor %}{% block content %}{% endblock %}</main>
+</div></body></html>

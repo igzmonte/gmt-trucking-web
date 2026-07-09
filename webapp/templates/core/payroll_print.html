@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Payroll #{{ entry.pk }}</title>
+  <style>
+    @page{size:A5 landscape;margin:8mm}
+    body{font:12px Arial,sans-serif;color:#111;margin:0}
+    .sheet{padding:2mm 4mm 24mm}
+    .print-button{margin-bottom:8px}
+    .top{display:flex;justify-content:space-between;gap:12px}
+    .top h1{font-size:20px;margin:0 0 5px}
+    .top h2{font-size:16px;margin:0;text-align:right}
+    .meta{font-size:14px;margin:3px 0}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}
+    th{background:#f0f0f0}
+    .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+    .center{text-align:center}
+    .summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}
+    .net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}
+    .remarks-box{min-height:42px;white-space:pre-wrap}
+    .signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}
+    @media print{.print-button{display:none}}
+  </style>
+</head>
+<body>
+  <div class="sheet">
+    <button class="print-button" onclick="window.print()">Print</button>
+    <div class="top">
+      <div>
+        <h1>Payroll for {{ entry.period_from }} to {{ entry.period_to }}</h1>
+        <div class="meta"><strong>Payroll ID:</strong> {{ entry.pk }}</div>
+        <div class="meta"><strong>Name of {{ entry.employee_type }}:</strong> {{ entry.employee }}</div>
+        <div class="meta"><strong>Work:</strong> {{ entry.unit_description }}</div>
+      </div>
+      <h2>{{ entry.pay_date }}</h2>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Trips</th>
+          <th>Rate</th>
+          <th>Trip Ticket / Waybill</th>
+          <th>Origin-Destination</th>
+          <th>Item / Job</th>
+          <th>Amount</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in trip_rows %}
+          <tr>
+            <td>{{ row.trip.trip_date }}</td>
+            <td class="center">1</td>
+            <td class="num">{{ row.amount }}</td>
+            <td>{{ row.trip.trip_ticket_no }}</td>
+            <td>{{ row.trip.origin }} to {{ row.trip.destination }}</td>
+            <td>{{ row.trip.job_description }}</td>
+            <td class="num">{{ row.amount }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7" class="center">No trip-level payroll detail captured for this entry.</td></tr>
+        {% endfor %}
+        <tr>
+          <td></td>
+          <td class="center"><strong>{{ entry.trips_count }}</strong></td>
+          <td colspan="4" class="num"><strong>Gross Pay</strong></td>
+          <td class="num"><strong>&#8369; {{ entry.gross_pay }}</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="summary">
+      <table>
+        <tr><th colspan="2">Payroll Summary</th></tr>
+        <tr><td>Days Count</td><td>{{ entry.days_count }}</td></tr>
+        <tr><td>Additional Pay</td><td class="num">&#8369; {{ entry.additional_pay }}</td></tr>
+      </table>
+      <div>
+        <table>
+          <tr><th>Remarks</th></tr>
+          <tr><td class="remarks-box">{{ entry.remarks|default:""|linebreaksbr }}</td></tr>
+        </table>
+      </div>
+      <div>
+        <table>
+          <tr><th colspan="2">Deductions</th></tr>
+          {% for label,amount in deductions %}
+            <tr><td>{{ label }}</td><td class="num">{% if amount %}&#8369; {{ amount }}{% endif %}</td></tr>
+          {% endfor %}
+        </table>
+        <div class="net">Net Pay: &#8369; {{ entry.net_pay }}</div>
+      </div>
+    </div>
+
+    <div class="signature">Received by: / Employee Signature</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,45 @@
+{% extends "base.html" %}{% block content %}
+<section class="panel">
+  <div class="toolbar">
+    <form method="get">
+      <input name="q" value="{{ query }}" placeholder="Search {{ page_title }}">
+      <button>Search</button>
+    </form>
+    <div>
+      {% if can_edit_page %}<a class="button" href="{% url spec.key|add:'_new' %}" data-dialog-open="create-record-dialog">New Record</a>{% endif %}
+      <a class="button secondary" href="{% url spec.key|add:'_export' %}">Export CSV</a>
+    </div>
+  </div>
+  <table>
+    <thead><tr>{% for label,field in spec.columns %}<th>{{ label }}</th>{% endfor %}<th>Actions</th></tr></thead>
+    <tbody>
+      {% for row in page_obj %}
+      <tr>
+        {% for label,field in spec.columns %}
+        <td>{% if field == 'employee_code' %}{{ row.employee_code|default:'' }}{% elif field == 'full_name' %}{{ row.full_name }}{% elif field == 'employee_type' %}{{ row.employee_type }}{% elif field == 'payroll_basis' %}{{ row.payroll_basis }}{% elif field == 'employment_status' %}{{ row.employment_status }}{% elif field == 'asset_code' %}{{ row.asset_code }}{% elif field == 'asset_type' %}{{ row.asset_type }}{% elif field == 'plate_no' %}{{ row.plate_no }}{% elif field == 'make_model' %}{{ row.make_model }}{% elif field == 'status' %}{{ row.status }}{% elif field == 'client_code' %}{{ row.client_code|default:'' }}{% elif field == 'client_name' %}{{ row.client_name }}{% elif field == 'contact_person' %}{{ row.contact_person }}{% elif field == 'contact_no' %}{{ row.contact_no }}{% elif field == 'terms_days' %}{{ row.terms_days }}{% elif field == 'supplier_name' %}{{ row.supplier_name }}{% elif field == 'address' %}{{ row.address }}{% endif %}</td>
+        {% endfor %}
+        <td>{% if can_edit_page %}<a href="{% url spec.key|add:'_edit' row.pk %}">Edit</a><form class="inline" method="post" action="{% url spec.key|add:'_delete' row.pk %}">{% csrf_token %}<button class="link danger" onclick="return confirm('Delete this record?')">Delete</button></form>{% else %}<span class="muted">Read only</span>{% endif %}</td>
+      </tr>
+      {% empty %}<tr><td colspan="12">No records found.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  <div class="pagination">{% if page_obj.has_previous %}<a href="?q={{ query }}&page={{ page_obj.previous_page_number }}">Previous</a>{% endif %}<span>Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a href="?q={{ query }}&page={{ page_obj.next_page_number }}">Next</a>{% endif %}</div>
+</section>
+
+{% if can_edit_page %}
+<dialog id="create-record-dialog" class="record-dialog"{% if open_create_modal %} data-open-on-load{% endif %}>
+  <div class="dialog-header">
+    <div><span class="dialog-kicker">{{ page_title }}</span><h3>New Record</h3></div>
+    <button type="button" class="dialog-close" data-dialog-close aria-label="Close dialog">&times;</button>
+  </div>
+  <form method="post" action="{% url spec.key|add:'_list' %}" class="dialog-form">
+    {% csrf_token %}
+    {{ create_form.as_p }}
+    <div class="form-actions dialog-actions">
+      <button type="button" class="secondary" data-dialog-close>Cancel</button>
+      <button type="submit">Save Record</button>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+{% endblock %}

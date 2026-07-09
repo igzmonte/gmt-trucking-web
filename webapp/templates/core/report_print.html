@@ -1,0 +1,68 @@
+{% load accounting %}<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ report.label }}</title>
+  <style>
+    @page{size:A4 landscape;margin:11mm}
+    body{font:10pt Arial,sans-serif;color:#111;margin:0}
+    .sheet{padding:2mm}
+    .print-button{margin-bottom:10px}
+    .header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:10px}
+    h1{font-size:18pt;margin:0 0 3px}
+    h2{font-size:14pt;margin:0 0 4px}
+    .muted{color:#555}
+    .meta{font-size:9pt;text-align:right;line-height:1.45}
+    .filters{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px}
+    .filter{border:1px solid #bbb;border-radius:12px;padding:3px 8px;font-size:9pt}
+    table{width:100%;border-collapse:collapse}
+    th,td{border:1px solid #444;padding:4px 5px;vertical-align:top}
+    th{background:#eee;text-align:left}
+    tfoot td{font-weight:bold;background:#f7f7f7}
+    .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+    .empty{text-align:center;padding:18px}
+    @media print{.print-button{display:none}}
+  </style>
+</head>
+<body>
+  <div class="sheet">
+    <button class="print-button" onclick="window.print()">Print</button>
+    <div class="header">
+      <div>
+        <h1>GMT Trucking</h1>
+        <h2>{{ report.label }}</h2>
+        <div class="muted">{{ report.description }}</div>
+      </div>
+      <div class="meta">
+        <div><strong>Generated:</strong> {{ generated_at|date:"M d, Y h:i A" }}</div>
+        <div><strong>Rows:</strong> {{ report.row_count }}</div>
+      </div>
+    </div>
+    <div class="filters">
+      <span class="filter"><strong>Report:</strong> {{ report.label }}</span>
+      {% for label,value in active_filters %}
+        <span class="filter"><strong>{{ label }}:</strong> {{ value }}</span>
+      {% empty %}
+        <span class="filter">No filters applied</span>
+      {% endfor %}
+    </div>
+    <table>
+      <thead>
+        <tr>{% for column in report.columns %}<th{% if column.kind == 'money' or column.kind == 'number' %} class="num"{% endif %}>{{ column.label }}</th>{% endfor %}</tr>
+      </thead>
+      <tbody>
+        {% for row in report.rows %}
+          <tr>{% for cell in row %}<td{% if cell.kind == 'money' or cell.kind == 'number' %} class="num"{% endif %}>{% if cell.kind == 'money' %}{{ cell.value|accounting }}{% else %}{{ cell.value }}{% endif %}</td>{% endfor %}</tr>
+        {% empty %}
+          <tr><td colspan="{{ report.columns|length }}" class="empty">No rows match this report and its filters.</td></tr>
+        {% endfor %}
+      </tbody>
+      {% if report.rows %}
+        <tfoot>
+          <tr>{% for cell in report.totals %}<td{% if cell.kind == 'money' or cell.kind == 'number' %} class="num"{% endif %}>{% if cell.kind == 'money' %}{{ cell.value|accounting }}{% else %}{{ cell.value }}{% endif %}</td>{% endfor %}</tr>
+        </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</body>
+</html>

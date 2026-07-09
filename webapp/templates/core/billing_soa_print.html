@@ -1,0 +1,45 @@
+{% load accounting %}<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Statement of Account - {{ soa.client }}</title>
+  <style>
+    @page{size:A4 portrait;margin:12.7mm}
+    body{font:10.5pt Arial,sans-serif;color:#111;margin:0}
+    button{margin-bottom:10px}.header{text-align:right;margin-bottom:16px}.header h1{font-size:18pt;margin:0}
+    .meta{width:100%;margin:8px 0 18px}.meta td{padding:3px}.label{width:150px;font-weight:bold}
+    table{width:100%;border-collapse:collapse}.soa th,.soa td{border:1px solid #444;padding:5px 4px;font-size:8.8pt}.soa th{text-align:center;background:#eee}
+    .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.totals{width:330px;margin:12px 0 0 auto}.totals td{padding:4px}.grand td{border-top:1px solid;border-bottom:1px solid;font-weight:bold}
+    .empty{text-align:center;padding:16px}.follows{text-align:center;font-weight:bold;margin:22px}.signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:65px}.signatures div{border-top:1px solid;padding-top:5px}
+    @media print{button{display:none}}
+  </style>
+</head>
+<body>
+  <button onclick="window.print()">Print</button>
+  <div class="header"><h1>GMT Trucking</h1><div>Statement of Account</div></div>
+  <table class="meta">
+    <tr><td class="label">Client:</td><td>{{ soa.client }}</td></tr>
+    <tr><td class="label">Billing Address:</td><td>{{ soa.client.billing_address }}</td></tr>
+    <tr><td class="label">As of Date:</td><td>{{ soa.as_of_date }}</td></tr>
+    <tr><td class="label">Mode:</td><td>{% if soa.mode == "outstanding" %}Outstanding Only{% else %}All Activity{% endif %}</td></tr>
+    <tr><td class="label">Billing Date Scope:</td><td>{% if soa.date_from or soa.date_to %}{{ soa.date_from|default:"Beginning" }} to {{ soa.date_to|default:"Present" }}{% else %}All billing dates{% endif %}</td></tr>
+  </table>
+  <table class="soa">
+    <thead><tr><th>Billing No.</th><th>Billing Date</th><th>Billing Period</th><th>Grand Total</th><th>Payments</th><th>Balance</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for row in soa.rows %}
+        <tr><td><a href="{% url 'billing_detail' row.statement.pk %}">{{ row.billing_no }}</a></td><td>{{ row.billing_date }}</td><td>{{ row.period_from|default:"" }}{% if row.period_to %} to {{ row.period_to }}{% endif %}</td><td class="num">{{ row.grand_total|accounting }}</td><td class="num">{{ row.payments|accounting }}</td><td class="num">{{ row.balance|accounting }}</td><td>{{ row.status }}</td></tr>
+      {% empty %}
+        <tr><td colspan="7" class="empty">No billing statements match this Statement of Account.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <table class="totals">
+    <tr><td>Total Billed</td><td class="num">{{ soa.total_billed|accounting }}</td></tr>
+    <tr><td>Total Payments</td><td class="num">{{ soa.total_payments|accounting }}</td></tr>
+    <tr class="grand"><td>Total Balance</td><td class="num">{{ soa.total_balance|accounting }}</td></tr>
+  </table>
+  <div class="follows">&mdash;&mdash; Nothing Follows &mdash;&mdash;</div>
+  <div class="signatures"><div>Prepared by:</div><div>Checked by:</div><div>Received/Conforme:</div></div>
+</body>
+</html>

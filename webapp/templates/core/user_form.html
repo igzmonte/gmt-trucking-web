@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block content %}
+<section class="panel form-panel">
+  <form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <div class="form-actions">
+      <button type="submit">Save User</button>
+      <a class="button secondary" href="{% url 'users_list' %}">Cancel</a>
+      {% if editing %}<a class="button secondary" href="{% url 'users_password' record.pk %}">Reset Password</a>{% endif %}
+    </div>
+  </form>
+</section>
+{% endblock %}
