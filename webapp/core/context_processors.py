@@ -1,3 +1,5 @@
+from django.conf import settings
+
 from .access import ROLE_PAGE_ACCESS, can_edit, user_role
 
 NAV_GROUPS = [
@@ -37,4 +39,8 @@ def navigation(request):
             if page == "Collections" and can_edit(request.user, "Collections"):
                 items.append({"label": "New Collection", "url_name": "collection_new", "is_subitem": True})
         groups.append((group, items))
-    return {"current_role": role, "navigation_groups": [(g, p) for g, p in groups if p]}
+    return {
+        "current_role": role,
+        "navigation_groups": [(g, p) for g, p in groups if p],
+        "show_demo_login_hint": settings.DEBUG,
+    }

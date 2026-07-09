@@ -9,7 +9,7 @@ ROLES = ("admin", "encoder", "viewer", "accounting")
 
 
 class Command(BaseCommand):
-    help = "Create hosted role groups and the first administrator from environment secrets"
+    help = "Create hosted role groups and synchronize the hosted administrator from environment secrets"
 
     @transaction.atomic
     def handle(self, *args, **options):
@@ -31,11 +31,13 @@ class Command(BaseCommand):
         user.is_active = True
         user.is_staff = True
         user.is_superuser = True
-        if created:
-            user.set_password(password)
+        # Render free instances do not provide a shell, so the hosted admin
+        # password must be reset safely by redeploying with updated environment
+        # variables. Treat GMT_ADMIN_PASSWORD as the source of truth.
+        user.set_password(password)
         user.save()
         user.groups.set([groups["admin"]])
-        action = "created" if created else "verified"
+        action = "created" if created else "synchronized"
         self.stdout.write(self.style.SUCCESS(f"Hosted administrator {action}; no secret values were printed."))
 
         if preview_password:

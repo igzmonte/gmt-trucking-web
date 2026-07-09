@@ -14,7 +14,7 @@ services:
     region: singapore
     buildCommand: bash build.sh
     initialDeployHook: python webapp/manage.py bootstrap_hosted && python webapp/manage.py seed_hosted_preview
-    startCommand: python -m gunicorn config.asgi:application --chdir webapp -k uvicorn.workers.UvicornWorker
+    startCommand: python webapp/manage.py bootstrap_hosted && python -m gunicorn config.asgi:application --chdir webapp -k uvicorn.workers.UvicornWorker
     healthCheckPath: /health/
     autoDeployTrigger: commit
     envVars:
