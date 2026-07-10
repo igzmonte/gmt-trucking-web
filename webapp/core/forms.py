@@ -407,9 +407,9 @@ class PayrollForm(forms.Form):
             self.add_error("period_to", "Period end must be on or after period start.")
         if self.preview:
             if cleaned.get("vale_deduction") is not None and cleaned["vale_deduction"] > self.preview["vale_deduction"]:
-                self.add_error("vale_deduction", "Deduction cannot exceed the available Vale installment total.")
+                self.add_error("vale_deduction", "Deduction cannot exceed the remaining Vale total.")
             if cleaned.get("cash_advance_deduction") is not None and cleaned["cash_advance_deduction"] > self.preview["cash_advance_deduction"]:
-                self.add_error("cash_advance_deduction", "Deduction cannot exceed the available Cash Advance balance.")
+                self.add_error("cash_advance_deduction", "Deduction cannot exceed the remaining Cash Advance balance.")
         return cleaned
 
 

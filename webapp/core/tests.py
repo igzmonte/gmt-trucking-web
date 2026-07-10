@@ -686,6 +686,10 @@ class PayrollOperationsTests(TestCase):
         self.assertContains(response, "TT-PAY-001")
         self.assertContains(response, "Night Shift")
         self.assertContains(response, "New Payroll")
+        self.assertContains(response, "Remaining Vale")
+        self.assertContains(response, "Remaining Cash Advance")
+        self.assertNotContains(response, "Available Vale installments")
+        self.assertNotContains(response, "Available Cash Advance")
 
     def test_driver_payroll_claims_trip_deducts_advances_and_calculates_net(self):
         vale = ValeRecord.objects.create(employee=self.driver, date_granted="2026-06-01", amount=1200, installment_amount=500, balance=1200, status="Open")
@@ -751,6 +755,11 @@ class PayrollOperationsTests(TestCase):
         self.assertContains(printable, "Payroll delivery service")
         self.assertContains(printable, "Received by: / Employee Signature")
         self.assertContains(printable, "Remarks")
+        self.assertContains(printable, "Remaining Vale")
+        self.assertContains(printable, "Remaining Cash Advance")
+        self.assertContains(printable, "700.00")
+        self.assertNotContains(printable, "Available Vale installments")
+        self.assertNotContains(printable, "Available Cash Advance")
         html = printable.content.decode()
         self.assertLess(html.index("Payroll Summary"), html.index("Remarks"))
         self.assertLess(html.index("Remarks"), html.index("Deductions"))

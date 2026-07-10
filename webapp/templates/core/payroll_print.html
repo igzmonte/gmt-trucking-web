@@ -19,7 +19,8 @@
     .center{text-align:center}
     .summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}
     .net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}
-    .remarks-box{min-height:42px;white-space:pre-wrap}
+    .remarks-box{min-height:78px;white-space:pre-wrap}
+    .remaining-balances{margin-top:8px}
     .signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}
     @media print{.print-button{display:none}}
   </style>
@@ -82,6 +83,10 @@
         <table>
           <tr><th>Remarks</th></tr>
           <tr><td class="remarks-box">{{ entry.remarks|default:""|linebreaksbr }}</td></tr>
+        </table>
+        <table class="remaining-balances">
+          <tr><td>Remaining Vale</td><td class="num">&#8369; {{ remaining_vale }}</td></tr>
+          <tr><td>Remaining Cash Advance</td><td class="num">&#8369; {{ remaining_cash_advance }}</td></tr>
         </table>
       </div>
       <div>

@@ -5,13 +5,13 @@ from django.contrib import messages
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db import IntegrityError
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 
 from .access import can_edit, page_access
 from .forms import PayrollForm
-from .models import Employee, PayrollEntry
+from .models import CashAdvance, Employee, PayrollEntry, ValeRecord
 from .payroll_services import create_payroll, delete_payroll, money, payroll_preview
 
 
@@ -114,7 +114,20 @@ def _detail_context(entry):
         else:
             amount = 0
         trip_rows.append({"trip": trip, "amount": amount})
-    return {"entry": entry, "trip_rows": trip_rows, "deductions": deductions, "total_deductions": sum((amount for _, amount in deductions), 0)}
+    remaining_vale = money(
+        ValeRecord.objects.filter(employee=entry.employee, balance__gt=0).aggregate(total=Sum("balance"))["total"] or 0
+    )
+    remaining_cash_advance = money(
+        CashAdvance.objects.filter(employee=entry.employee, balance__gt=0).aggregate(total=Sum("balance"))["total"] or 0
+    )
+    return {
+        "entry": entry,
+        "trip_rows": trip_rows,
+        "deductions": deductions,
+        "total_deductions": sum((amount for _, amount in deductions), 0),
+        "remaining_vale": remaining_vale,
+        "remaining_cash_advance": remaining_cash_advance,
+    }
 
 
 @page_access(PAGE)
