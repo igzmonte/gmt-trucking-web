@@ -5,6 +5,7 @@ from django import forms
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 
+from .choice_labels import apply_choice_labels
 from .models import Asset, BillingStatement, CashAdvance, Client, Collection, Employee, Payable, RecurringTripMaster, Repair, Supplier, Trip, TripEmployeePayItem, TripHelper, ValeRecord
 from .services import next_trip_ticket_no
 
@@ -39,6 +40,7 @@ class AssetForm(StyledModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["assigned_employee"].queryset = Employee.objects.filter(active=True)
+        apply_choice_labels(self.fields["assigned_employee"])
 
 
 class ClientForm(StyledModelForm):
@@ -79,6 +81,7 @@ class RecurringTripForm(StyledModelForm):
         self.fields["default_driver"].queryset = Employee.objects.filter(
             active=True, employee_type=Employee.Type.DRIVER
         ).order_by("full_name")
+        apply_choice_labels(self.fields["client"], self.fields["default_asset"], self.fields["default_driver"])
 
     def clean_default_helper_count(self):
         count = self.cleaned_data.get("default_helper_count") or 0
@@ -152,6 +155,11 @@ class TripForm(StyledModelForm):
         if self.instance and self.instance.pk and self.instance.recurring_master_id:
             master_filter |= Q(pk=self.instance.recurring_master_id)
         self.fields["recurring_master"].queryset = RecurringTripMaster.objects.filter(master_filter).order_by("master_code")
+        apply_choice_labels(
+            self.fields["client"], self.fields["asset"], self.fields["driver"],
+            self.fields["helper_1"], self.fields["helper_2"], self.fields["helper_3"],
+            self.fields["recurring_master"],
+        )
         if self.instance and self.instance.pk:
             helper_ids = list(self.instance.helper_assignments.order_by("helper_order", "id").values_list("employee_id", flat=True))
             for index, helper_id in enumerate(helper_ids[:3], start=1):
@@ -258,6 +266,7 @@ class RepairForm(StyledModelForm):
         super().__init__(*args, **kwargs)
         self.fields["asset"].queryset = Asset.objects.order_by("asset_code", "id")
         self.fields["supplier"].queryset = Supplier.objects.order_by("supplier_name", "id")
+        apply_choice_labels(self.fields["asset"], self.fields["supplier"])
         self.fields["total_cost"].required = False
 
     def clean(self):
@@ -293,6 +302,7 @@ class PayableForm(StyledModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["supplier"].queryset = Supplier.objects.order_by("supplier_name", "id")
+        apply_choice_labels(self.fields["supplier"])
 
     def clean_amount(self):
         amount = self.cleaned_data["amount"]
@@ -316,6 +326,7 @@ class ValeForm(StyledModelForm):
         if self.instance and self.instance.pk:
             employee_filter |= Q(pk=self.instance.employee_id)
         self.fields["employee"].queryset = Employee.objects.filter(employee_filter).order_by("full_name", "id")
+        apply_choice_labels(self.fields["employee"])
 
     def clean(self):
         cleaned = super().clean()
@@ -354,6 +365,7 @@ class CashAdvanceForm(StyledModelForm):
         if self.instance and self.instance.pk:
             employee_filter |= Q(pk=self.instance.employee_id)
         self.fields["employee"].queryset = Employee.objects.filter(employee_filter).order_by("full_name", "id")
+        apply_choice_labels(self.fields["employee"])
 
     def clean_amount(self):
         amount = self.cleaned_data["amount"]
@@ -398,6 +410,7 @@ class PayrollForm(forms.Form):
         super().__init__(*args, **kwargs)
         self.preview = preview
         self.fields["employee"].queryset = Employee.objects.filter(active=True).order_by("full_name", "id")
+        apply_choice_labels(self.fields["employee"])
         for field in self.fields.values():
             field.widget.attrs.setdefault("class", "form-control")
 
@@ -426,6 +439,7 @@ class BillingForm(forms.Form):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["client"].queryset = Client.objects.filter(active=True).order_by("client_name", "id")
+        apply_choice_labels(self.fields["client"])
         for field in self.fields.values():
             field.widget.attrs.setdefault("class", "form-control")
 
@@ -480,6 +494,7 @@ class StatementOfAccountForm(forms.Form):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["client"].queryset = Client.objects.filter(active=True).order_by("client_name", "id")
+        apply_choice_labels(self.fields["client"])
         for field in self.fields.values():
             field.widget.attrs.setdefault("class", "form-control")
 
@@ -509,3 +524,4 @@ class CollectionForm(StyledModelForm):
             queryset = queryset.filter(pk=billing.pk)
             self.fields["billing"].initial = billing
         self.fields["billing"].queryset = queryset
+        apply_choice_labels(self.fields["billing"])

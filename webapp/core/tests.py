@@ -245,6 +245,13 @@ class MasterDataTests(TestCase):
         self.assertContains(response, 'id="create-record-dialog"')
         self.assertContains(response, 'data-dialog-open="create-record-dialog"')
 
+        Asset.objects.create(
+            asset_code="UNIT-DETAIL", asset_type=Asset.Type.CARGO, plate_no="PLATE-777",
+            make_model="Detail Model", assigned_employee=self.employee,
+        )
+        fleet = self.client.get(reverse("fleet_list"))
+        self.assertContains(fleet, "E-1 — Example Employee — Driver — Per Trip")
+
         response = self.client.post(reverse("clients_list"), {
             "client_code": "C-1",
             "client_name": "Example Client",
@@ -292,8 +299,8 @@ class TripOperationsTests(TestCase):
             Employee.objects.create(employee_code=f"TRIP-H{i}", full_name=f"Trip Helper {i}", employee_type="Helper", employment_status="Active", payroll_basis="Per Trip")
             for i in range(1, 4)
         ]
-        self.small = Asset.objects.create(asset_code="SMALL-1", asset_type=Asset.Type.SMALL)
-        self.trailer = Asset.objects.create(asset_code="TRAILER-1", asset_type=Asset.Type.TRAILER)
+        self.small = Asset.objects.create(asset_code="SMALL-1", asset_type=Asset.Type.SMALL, plate_no="SML-123", make_model="Small Model")
+        self.trailer = Asset.objects.create(asset_code="TRAILER-1", asset_type=Asset.Type.TRAILER, plate_no="TRL-999", make_model="Trailer Model")
         self.master = RecurringTripMaster.objects.create(
             master_code="RM-001", client=self.client_record, job_description="Recurring delivery",
             origin="Warehouse", destination="Depot", default_asset=self.trailer,
@@ -332,9 +339,19 @@ class TripOperationsTests(TestCase):
         self.assertNotContains(response, 'id="trip-create-dialog"')
         self.assertContains(response, reverse("trips_new"))
         self.assertContains(response, "New Trip Details")
+        recurring_page = self.client.get(reverse("recurring_trips_list"))
+        self.assertContains(recurring_page, "TRIP-C")
+        self.assertContains(recurring_page, "TRAILER-1")
+        self.assertContains(recurring_page, "TRL-999")
+        self.assertContains(recurring_page, "TRIP-D")
         new_page = self.client.get(reverse("trips_new"))
         self.assertEqual(new_page.status_code, 200)
         self.assertContains(new_page, "RM-001")
+        self.assertContains(new_page, "RM-001 — TRIP-C — Trip Client — Warehouse → Depot — Recurring delivery")
+        self.assertContains(new_page, "TRAILER-1 — TRL-999 — Trailer Truck — Trailer Model")
+        self.assertContains(new_page, "TRIP-D — Trip Driver — Driver — Per Trip")
+        self.assertContains(new_page, "TRIP-H1 — Trip Helper 1 — Helper — Per Trip")
+        self.assertContains(new_page, "TRIP-C — Trip Client")
         self.assertContains(new_page, 'class="trip-section-grid"')
         self.assertContains(new_page, "Employee Pay Rates")
         self.assertContains(new_page, "Trip / Unit Charges")
@@ -438,8 +455,8 @@ class RepairsPayablesTests(TestCase):
             user = User.objects.create_user(f"maintenance_{role}", password="test")
             user.groups.add(group)
             self.users[role] = user
-        self.asset = Asset.objects.create(asset_code="R-TRUCK-1", asset_type=Asset.Type.CARGO)
-        self.supplier = Supplier.objects.create(supplier_name="Repair Supplier")
+        self.asset = Asset.objects.create(asset_code="R-TRUCK-1", asset_type=Asset.Type.CARGO, plate_no="REP-321", make_model="Repair Model")
+        self.supplier = Supplier.objects.create(supplier_name="Repair Supplier", contact_person="Supplier Contact")
 
     def repair_payload(self, **overrides):
         payload = {
@@ -475,8 +492,12 @@ class RepairsPayablesTests(TestCase):
         self.assertNotContains(self.client.get(reverse("repairs_list")), "New Repair Details")
         self.client.force_login(self.users["encoder"])
         self.assertContains(self.client.get(reverse("repairs_list")), "New Repair Details")
+        repair_form = self.client.get(reverse("repairs_new"))
+        self.assertContains(repair_form, "R-TRUCK-1 — REP-321 — Cargo Truck — Repair Model")
+        self.assertContains(repair_form, "Repair Supplier — Supplier Contact")
         self.client.force_login(self.users["accounting"])
         self.assertContains(self.client.get(reverse("payables_list")), "New Payable Details")
+        self.assertContains(self.client.get(reverse("payables_new")), "Repair Supplier — Supplier Contact")
 
     def test_repair_total_and_generated_payable_snapshot(self):
         self.client.force_login(self.users["encoder"])
@@ -586,6 +607,10 @@ class AdvanceOperationsTests(TestCase):
 
     def test_create_vale_opening_balance_and_detail(self):
         self.client.force_login(self.users["encoder"])
+        self.assertContains(
+            self.client.get(reverse("vale_new")),
+            "ADV-EMP — Advance Employee — Driver — Per Trip",
+        )
         response = self.client.post(reverse("vale_new"), self.vale_payload())
         record = ValeRecord.objects.get()
         self.assertRedirects(response, reverse("vale_detail", args=[record.pk]))
@@ -684,6 +709,7 @@ class PayrollOperationsTests(TestCase):
         self.client.force_login(self.users["accounting"])
         response = self.client.get(reverse("payroll_new") + f"?employee={self.driver.pk}&period_from=2026-07-01&period_to=2026-07-31")
         self.assertContains(response, "TT-PAY-001")
+        self.assertContains(response, "PAY-D — Payroll Driver — Driver — Per Trip")
         self.assertContains(response, "Night Shift")
         self.assertContains(response, "New Payroll")
         self.assertContains(response, "Remaining Vale")
@@ -841,6 +867,7 @@ class BillingCollectionsTests(TestCase):
         response = self.client.get(reverse("billing_new") + f"?client={self.client_record.pk}&period_from=2026-07-01&period_to=2026-07-31")
         self.assertContains(response, "TT-BILL-001")
         self.assertContains(response, "TT-BILL-002")
+        self.assertContains(response, "BILL-C — Billing Client")
         self.assertContains(response, "New Billing Statement")
         self.assertContains(self.client.get(reverse("billing_list")), "New Collection")
 
@@ -872,6 +899,10 @@ class BillingCollectionsTests(TestCase):
 
     def test_partial_and_overpayment_update_status_and_outstanding(self):
         statement = self.create_statement()
+        collection_form = self.client.get(reverse("collection_new"))
+        self.assertContains(collection_form, "BS-2026-000001")
+        self.assertContains(collection_form, "BILL-C")
+        self.assertContains(collection_form, "Billing Client")
         response = self.client.post(reverse("collection_new"), self.collection_payload(statement, "2000.00"))
         first = Collection.objects.get(reference_no="PAY-001")
         self.assertRedirects(response, reverse("collection_detail", args=[first.pk]))
