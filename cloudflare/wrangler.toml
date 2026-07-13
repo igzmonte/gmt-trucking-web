@@ -5,7 +5,7 @@ pages_build_output_dir = "public"
 [[d1_databases]]
 binding = "DB"
 database_name = "gmt-trucking"
-database_id = "replace-with-your-d1-database-id"
+database_id = "3a6fd272-3393-4a36-ba66-3abd48fbc032"
 
 [vars]
 GMT_APP_NAME = "GMT Trucking"
