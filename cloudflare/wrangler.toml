@@ -1,0 +1,12 @@
+name = "gmt-trucking-cloudflare"
+compatibility_date = "2026-07-13"
+pages_build_output_dir = "public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gmt-trucking"
+database_id = "replace-with-your-d1-database-id"
+
+[vars]
+GMT_APP_NAME = "GMT Trucking"
+GMT_SESSION_SECRET = "replace-this-in-cloudflare-pages-settings"
