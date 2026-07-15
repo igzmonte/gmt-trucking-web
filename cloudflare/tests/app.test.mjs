@@ -30,6 +30,7 @@ function envWithRows(rows = {}) {
           },
           async all() {
             if (state.sql.includes("FROM trips t")) return { results: rows.trips || [] };
+            if (state.sql.includes("FROM recurring_trip_masters r")) return { results: filtered("recurring").slice(0, 25) };
             if (state.sql.includes("FROM employees")) return { results: filtered("employees").slice(0, 25) };
             if (state.sql.includes("FROM assets")) return { results: filtered("assets").slice(0, 25) };
             if (state.sql.includes("FROM clients")) return { results: filtered("clients").slice(0, 25) };
@@ -38,6 +39,7 @@ function envWithRows(rows = {}) {
           },
           async first() {
             if (state.sql.includes("FROM users")) return rows.user || null;
+            if (state.sql.includes("COUNT(*) AS total FROM recurring_trip_masters") && state.sql.includes("LIKE")) return { total: rows.recurringCount ?? filtered("recurring").length };
             if (state.sql.includes("COUNT(*) AS total FROM employees") && state.sql.includes("LIKE")) return { total: rows.employeesCount ?? filtered("employees").length };
             if (state.sql.includes("COUNT(*) AS total FROM assets") && state.sql.includes("LIKE")) return { total: rows.assetsCount ?? filtered("assets").length };
             if (state.sql.includes("COUNT(*) AS total FROM clients") && state.sql.includes("LIKE")) return { total: rows.clientsCount ?? filtered("clients").length };
@@ -48,19 +50,22 @@ function envWithRows(rows = {}) {
               return { total: refs[table] || 0 };
             }
             if (state.sql.includes("COUNT(*) AS total FROM trips")) return { total: 0 };
+            if (state.sql.includes("COUNT(*) AS total FROM recurring_trip_masters")) return { total: rows.recurringCount ?? source("recurring").length };
             if (state.sql.includes("COUNT(*) AS total FROM employees")) return { total: rows.employeesCount ?? source("employees").length };
             if (state.sql.includes("COUNT(*) AS total FROM assets")) return { total: rows.assetsCount ?? source("assets").length };
             if (state.sql.includes("COUNT(*) AS total FROM clients")) return { total: rows.clientsCount ?? source("clients").length };
             if (state.sql.includes("COUNT(*) AS total FROM suppliers")) return { total: rows.suppliersCount ?? source("suppliers").length };
+            if (state.sql.includes("SELECT id FROM recurring_trip_masters WHERE id=?")) return byId("recurring") || null;
             if (state.sql.includes("SELECT id FROM employees WHERE id=?")) return byId("employees") || null;
             if (state.sql.includes("SELECT id FROM assets WHERE id=?")) return byId("assets") || null;
             if (state.sql.includes("SELECT id FROM clients WHERE id=?")) return byId("clients") || null;
             if (state.sql.includes("SELECT id FROM suppliers WHERE id=?")) return byId("suppliers") || null;
+            if (state.sql.includes("SELECT * FROM recurring_trip_masters WHERE id=?")) return byId("recurring") || null;
             if (state.sql.includes("SELECT * FROM employees WHERE id=?")) return byId("employees") || null;
             if (state.sql.includes("SELECT * FROM assets WHERE id=?")) return byId("assets") || null;
             if (state.sql.includes("SELECT * FROM clients WHERE id=?")) return byId("clients") || null;
             if (state.sql.includes("SELECT * FROM suppliers WHERE id=?")) return byId("suppliers") || null;
-            if (state.sql.match(/SELECT id FROM (employees|assets|clients|suppliers) WHERE/)) {
+            if (state.sql.match(/SELECT id FROM (employees|assets|clients|suppliers|recurring_trip_masters) WHERE/)) {
               if (rows.duplicate) return { id: rows.duplicate };
               return null;
             }
@@ -193,4 +198,123 @@ test("master data delete removes unused records", async () => {
   assert.equal(response.status, 303);
   assert.match(response.headers.get("location"), /Suppliers%20deleted/);
   assert.match(runs[0].sql, /DELETE FROM suppliers WHERE id=/);
+});
+
+test("recurring trips list supports search, pagination, and editor actions", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/recurring-trips?q=RM&page=2", "admin"), envWithRows({
+    recurringCount: 30,
+    recurring: [{
+      id: 1, master_code: "RM-001", client_name: "Client One", origin: "Warehouse", destination: "Depot",
+      asset_code: "UNIT-001", driver_name: "Driver One", default_helper_count: 2, standard_base_rate: 2500,
+      driver_pay_rate: 600, helper_pay_rate: 300,
+    }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /RM-001/);
+  assert.match(text, /New Template/);
+  assert.match(text, /Page 2 of 2/);
+  assert.match(text, /\/recurring-trips\/1\/edit/);
+  assert.match(text, /\/recurring-trips\/export\.csv\?q=RM/);
+});
+
+test("recurring trips CSV export uses Django-compatible headers", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/recurring-trips/export.csv?q=RM", "viewer"), envWithRows({
+    recurring: [{
+      id: 1, master_code: "RM-001", client_name: "Client One", job_description: "Item Job", origin: "Warehouse",
+      destination: "Depot", asset_code: "UNIT-001", driver_name: "Driver One", default_helper_count: 2,
+      standard_base_rate: 2500, driver_pay_rate: 600, helper_pay_rate: 300, active: 1,
+    }],
+  }));
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /ID,Code,Client,Item \/ Job,Origin,Destination,Asset,Driver,Helpers,Base Rate,Driver Pay,Helper Pay,Active/);
+});
+
+test("recurring trip form shows detailed dropdown labels", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/recurring-trips/new", "admin"), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    assets: [{ id: 2, asset_code: "UNIT-001", plate_no: "ABC-123", asset_type: "Cargo Truck", make_model: "Isuzu" }],
+    employees: [{ id: 3, employee_code: "EMP-001", full_name: "Driver One", employee_type: "Driver", payroll_basis: "Per Trip" }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /CLI-001/);
+  assert.match(text, /UNIT-001/);
+  assert.match(text, /ABC-123/);
+  assert.match(text, /EMP-001/);
+  assert.match(text, /Item \/ Job/);
+});
+
+test("recurring trip create validates helper limit and duplicate code", async () => {
+  const tooMany = new URLSearchParams({ master_code: "RM-NEW", default_helper_count: "11" });
+  let response = await handleRequest(await authedRequest("https://example.test/recurring-trips/new", "admin", { method: "POST", body: tooMany }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /cannot exceed 10/);
+
+  const duplicate = new URLSearchParams({ master_code: "RM-001", default_helper_count: "1" });
+  response = await handleRequest(await authedRequest("https://example.test/recurring-trips/new", "admin", { method: "POST", body: duplicate }), envWithRows({ duplicate: 1 }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /master code must be unique/);
+});
+
+test("recurring trip create and edit save cleaned values", async () => {
+  let runs = [];
+  let body = new URLSearchParams({
+    master_code: "RM-NEW", client_id: "1", job_description: "Delivery", origin: "A", destination: "B",
+    default_asset_id: "2", default_driver_id: "3", default_helper_count: "2", standard_base_rate: "2500.50",
+    driver_pay_rate: "", helper_pay_rate: "300", active: "1",
+  });
+  let response = await handleRequest(await authedRequest("https://example.test/recurring-trips/new", "encoder", { method: "POST", body }), envWithRows({ runs }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /Recurring%20trip%20master%20saved/);
+  assert.match(runs[0].sql, /INSERT INTO recurring_trip_masters/);
+  assert.equal(runs[0].params[8], "2500.5");
+
+  runs = [];
+  body = new URLSearchParams({ master_code: "RM-EDIT", default_helper_count: "1", active: "0" });
+  response = await handleRequest(await authedRequest("https://example.test/recurring-trips/1/edit", "admin", { method: "POST", body }), envWithRows({
+    recurring: [{ id: 1, master_code: "RM-OLD" }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /updated/);
+  assert.match(runs[0].sql, /UPDATE recurring_trip_masters SET/);
+});
+
+test("recurring trip permissions block viewer mutations and accounting access", async () => {
+  const body = new URLSearchParams({ master_code: "RM-X" });
+  let response = await handleRequest(await authedRequest("https://example.test/recurring-trips/new", "viewer", { method: "POST", body }), envWithRows());
+  assert.equal(response.status, 403);
+  assert.match(await response.text(), /do not have permission to edit/);
+
+  response = await handleRequest(await authedRequest("https://example.test/recurring-trips", "accounting"), envWithRows());
+  assert.equal(response.status, 403);
+});
+
+test("recurring trip delete is POST-only and clears linked trips first", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/recurring-trips/1/delete", "admin"), envWithRows({
+    recurring: [{ id: 1, master_code: "RM-001" }],
+  }));
+  assert.equal(response.status, 405);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/recurring-trips/1/delete", "admin", { method: "POST" }), envWithRows({
+    recurring: [{ id: 1, master_code: "RM-001" }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /existing%20trips%20kept/i);
+  assert.match(runs[0].sql, /UPDATE trips SET recurring_master_id=NULL/);
+  assert.match(runs[1].sql, /DELETE FROM recurring_trip_masters/);
+});
+
+test("trip create dropdown uses recurring template detail labels", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin"), envWithRows({
+    recurring: [{ id: 1, master_code: "RM-001", client_name: "Client One", origin: "A", destination: "B", job_description: "Delivery" }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /RM-001/);
+  assert.match(text, /Client One/);
+  assert.match(text, /Delivery/);
 });

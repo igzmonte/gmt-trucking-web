@@ -42,6 +42,10 @@ export function numberInput(name, label, value = "0") {
   return textInput(name, label, value, `type="number" step="0.01"`);
 }
 
+export function textareaInput(name, label, value = "", attrs = "") {
+  return `<label>${esc(label)}<textarea name="${esc(name)}" ${attrs}>${esc(value)}</textarea></label>`;
+}
+
 export function selectInput(name, label, rows, selected = "", labeler = (row) => row.name, blank = "---------") {
   return `<label>${esc(label)}<select name="${esc(name)}"><option value="">${esc(blank)}</option>${rows.map((row) => `<option value="${esc(row.id)}"${String(selected) === String(row.id) ? " selected" : ""}>${esc(labeler(row))}</option>`).join("")}</select></label>`;
 }

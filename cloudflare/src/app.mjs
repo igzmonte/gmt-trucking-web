@@ -1,7 +1,7 @@
 import { canEdit, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
-import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textInput } from "./html.mjs";
+import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
 import { choiceLabel, nextTripTicketNo, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
 
@@ -281,6 +281,142 @@ async function recurringList(env, user, path) {
   return html(layout({ title: "Recurring Trips", user, path, content: table(["Code", "Client", "Route", "Asset", "Driver", "Base Rate"], body) }));
 }
 
+function recurringWhere(query) {
+  if (!query) return { sql: "", params: [] };
+  return {
+    sql: " WHERE r.master_code LIKE ? OR c.client_name LIKE ? OR r.job_description LIKE ? OR r.origin LIKE ? OR r.destination LIKE ?",
+    params: Array(5).fill(`%${query}%`),
+  };
+}
+
+function recurringValues(data) {
+  return {
+    master_code: (data.master_code || "").trim(),
+    client_id: data.client_id || null,
+    job_description: (data.job_description || "").trim(),
+    origin: (data.origin || "").trim(),
+    destination: (data.destination || "").trim(),
+    default_asset_id: data.default_asset_id || null,
+    default_driver_id: data.default_driver_id || null,
+    default_helper_count: String(Number(data.default_helper_count || 0)),
+    standard_base_rate: String(Number(data.standard_base_rate || 0)),
+    driver_pay_rate: String(Number(data.driver_pay_rate || 0)),
+    helper_pay_rate: String(Number(data.helper_pay_rate || 0)),
+    default_extra_note: (data.default_extra_note || "").trim(),
+    remarks: (data.remarks || "").trim(),
+    active: data.active === "0" ? "0" : "1",
+  };
+}
+
+async function validateRecurring(env, values, id = null) {
+  const errors = [];
+  if (!values.master_code) errors.push("master code is required.");
+  if (Number(values.default_helper_count || 0) > 10) errors.push("Default helper count cannot exceed 10.");
+  if (values.master_code) {
+    const params = id ? [values.master_code, id] : [values.master_code];
+    const duplicate = await first(env, `SELECT id FROM recurring_trip_masters WHERE master_code=?${id ? " AND id<>?" : ""} LIMIT 1`, params);
+    if (duplicate) errors.push("master code must be unique.");
+  }
+  return errors;
+}
+
+async function recurringChoices(env) {
+  return await Promise.all([
+    all(env, "SELECT * FROM clients WHERE active=1 ORDER BY client_name"),
+    all(env, "SELECT * FROM assets ORDER BY asset_code"),
+    all(env, "SELECT * FROM employees WHERE active=1 AND employee_type='Driver' ORDER BY full_name"),
+  ]);
+}
+
+async function renderRecurringForm(env, row = {}, id = null, errors = []) {
+  const [clients, assets, drivers] = await recurringChoices(env);
+  const fields = [
+    textInput("master_code", "Code", row.master_code || "", "required"),
+    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r)),
+    textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'),
+    textInput("origin", "Origin", row.origin || ""),
+    textInput("destination", "Destination", row.destination || ""),
+    selectInput("default_asset_id", "Default asset", assets, row.default_asset_id || "", (r) => choiceLabel("asset", r)),
+    selectInput("default_driver_id", "Default driver", drivers, row.default_driver_id || "", (r) => choiceLabel("employee", r)),
+    numberInput("default_helper_count", "Default helper count", row.default_helper_count ?? 0),
+    numberInput("standard_base_rate", "Base rate", row.standard_base_rate ?? 0),
+    numberInput("driver_pay_rate", "Driver pay", row.driver_pay_rate ?? 0),
+    numberInput("helper_pay_rate", "Helper pay", row.helper_pay_rate ?? 0),
+    textareaInput("default_extra_note", "Default extra note", row.default_extra_note || "", 'rows="2"'),
+    textareaInput("remarks", "Remarks", row.remarks || "", 'rows="2"'),
+    selectInput("active", "Active", [{ id: "1", name: "Active" }, { id: "0", name: "Inactive" }], row.active ?? "1", (r) => r.name, ""),
+  ];
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const deleteForm = id ? `<form method="post" action="/recurring-trips/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this recurring template? Existing trips will be kept.');"><button class="danger">Delete</button><span class="muted">Existing trips keep their copied details; only the optional recurring-template link is cleared.</span></form>` : "";
+  return `${errorBox}${formPanel(id ? `/recurring-trips/${id}/edit` : "/recurring-trips/new", fields, "Save Template")}${deleteForm}`;
+}
+
+async function recurringListPage(request, env, user, path) {
+  const access = requireView(user, "Recurring Trips");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const where = recurringWhere(query);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY r.master_code, r.id LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((r) => `<tr><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">${esc(r.master_code)}</a>` : esc(r.master_code)}</td><td>${esc(r.client_name || "")}</td><td>${esc(r.origin)} â†’ ${esc(r.destination)}</td><td>${esc(r.asset_code || "")}</td><td>${esc(r.driver_name || "")}</td><td class="num">${esc(r.default_helper_count || 0)}</td><td class="num">${money(r.standard_base_rate)}</td><td class="num">${money(r.driver_pay_rate)}</td><td class="num">${money(r.helper_pay_rate)}</td><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search recurring trips"><button>Search</button></form><div>${canEdit(user, "Recurring Trips") ? `<a class="button" href="/recurring-trips/new">New Template</a>` : ""} <a class="button secondary" href="/recurring-trips/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Code", "Client", "Route", "Asset", "Driver", "Helpers", "Base Rate", "Driver Pay", "Helper Pay", "Actions"], body, { empty: "No recurring trip templates found." })}${pagination("/recurring-trips", query, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Recurring Trips", user, path, content }));
+}
+
+async function recurringFormPage(request, env, user, path, id = null) {
+  const access = requireEdit(user, "Recurring Trips");
+  if (access) return errorResponse(access, user, path);
+  const row = id ? await first(env, "SELECT * FROM recurring_trip_masters WHERE id=?", [id]) : { active: 1 };
+  if (id && !row) return html("Not found", 404);
+  if (request.method === "POST") {
+    const values = recurringValues(await parseForm(request));
+    const errors = await validateRecurring(env, values, id);
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} Recurring Trip Master`, user, path, content: await renderRecurringForm(env, values, id, errors) }), 400);
+    const fields = Object.keys(values);
+    const params = fields.map((field) => values[field]);
+    try {
+      if (id) {
+        await run(env, `UPDATE recurring_trip_masters SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...params, id]);
+        return redirect(`/recurring-trips?ok=${encodeURIComponent("Recurring trip master updated.")}`);
+      }
+      await run(env, `INSERT INTO recurring_trip_masters (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, params);
+      return redirect(`/recurring-trips?ok=${encodeURIComponent("Recurring trip master saved.")}`);
+    } catch (error) {
+      return html(layout({ title: `${id ? "Edit" : "New"} Recurring Trip Master`, user, path, content: await renderRecurringForm(env, values, id, [`Could not save recurring trip: ${error.message || error}`]) }), 400);
+    }
+  }
+  return html(layout({ title: `${id ? "Edit" : "New"} Recurring Trip Master`, user, path, content: await renderRecurringForm(env, row, id) }));
+}
+
+async function recurringDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Recurring Trips");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const row = await first(env, "SELECT id FROM recurring_trip_masters WHERE id=?", [id]);
+  if (!row) return redirect("/recurring-trips?error=Record%20not%20found.");
+  await run(env, "UPDATE trips SET recurring_master_id=NULL WHERE recurring_master_id=?", [id]);
+  await run(env, "DELETE FROM recurring_trip_masters WHERE id=?", [id]);
+  return redirect(`/recurring-trips?ok=${encodeURIComponent("Recurring trip master deleted; existing trips kept their transaction snapshots.")}`);
+}
+
+async function recurringExportPage(request, env, user, path) {
+  const access = requireView(user, "Recurring Trips");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const where = recurringWhere((url.searchParams.get("q") || "").trim());
+  const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY r.id`, where.params);
+  const lines = ["ID,Code,Client,Item / Job,Origin,Destination,Asset,Driver,Helpers,Base Rate,Driver Pay,Helper Pay,Active"];
+  for (const row of rows) {
+    lines.push([row.id, row.master_code, row.client_name || "", row.job_description || "", row.origin || "", row.destination || "", row.asset_code || "", row.driver_name || "", row.default_helper_count || 0, row.standard_base_rate || 0, row.driver_pay_rate || 0, row.helper_pay_rate || 0, row.active ? "True" : "False"].map((value) => `"${String(value).replaceAll('"', '""')}"`).join(","));
+  }
+  return csv(lines.join("\n"), "recurring_trips.csv");
+}
+
 async function tripList(env, user, path) {
   const access = requireView(user, "Trips");
   if (access) return errorResponse(access, user, path);
@@ -391,10 +527,17 @@ export async function handleRequest(request, env) {
     if (del) return masterDelete(request, env, user, base, spec, Number(del[1]));
     if (path === `${base}/export.csv`) return masterExport(request, env, user, base, spec);
   }
-  if (path === "/recurring-trips") return recurringList(env, user, path);
+  let match;
+  if (path === "/recurring-trips") return recurringListPage(request, env, user, path);
+  if (path === "/recurring-trips/new") return recurringFormPage(request, env, user, path);
+  match = path.match(/^\/recurring-trips\/(\d+)\/edit$/);
+  if (match) return recurringFormPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/recurring-trips\/(\d+)\/delete$/);
+  if (match) return recurringDeletePage(request, env, user, path, Number(match[1]));
+  if (path === "/recurring-trips/export.csv") return recurringExportPage(request, env, user, path);
   if (path === "/trips") return tripList(env, user, path);
   if (path === "/trips/new") return tripForm(request, env, user, path);
-  let match = path.match(/^\/trips\/(\d+)\/print$/);
+  match = path.match(/^\/trips\/(\d+)\/print$/);
   if (match) return tripDetail(env, user, path, Number(match[1]), true);
   match = path.match(/^\/trips\/(\d+)$/);
   if (match) return tripDetail(env, user, path, Number(match[1]));
