@@ -18,11 +18,13 @@ async function hmac(secret, message) {
 export async function verifyPassword(password, encoded) {
   const [kind, iterations, salt64, hash64] = String(encoded || "").split("$");
   if (kind !== "pbkdf2_sha256") return false;
+  const iterationCount = Number(iterations);
+  if (!Number.isFinite(iterationCount) || iterationCount > 100000) return false;
   const salt = unb64(salt64);
   const expected = hash64;
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt, iterations: Number(iterations), hash: "SHA-256" },
+    { name: "PBKDF2", salt, iterations: iterationCount, hash: "SHA-256" },
     key,
     256,
   );

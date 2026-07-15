@@ -1,9 +1,9 @@
 INSERT OR IGNORE INTO users (id, username, password_hash, first_name, last_name, email, role, active)
 VALUES
-  (1, 'test_admin', 'pbkdf2_sha256$260000$Z210LXByZXZpZXctc2FsdA$q4DiTWXE27jvichAjIxrLwGXto8xV0NX5i4P_awNFSk', 'Test', 'Admin', 'admin@example.invalid', 'admin', 1),
-  (2, 'test_encoder', 'pbkdf2_sha256$260000$Z210LXByZXZpZXctc2FsdA$q4DiTWXE27jvichAjIxrLwGXto8xV0NX5i4P_awNFSk', 'Test', 'Encoder', 'encoder@example.invalid', 'encoder', 1),
-  (3, 'test_viewer', 'pbkdf2_sha256$260000$Z210LXByZXZpZXctc2FsdA$q4DiTWXE27jvichAjIxrLwGXto8xV0NX5i4P_awNFSk', 'Test', 'Viewer', 'viewer@example.invalid', 'viewer', 1),
-  (4, 'test_accounting', 'pbkdf2_sha256$260000$Z210LXByZXZpZXctc2FsdA$q4DiTWXE27jvichAjIxrLwGXto8xV0NX5i4P_awNFSk', 'Test', 'Accounting', 'accounting@example.invalid', 'accounting', 1);
+  (1, 'test_admin', 'pbkdf2_sha256$100000$Z210LXByZXZpZXctc2FsdA$mC750WqADhKCN332w-WCRoVhAuKGw7Hvzv9jLseosSE', 'Test', 'Admin', 'admin@example.invalid', 'admin', 1),
+  (2, 'test_encoder', 'pbkdf2_sha256$100000$Z210LXByZXZpZXctc2FsdA$mC750WqADhKCN332w-WCRoVhAuKGw7Hvzv9jLseosSE', 'Test', 'Encoder', 'encoder@example.invalid', 'encoder', 1),
+  (3, 'test_viewer', 'pbkdf2_sha256$100000$Z210LXByZXZpZXctc2FsdA$mC750WqADhKCN332w-WCRoVhAuKGw7Hvzv9jLseosSE', 'Test', 'Viewer', 'viewer@example.invalid', 'viewer', 1),
+  (4, 'test_accounting', 'pbkdf2_sha256$100000$Z210LXByZXZpZXctc2FsdA$mC750WqADhKCN332w-WCRoVhAuKGw7Hvzv9jLseosSE', 'Test', 'Accounting', 'accounting@example.invalid', 'accounting', 1);
 
 INSERT OR IGNORE INTO employees (id, employee_code, full_name, employee_type, employment_status, payroll_basis, daily_rate, trip_rate, active)
 VALUES
