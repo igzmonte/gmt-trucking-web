@@ -69,7 +69,15 @@ function errorResponse(error, user, path = "/") {
 async function login(request, env) {
   if (request.method === "GET") return html(loginPage());
   const data = await parseForm(request);
-  const user = await first(env, "SELECT * FROM users WHERE username=? AND active=1", [data.username || ""]);
+  let user;
+  try {
+    user = await first(env, "SELECT * FROM users WHERE username=? AND active=1", [data.username || ""]);
+  } catch (error) {
+    if (String(error?.message || error).toLowerCase().includes("users")) {
+      return html(loginPage("Database is not initialized yet. Run the D1 setup SQL scripts first."), 503);
+    }
+    throw error;
+  }
   if (!user || !(await verifyPassword(data.password || "", user.password_hash))) {
     return html(loginPage("Invalid username or password."), 401);
   }

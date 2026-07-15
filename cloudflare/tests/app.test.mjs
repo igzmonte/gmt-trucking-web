@@ -49,3 +49,19 @@ test("protected routes redirect anonymous users to login", async () => {
   assert.equal(response.status, 303);
   assert.equal(response.headers.get("location"), "/login");
 });
+
+test("login explains when D1 setup has not created users table", async () => {
+  const badEnv = envWithRows();
+  badEnv.DB.prepare = () => ({
+    bind() {
+      return this;
+    },
+    async first() {
+      throw new Error("no such table: users");
+    },
+  });
+  const body = new URLSearchParams({ username: "test_admin", password: "characterization-only" });
+  const response = await handleRequest(new Request("https://example.test/login", { method: "POST", body }), badEnv);
+  assert.equal(response.status, 503);
+  assert.match(await response.text(), /Database is not initialized yet/);
+});
