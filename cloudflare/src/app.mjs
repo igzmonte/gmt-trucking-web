@@ -186,6 +186,17 @@ function paginationWithParams(base, params, page, total) {
   return `<div class="pagination">${link(Math.max(1, page - 1), "Previous", page <= 1)}<span>Page ${page} of ${pages}</span>${link(Math.min(pages, page + 1), "Next", page >= pages)}</div>`;
 }
 
+function paginationWithPageParam(base, params, pageParam, page, total) {
+  const pages = Math.max(1, Math.ceil(total / 25));
+  if (pages <= 1) return `<p class="muted">Page 1 of 1</p>`;
+  const link = (target, label, disabled = false) => {
+    const next = new URLSearchParams(params);
+    next.set(pageParam, String(target));
+    return disabled ? `<span class="button secondary disabled">${esc(label)}</span>` : `<a class="button secondary" href="${esc(`${base}?${next.toString()}`)}">${esc(label)}</a>`;
+  };
+  return `<div class="pagination">${link(Math.max(1, page - 1), "Previous", page <= 1)}<span>Page ${page} of ${pages}</span>${link(Math.min(pages, page + 1), "Next", page >= pages)}</div>`;
+}
+
 async function validateMaster(env, spec, values, id = null) {
   const errors = [];
   for (const field of spec.required || []) {
@@ -784,6 +795,471 @@ async function tripExportPage(request, env, user, path) {
   return csv(lines.join("\n"), "trips.csv");
 }
 
+const REPAIR_STATUSES = ["Open", "Completed", "Cancelled"];
+const PAYABLE_STATUSES = ["Open", "Partial", "Paid", "Cancelled"];
+const ADVANCE_STATUSES = ["Open", "Paid", "Cancelled"];
+
+function quotedCsvRow(values) {
+  return values.map((value) => `"${String(value ?? "").replaceAll('"', '""')}"`).join(",");
+}
+
+function numeric(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function numericText(value) {
+  return String(numeric(value));
+}
+
+function requireNonNegative(values, fields) {
+  const errors = [];
+  for (const field of fields) {
+    if (numeric(values[field]) < 0) errors.push(`${field.replaceAll("_", " ")} cannot be negative.`);
+  }
+  return errors;
+}
+
+function repairWhere(query, status = "") {
+  const clauses = [];
+  const params = [];
+  if (query) {
+    clauses.push("(r.repair_description LIKE ? OR r.meter_value LIKE ? OR a.asset_code LIKE ? OR s.supplier_name LIKE ?)");
+    params.push(...Array(4).fill(`%${query}%`));
+  }
+  if (status && REPAIR_STATUSES.includes(status)) {
+    clauses.push("r.status=?");
+    params.push(status);
+  }
+  return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+function repairValues(data) {
+  const parts = numeric(data.parts_cost);
+  const labor = numeric(data.labor_cost);
+  const other = numeric(data.other_cost);
+  return {
+    repair_date: (data.repair_date || "").trim(),
+    asset_id: data.asset_id || null,
+    repair_description: (data.repair_description || "").trim(),
+    meter_value: (data.meter_value || "").trim(),
+    supplier_id: data.supplier_id || null,
+    parts_cost: String(parts),
+    labor_cost: String(labor),
+    other_cost: String(other),
+    total_cost: String(parts + labor + other),
+    status: REPAIR_STATUSES.includes(data.status) ? data.status : "Open",
+    notes: (data.notes || "").trim(),
+    auto_generate_payable: data.auto_generate_payable === "1" ? "1" : "0",
+  };
+}
+
+async function repairChoices(env) {
+  return await Promise.all([
+    all(env, "SELECT * FROM assets ORDER BY asset_code"),
+    all(env, "SELECT * FROM suppliers ORDER BY supplier_name"),
+  ]);
+}
+
+async function renderRepairForm(env, row = {}, id = null, errors = []) {
+  const [assets, suppliers] = await repairChoices(env);
+  const fields = [
+    textInput("repair_date", "Repair date", row.repair_date || todayISO(), 'type="date" required'),
+    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r)),
+    textareaInput("repair_description", "Description", row.repair_description || "", 'rows="2" required'),
+    textInput("meter_value", "Meter value", row.meter_value || ""),
+    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r)),
+    numberInput("parts_cost", "Parts cost", row.parts_cost ?? 0),
+    numberInput("labor_cost", "Labor cost", row.labor_cost ?? 0),
+    numberInput("other_cost", "Other cost", row.other_cost ?? 0),
+    selectInput("status", "Status", REPAIR_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, ""),
+    selectInput("auto_generate_payable", "Auto-generate payable", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.auto_generate_payable ? "1" : "0", (r) => r.name, ""),
+    textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
+  ];
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const deleteForm = id ? `<form method="post" action="/repairs/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this repair?');"><button class="danger">Delete</button></form>` : "";
+  return `${errorBox}${formPanel(id ? `/repairs/${id}/edit` : "/repairs/new", fields, "Save Repair")}${deleteForm}`;
+}
+
+async function validateRepair(values) {
+  const errors = [];
+  if (!values.repair_date) errors.push("repair date is required.");
+  if (!values.repair_description) errors.push("repair description is required.");
+  errors.push(...requireNonNegative(values, ["parts_cost", "labor_cost", "other_cost", "total_cost"]));
+  return errors;
+}
+
+async function upsertRepairPayable(env, repairId, values) {
+  if (values.auto_generate_payable !== "1" || !values.supplier_id || numeric(values.total_cost) <= 0) return;
+  const existing = await first(env, "SELECT id FROM payables WHERE linked_repair_id=?", [repairId]);
+  const payable = {
+    payable_date: values.repair_date,
+    supplier_id: values.supplier_id,
+    source_type: "Repair",
+    reference_no: `REPAIR-${String(repairId).padStart(6, "0")}`,
+    description: values.repair_description,
+    amount: values.total_cost,
+    due_date: "",
+    status: "Open",
+    notes: values.notes,
+    linked_repair_id: repairId,
+  };
+  const fields = Object.keys(payable);
+  if (existing) {
+    await run(env, `UPDATE payables SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...fields.map((field) => payable[field]), existing.id]);
+  } else {
+    await run(env, `INSERT INTO payables (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => payable[field]));
+  }
+}
+
+async function saveRepair(env, values, id = null) {
+  const fields = Object.keys(values);
+  let repairId = id;
+  if (id) {
+    await run(env, `UPDATE repairs SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...fields.map((field) => values[field]), id]);
+  } else {
+    const result = await run(env, `INSERT INTO repairs (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
+    repairId = result?.meta?.last_row_id;
+    if (!repairId) {
+      const created = await first(env, "SELECT id FROM repairs WHERE repair_date=? AND repair_description=? ORDER BY id DESC LIMIT 1", [values.repair_date, values.repair_description]);
+      repairId = created?.id;
+    }
+  }
+  await upsertRepairPayable(env, repairId, values);
+  return repairId;
+}
+
+async function repairsPage(request, env, user, path) {
+  const access = requireView(user, "Repairs");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const status = (url.searchParams.get("status") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const where = repairWhere(query, status);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT r.*, a.asset_code, a.plate_no, s.supplier_name, p.reference_no AS payable_ref FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id LEFT JOIN payables p ON p.linked_repair_id=r.id${where.sql} ORDER BY r.repair_date DESC, r.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((row) => `<tr><td>${esc(row.repair_date)}</td><td>${esc(row.asset_code || "")}<small class="cell-detail">${esc(row.plate_no || "")}</small></td><td>${canEdit(user, "Repairs") ? `<a href="/repairs/${row.id}/edit">${esc(row.repair_description)}</a>` : esc(row.repair_description)}</td><td>${esc(row.supplier_name || "")}</td><td>${esc(row.meter_value || "")}</td>${moneyCell(row.total_cost)}<td><span class="status">${esc(row.status)}</span></td><td>${esc(row.payable_ref || "")}</td><td>${canEdit(user, "Repairs") ? `<a href="/repairs/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (status) params.set("status", status);
+  const statusOptions = `<select name="status"><option value="">All statuses</option>${REPAIR_STATUSES.map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search repairs">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Repairs") ? `<a class="button" href="/repairs/new">New Repair</a>` : ""} <a class="button secondary" href="${esc(`/repairs/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Asset", "Description", "Supplier", "Meter", "Total Cost", "Status", "Payable", "Actions"], body, { empty: "No repairs found." })}${paginationWithParams("/repairs", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Repairs", user, path, content }));
+}
+
+async function repairFormPage(request, env, user, path, id = null) {
+  const access = requireEdit(user, "Repairs");
+  if (access) return errorResponse(access, user, path);
+  const row = id ? await first(env, "SELECT * FROM repairs WHERE id=?", [id]) : { repair_date: todayISO(), status: "Open" };
+  if (id && !row) return html("Not found", 404);
+  if (request.method === "POST") {
+    const values = repairValues(await parseForm(request));
+    const errors = await validateRepair(values);
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} Repair`, user, path, content: await renderRepairForm(env, values, id, errors) }), 400);
+    try {
+      await saveRepair(env, values, id);
+      return redirect(`/repairs?ok=${encodeURIComponent(id ? "Repair updated." : "Repair saved.")}`);
+    } catch (error) {
+      return html(layout({ title: `${id ? "Edit" : "New"} Repair`, user, path, content: await renderRepairForm(env, values, id, [`Could not save repair: ${error.message || error}`]) }), 400);
+    }
+  }
+  return html(layout({ title: `${id ? "Edit" : "New"} Repair`, user, path, content: await renderRepairForm(env, row, id) }));
+}
+
+async function repairDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Repairs");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  await run(env, "DELETE FROM payables WHERE linked_repair_id=?", [id]);
+  await run(env, "DELETE FROM repairs WHERE id=?", [id]);
+  return redirect(`/repairs?ok=${encodeURIComponent("Repair deleted.")}`);
+}
+
+async function repairExportPage(request, env, user, path) {
+  const access = requireView(user, "Repairs");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const where = repairWhere((url.searchParams.get("q") || "").trim(), (url.searchParams.get("status") || "").trim());
+  const rows = await all(env, `SELECT r.*, a.asset_code, s.supplier_name, p.reference_no AS payable_ref FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id LEFT JOIN payables p ON p.linked_repair_id=r.id${where.sql} ORDER BY r.id`, where.params);
+  const lines = ["ID,Date,Asset,Description,Supplier,Meter,Parts,Labor,Other,Total Cost,Status,Payable"];
+  for (const row of rows) lines.push(quotedCsvRow([row.id, row.repair_date, row.asset_code || "", row.repair_description, row.supplier_name || "", row.meter_value, row.parts_cost, row.labor_cost, row.other_cost, row.total_cost, row.status, row.payable_ref || ""]));
+  return csv(lines.join("\n"), "repairs.csv");
+}
+
+function payableWhere(query, status = "") {
+  const clauses = [];
+  const params = [];
+  if (query) {
+    clauses.push("(p.reference_no LIKE ? OR p.description LIKE ? OR s.supplier_name LIKE ? OR p.source_type LIKE ?)");
+    params.push(...Array(4).fill(`%${query}%`));
+  }
+  if (status && PAYABLE_STATUSES.includes(status)) {
+    clauses.push("p.status=?");
+    params.push(status);
+  }
+  return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+function payableValues(data) {
+  return {
+    payable_date: (data.payable_date || "").trim(),
+    supplier_id: data.supplier_id || null,
+    source_type: (data.source_type || "Manual").trim(),
+    reference_no: (data.reference_no || "").trim(),
+    description: (data.description || "").trim(),
+    amount: numericText(data.amount),
+    due_date: (data.due_date || "").trim(),
+    status: PAYABLE_STATUSES.includes(data.status) ? data.status : "Open",
+    notes: (data.notes || "").trim(),
+    linked_repair_id: data.linked_repair_id || null,
+  };
+}
+
+async function payableChoices(env) {
+  return await Promise.all([
+    all(env, "SELECT * FROM suppliers ORDER BY supplier_name"),
+    all(env, "SELECT id, repair_date, repair_description FROM repairs ORDER BY repair_date DESC, id DESC LIMIT 200"),
+  ]);
+}
+
+async function renderPayableForm(env, row = {}, id = null, errors = []) {
+  const [suppliers, repairs] = await payableChoices(env);
+  const fields = [
+    textInput("payable_date", "Payable date", row.payable_date || todayISO(), 'type="date" required'),
+    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r)),
+    textInput("source_type", "Source type", row.source_type || "Manual"),
+    textInput("reference_no", "Reference no.", row.reference_no || ""),
+    textareaInput("description", "Description", row.description || "", 'rows="2" required'),
+    numberInput("amount", "Amount", row.amount ?? 0),
+    textInput("due_date", "Due date", row.due_date || "", 'type="date"'),
+    selectInput("status", "Status", PAYABLE_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, ""),
+    selectInput("linked_repair_id", "Linked repair", repairs, row.linked_repair_id || "", (r) => `Repair #${r.id} — ${r.repair_date} — ${r.repair_description}`),
+    textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
+  ];
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const deleteForm = id ? `<form method="post" action="/payables/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this payable? Repair-linked payables are protected.');"><button class="danger">Delete</button></form>` : "";
+  return `${errorBox}${formPanel(id ? `/payables/${id}/edit` : "/payables/new", fields, "Save Payable")}${deleteForm}`;
+}
+
+function validatePayable(values) {
+  const errors = [];
+  if (!values.payable_date) errors.push("payable date is required.");
+  if (!values.description) errors.push("description is required.");
+  if (numeric(values.amount) < 0) errors.push("amount cannot be negative.");
+  return errors;
+}
+
+async function payablesPage(request, env, user, path) {
+  const access = requireView(user, "Payables");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const status = (url.searchParams.get("status") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const where = payableWhere(query, status);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql} ORDER BY p.payable_date DESC, p.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((row) => `<tr><td>${esc(row.payable_date)}</td><td>${canEdit(user, "Payables") ? `<a href="/payables/${row.id}/edit">${esc(row.reference_no || `PAY-${row.id}`)}</a>` : esc(row.reference_no || `PAY-${row.id}`)}</td><td>${esc(row.supplier_name || "")}</td><td>${esc(row.source_type || "")}</td><td>${esc(row.description || "")}</td>${moneyCell(row.amount)}<td>${esc(row.due_date || "")}</td><td><span class="status">${esc(row.status)}</span></td><td>${row.linked_repair_id ? `Repair #${esc(row.linked_repair_id)}` : ""}</td><td>${canEdit(user, "Payables") ? `<a href="/payables/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (status) params.set("status", status);
+  const statusOptions = `<select name="status"><option value="">All statuses</option>${PAYABLE_STATUSES.map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search payables">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Payables") ? `<a class="button" href="/payables/new">New Payable</a>` : ""} <a class="button secondary" href="${esc(`/payables/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Ref. No.", "Supplier", "Source", "Description", "Amount", "Due", "Status", "Linked Repair", "Actions"], body, { empty: "No payables found." })}${paginationWithParams("/payables", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Payables", user, path, content }));
+}
+
+async function payableFormPage(request, env, user, path, id = null) {
+  const access = requireEdit(user, "Payables");
+  if (access) return errorResponse(access, user, path);
+  const row = id ? await first(env, "SELECT * FROM payables WHERE id=?", [id]) : { payable_date: todayISO(), source_type: "Manual", status: "Open" };
+  if (id && !row) return html("Not found", 404);
+  if (request.method === "POST") {
+    const values = payableValues(await parseForm(request));
+    const errors = validatePayable(values);
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} Payable`, user, path, content: await renderPayableForm(env, values, id, errors) }), 400);
+    const fields = Object.keys(values);
+    try {
+      if (id) await run(env, `UPDATE payables SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...fields.map((field) => values[field]), id]);
+      else await run(env, `INSERT INTO payables (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
+      return redirect(`/payables?ok=${encodeURIComponent(id ? "Payable updated." : "Payable saved.")}`);
+    } catch (error) {
+      return html(layout({ title: `${id ? "Edit" : "New"} Payable`, user, path, content: await renderPayableForm(env, values, id, [`Could not save payable: ${error.message || error}`]) }), 400);
+    }
+  }
+  return html(layout({ title: `${id ? "Edit" : "New"} Payable`, user, path, content: await renderPayableForm(env, row, id) }));
+}
+
+async function payableDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Payables");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const row = await first(env, "SELECT * FROM payables WHERE id=?", [id]);
+  if (row?.linked_repair_id) return redirect(`/payables?error=${encodeURIComponent("Cannot delete a repair-linked payable. Unlink the repair/payable first.")}`);
+  await run(env, "DELETE FROM payables WHERE id=?", [id]);
+  return redirect(`/payables?ok=${encodeURIComponent("Payable deleted.")}`);
+}
+
+async function payableExportPage(request, env, user, path) {
+  const access = requireView(user, "Payables");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const where = payableWhere((url.searchParams.get("q") || "").trim(), (url.searchParams.get("status") || "").trim());
+  const rows = await all(env, `SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql} ORDER BY p.id`, where.params);
+  const lines = ["ID,Date,Supplier,Source,Reference No.,Description,Amount,Due Date,Status,Linked Repair"];
+  for (const row of rows) lines.push(quotedCsvRow([row.id, row.payable_date, row.supplier_name || "", row.source_type, row.reference_no, row.description, row.amount, row.due_date || "", row.status, row.linked_repair_id || ""]));
+  return csv(lines.join("\n"), "payables.csv");
+}
+
+const ADVANCE_SPECS = {
+  vale: {
+    page: "Vale / Cash Advance",
+    title: "Vale",
+    table: "vale_records",
+    route: "vale",
+    dateField: "date_granted",
+    amountFields: ["amount", "installment_amount", "balance"],
+    columns: ["employee_name", "date_granted", "amount", "installment_amount", "balance", "status"],
+    labels: ["Employee", "Date", "Amount", "Installment", "Balance", "Status"],
+  },
+  cash: {
+    page: "Vale / Cash Advance",
+    title: "Cash Advance",
+    table: "cash_advances",
+    route: "cash",
+    dateField: "date_granted",
+    amountFields: ["amount", "balance"],
+    columns: ["employee_name", "date_granted", "amount", "balance", "applied", "status"],
+    labels: ["Employee", "Date", "Amount", "Balance", "Applied", "Status"],
+  },
+};
+
+function advanceValues(data, type) {
+  const amount = numeric(data.amount);
+  const balanceValue = data.balance === undefined || data.balance === "" ? amount : numeric(data.balance);
+  const values = {
+    employee_id: data.employee_id || null,
+    date_granted: (data.date_granted || "").trim(),
+    amount: String(amount),
+    balance: String(balanceValue),
+    status: ADVANCE_STATUSES.includes(data.status) ? data.status : "Open",
+    notes: (data.notes || "").trim(),
+  };
+  if (type === "vale") values.installment_amount = numericText(data.installment_amount);
+  if (type === "cash") values.applied = data.applied === "1" ? "1" : "0";
+  return values;
+}
+
+function validateAdvance(values, type) {
+  const errors = [];
+  if (!values.employee_id) errors.push("employee is required.");
+  if (!values.date_granted) errors.push("date granted is required.");
+  errors.push(...requireNonNegative(values, type === "vale" ? ["amount", "installment_amount", "balance"] : ["amount", "balance"]));
+  return errors;
+}
+
+async function renderAdvanceForm(env, type, row = {}, id = null, errors = []) {
+  const employees = await all(env, "SELECT * FROM employees WHERE active=1 ORDER BY full_name");
+  const fields = [
+    selectInput("employee_id", "Employee", employees, row.employee_id || "", (r) => choiceLabel("employee", r)),
+    textInput("date_granted", "Date granted", row.date_granted || todayISO(), 'type="date" required'),
+    numberInput("amount", "Amount", row.amount ?? 0),
+    ...(type === "vale" ? [numberInput("installment_amount", "Installment amount", row.installment_amount ?? 0)] : [selectInput("applied", "Applied", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.applied ? "1" : "0", (r) => r.name, "")]),
+    numberInput("balance", "Balance", row.balance ?? row.amount ?? 0),
+    selectInput("status", "Status", ADVANCE_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, ""),
+    textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
+  ];
+  const spec = ADVANCE_SPECS[type];
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const deleteForm = id ? `<form method="post" action="/advances/${type}/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this ${esc(spec.title)} record?');"><button class="danger">Delete</button></form>` : "";
+  return `${errorBox}${formPanel(id ? `/advances/${type}/${id}/edit` : `/advances/${type}/new`, fields, `Save ${spec.title}`)}${deleteForm}`;
+}
+
+function advanceWhere(query, alias = "v") {
+  if (!query) return { sql: "", params: [] };
+  return {
+    sql: ` WHERE e.full_name LIKE ? OR e.employee_code LIKE ? OR ${alias}.status LIKE ? OR ${alias}.notes LIKE ?`,
+    params: Array(4).fill(`%${query}%`),
+  };
+}
+
+async function advancesPage(request, env, user, path) {
+  const access = requireView(user, "Vale / Cash Advance");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const valePage = Math.max(1, Number(url.searchParams.get("vale_page") || 1) || 1);
+  const cashPage = Math.max(1, Number(url.searchParams.get("cash_page") || 1) || 1);
+  const valeWhere = advanceWhere(query, "v");
+  const cashWhere = advanceWhere(query, "c");
+  const [valeCount, cashCount, valeRows, cashRows] = await Promise.all([
+    first(env, `SELECT COUNT(*) AS total FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id${valeWhere.sql}`, valeWhere.params),
+    first(env, `SELECT COUNT(*) AS total FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id${cashWhere.sql}`, cashWhere.params),
+    all(env, `SELECT v.*, e.full_name AS employee_name, e.employee_code FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id${valeWhere.sql} ORDER BY v.date_granted DESC, v.id DESC LIMIT 25 OFFSET ?`, [...valeWhere.params, (valePage - 1) * 25]),
+    all(env, `SELECT c.*, e.full_name AS employee_name, e.employee_code FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id${cashWhere.sql} ORDER BY c.date_granted DESC, c.id DESC LIMIT 25 OFFSET ?`, [...cashWhere.params, (cashPage - 1) * 25]),
+  ]);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search advances"><button>Search</button></form><div>${canEdit(user, "Vale / Cash Advance") ? `<a class="button" href="/advances/vale/new">New Vale</a> <a class="button" href="/advances/cash/new">New Cash Advance</a>` : ""}</div></div>`;
+  const valeBody = valeRows.map((row) => `<tr><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/vale/${row.id}/edit">${esc(row.employee_name || "")}</a>` : esc(row.employee_name || "")}</td><td>${esc(row.date_granted)}</td>${moneyCell(row.amount)}${moneyCell(row.installment_amount)}${moneyCell(row.balance)}<td><span class="status">${esc(row.status)}</span></td><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/vale/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
+  const cashBody = cashRows.map((row) => `<tr><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/cash/${row.id}/edit">${esc(row.employee_name || "")}</a>` : esc(row.employee_name || "")}</td><td>${esc(row.date_granted)}</td>${moneyCell(row.amount)}${moneyCell(row.balance)}<td>${row.applied ? "Yes" : "No"}</td><td><span class="status">${esc(row.status)}</span></td><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/cash/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section><section class="panel"><div class="toolbar"><h3>Vale</h3><a class="button secondary" href="${esc(`/advances/vale/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Vale CSV</a></div></section>${table(["Employee", "Date", "Amount", "Installment", "Balance", "Status", "Actions"], valeBody, { empty: "No vale records found." })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["cash_page", String(cashPage)]]), "vale_page", valePage, Number(valeCount?.total || 0))}<section class="panel"><div class="toolbar"><h3>Cash Advance</h3><a class="button secondary" href="${esc(`/advances/cash/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Cash CSV</a></div></section>${table(["Employee", "Date", "Amount", "Balance", "Applied", "Status", "Actions"], cashBody, { empty: "No cash advances found." })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["vale_page", String(valePage)]]), "cash_page", cashPage, Number(cashCount?.total || 0))}`;
+  return html(layout({ title: "Vale / Cash Advance", user, path, content }));
+}
+
+async function advanceFormPage(request, env, user, path, type, id = null) {
+  const spec = ADVANCE_SPECS[type];
+  if (!spec) return html("Not found", 404);
+  const access = requireEdit(user, spec.page);
+  if (access) return errorResponse(access, user, path);
+  const row = id ? await first(env, `SELECT * FROM ${spec.table} WHERE id=?`, [id]) : { date_granted: todayISO(), status: "Open" };
+  if (id && !row) return html("Not found", 404);
+  if (request.method === "POST") {
+    const values = advanceValues(await parseForm(request), type);
+    const errors = validateAdvance(values, type);
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: await renderAdvanceForm(env, type, values, id, errors) }), 400);
+    const fields = Object.keys(values);
+    try {
+      if (id) await run(env, `UPDATE ${spec.table} SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...fields.map((field) => values[field]), id]);
+      else await run(env, `INSERT INTO ${spec.table} (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
+      return redirect(`/advances?ok=${encodeURIComponent(`${spec.title} ${id ? "updated" : "saved"}.`)}`);
+    } catch (error) {
+      return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: await renderAdvanceForm(env, type, values, id, [`Could not save ${spec.title}: ${error.message || error}`]) }), 400);
+    }
+  }
+  return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: await renderAdvanceForm(env, type, row, id) }));
+}
+
+async function advanceDeletePage(request, env, user, path, type, id) {
+  const spec = ADVANCE_SPECS[type];
+  if (!spec) return html("Not found", 404);
+  const access = requireEdit(user, spec.page);
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  await run(env, `DELETE FROM ${spec.table} WHERE id=?`, [id]);
+  return redirect(`/advances?ok=${encodeURIComponent(`${spec.title} deleted.`)}`);
+}
+
+async function advanceExportPage(request, env, user, path, type) {
+  const spec = ADVANCE_SPECS[type];
+  if (!spec) return html("Not found", 404);
+  const access = requireView(user, spec.page);
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const alias = type === "vale" ? "v" : "c";
+  const where = advanceWhere((url.searchParams.get("q") || "").trim(), alias);
+  const rows = await all(env, `SELECT ${alias}.*, e.full_name AS employee_name, e.employee_code FROM ${spec.table} ${alias} LEFT JOIN employees e ON e.id=${alias}.employee_id${where.sql} ORDER BY ${alias}.id`, where.params);
+  const lines = [type === "vale" ? "ID,Employee,Date,Amount,Installment Amount,Balance,Status" : "ID,Employee,Date,Amount,Balance,Applied,Status"];
+  for (const row of rows) {
+    lines.push(type === "vale"
+      ? quotedCsvRow([row.id, row.employee_name || "", row.date_granted, row.amount, row.installment_amount, row.balance, row.status])
+      : quotedCsvRow([row.id, row.employee_name || "", row.date_granted, row.amount, row.balance, row.applied ? "Yes" : "No", row.status]));
+  }
+  return csv(lines.join("\n"), `${spec.table}.csv`);
+}
+
 async function reportList(env, user, path) {
   const access = requireView(user, "Reports");
   if (access) return errorResponse(access, user, path);
@@ -837,10 +1313,30 @@ export async function handleRequest(request, env) {
   if (match) return tripDeletePage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/trips\/(\d+)$/);
   if (match) return tripDetailPage(request, env, user, path, Number(match[1]));
+  if (path === "/repairs") return repairsPage(request, env, user, path);
+  if (path === "/repairs/new") return repairFormPage(request, env, user, path);
+  if (path === "/repairs/export.csv") return repairExportPage(request, env, user, path);
+  match = path.match(/^\/repairs\/(\d+)\/edit$/);
+  if (match) return repairFormPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/repairs\/(\d+)\/delete$/);
+  if (match) return repairDeletePage(request, env, user, path, Number(match[1]));
+  if (path === "/payables") return payablesPage(request, env, user, path);
+  if (path === "/payables/new") return payableFormPage(request, env, user, path);
+  if (path === "/payables/export.csv") return payableExportPage(request, env, user, path);
+  match = path.match(/^\/payables\/(\d+)\/edit$/);
+  if (match) return payableFormPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/payables\/(\d+)\/delete$/);
+  if (match) return payableDeletePage(request, env, user, path, Number(match[1]));
+  if (path === "/advances") return advancesPage(request, env, user, path);
+  if (path === "/advances/vale/new") return advanceFormPage(request, env, user, path, "vale");
+  if (path === "/advances/cash/new") return advanceFormPage(request, env, user, path, "cash");
+  if (path === "/advances/vale/export.csv") return advanceExportPage(request, env, user, path, "vale");
+  if (path === "/advances/cash/export.csv") return advanceExportPage(request, env, user, path, "cash");
+  match = path.match(/^\/advances\/(vale|cash)\/(\d+)\/edit$/);
+  if (match) return advanceFormPage(request, env, user, path, match[1], Number(match[2]));
+  match = path.match(/^\/advances\/(vale|cash)\/(\d+)\/delete$/);
+  if (match) return advanceDeletePage(request, env, user, path, match[1], Number(match[2]));
   if (path === "/reports") return reportList(env, user, path);
-  if (path === "/repairs") return placeholder("Repairs", user, path, "Repairs");
-  if (path === "/payables") return placeholder("Payables", user, path, "Payables");
-  if (path === "/advances") return placeholder("Vale / Cash Advance", user, path, "Vale / Cash Advance");
   if (path === "/payroll") return placeholder("Payroll", user, path, "Payroll");
   if (path === "/billing") return placeholder("Billing", user, path, "Billing");
   if (path === "/collections") return placeholder("Collections", user, path, "Collections");

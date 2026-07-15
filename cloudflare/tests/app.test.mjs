@@ -29,10 +29,15 @@ function envWithRows(rows = {}) {
             return this;
           },
           async all() {
+            if (state.sql.includes("FROM repairs r")) return { results: rows.repairs || [] };
+            if (state.sql.includes("FROM payables p")) return { results: rows.payables || [] };
+            if (state.sql.includes("FROM vale_records v")) return { results: rows.vale || [] };
+            if (state.sql.includes("FROM cash_advances c")) return { results: rows.cashAdvances || [] };
             if (state.sql.includes("FROM trips t")) return { results: rows.trips || [] };
             if (state.sql.includes("FROM trip_helpers th")) return { results: rows.tripHelpers || [] };
             if (state.sql.includes("FROM trip_employee_pay_items")) return { results: rows.payItems || [] };
             if (state.sql.includes("FROM recurring_trip_masters r")) return { results: filtered("recurring").slice(0, 25) };
+            if (state.sql.includes("FROM repairs ORDER BY")) return { results: rows.repairs || [] };
             if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Driver'")) return { results: rows.drivers || filtered("employees").filter((row) => row.employee_type === "Driver").slice(0, 25) };
             if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Helper'")) return { results: rows.helpers || filtered("employees").filter((row) => row.employee_type === "Helper").slice(0, 25) };
             if (state.sql.includes("FROM employees")) return { results: filtered("employees").slice(0, 25) };
@@ -43,6 +48,10 @@ function envWithRows(rows = {}) {
           },
           async first() {
             if (state.sql.includes("FROM users")) return rows.user || null;
+            if (state.sql.includes("COUNT(*) AS total FROM repairs r")) return { total: rows.repairsCount ?? filtered("repairs").length };
+            if (state.sql.includes("COUNT(*) AS total FROM payables p")) return { total: rows.payablesCount ?? filtered("payables").length };
+            if (state.sql.includes("COUNT(*) AS total FROM vale_records v")) return { total: rows.valeCount ?? filtered("vale").length };
+            if (state.sql.includes("COUNT(*) AS total FROM cash_advances c")) return { total: rows.cashCount ?? filtered("cashAdvances").length };
             if (state.sql.includes("COUNT(*) AS total FROM trips WHERE")) return { total: (rows.refs || {}).trips || 0 };
             if (state.sql.includes("COUNT(*) AS total FROM trips")) return { total: rows.tripsCount ?? filtered("trips").length };
             if (state.sql.includes("COUNT(*) AS total FROM recurring_trip_masters") && state.sql.includes("LIKE")) return { total: rows.recurringCount ?? filtered("recurring").length };
@@ -74,6 +83,15 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("SELECT id FROM assets WHERE id=?")) return byId("assets") || null;
             if (state.sql.includes("SELECT id FROM clients WHERE id=?")) return byId("clients") || null;
             if (state.sql.includes("SELECT id FROM suppliers WHERE id=?")) return byId("suppliers") || null;
+            if (state.sql.includes("SELECT * FROM repairs WHERE id=?")) return byId("repairs") || null;
+            if (state.sql.includes("SELECT * FROM payables WHERE id=?")) return byId("payables") || null;
+            if (state.sql.includes("SELECT * FROM vale_records WHERE id=?")) return byId("vale") || null;
+            if (state.sql.includes("SELECT * FROM cash_advances WHERE id=?")) return byId("cashAdvances") || null;
+            if (state.sql.includes("SELECT id FROM repairs WHERE repair_date=?")) {
+              if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO repairs"))) return { id: rows.createdRepairId || 41 };
+              return null;
+            }
+            if (state.sql.includes("SELECT id FROM payables WHERE linked_repair_id=?")) return rows.linkedPayable || null;
             if (state.sql.includes("SELECT * FROM recurring_trip_masters WHERE id=?")) return byId("recurring") || null;
             if (state.sql.includes("SELECT * FROM employees WHERE id=?")) return byId("employees") || null;
             if (state.sql.includes("SELECT * FROM assets WHERE id=?")) return byId("assets") || null;
@@ -180,6 +198,53 @@ function sampleTrip(overrides = {}) {
     helper_names: "Helper One",
     ...overrides,
   };
+}
+
+function repairBody(overrides = {}) {
+  return new URLSearchParams({
+    repair_date: "2026-07-16",
+    asset_id: "2",
+    repair_description: "Oil change",
+    meter_value: "12000 km",
+    supplier_id: "7",
+    parts_cost: "1000",
+    labor_cost: "500",
+    other_cost: "250",
+    status: "Open",
+    auto_generate_payable: "1",
+    notes: "Urgent",
+    ...overrides,
+  });
+}
+
+function payableBody(overrides = {}) {
+  return new URLSearchParams({
+    payable_date: "2026-07-16",
+    supplier_id: "7",
+    source_type: "Manual",
+    reference_no: "BILL-1",
+    description: "Parts bill",
+    amount: "1200",
+    due_date: "2026-07-30",
+    status: "Open",
+    linked_repair_id: "",
+    notes: "",
+    ...overrides,
+  });
+}
+
+function advanceBody(overrides = {}) {
+  return new URLSearchParams({
+    employee_id: "4",
+    date_granted: "2026-07-16",
+    amount: "1000",
+    installment_amount: "250",
+    balance: "",
+    applied: "0",
+    status: "Open",
+    notes: "Preview",
+    ...overrides,
+  });
 }
 
 test("health endpoint is public and reports Cloudflare runtime", async () => {
@@ -575,4 +640,166 @@ test("trip delete is POST-only, protected by billing and payroll, and removes un
   assert.match(runs[0].sql, /DELETE FROM trip_helpers/);
   assert.match(runs[1].sql, /DELETE FROM trip_employee_pay_items/);
   assert.match(runs[2].sql, /DELETE FROM trips/);
+});
+
+test("repairs list supports search, pagination, export, and detailed linked data", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/repairs?q=oil&status=Open&page=2", "admin"), envWithRows({
+    repairsCount: 30,
+    repairs: [{
+      id: 1, repair_date: "2026-07-16", asset_code: "UNIT-001", plate_no: "ABC-123", repair_description: "Oil change",
+      supplier_name: "Parts Supplier", meter_value: "12000 km", total_cost: 1750, status: "Open", payable_ref: "REPAIR-000001",
+    }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Oil change/);
+  assert.match(text, /REPAIR-000001/);
+  assert.match(text, /Page 2 of 2/);
+  assert.match(text, /\/repairs\/1\/edit/);
+  assert.match(text, /\/repairs\/export\.csv\?q=oil&amp;status=Open/);
+});
+
+test("repair form shows asset and supplier detail labels", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/repairs/new", "admin"), envWithRows({
+    assets: [{ id: 2, asset_code: "UNIT-001", plate_no: "ABC-123", asset_type: "Cargo Truck", make_model: "Isuzu" }],
+    suppliers: [{ id: 7, supplier_name: "Parts Supplier", contact_person: "Ana" }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /UNIT-001/);
+  assert.match(text, /ABC-123/);
+  assert.match(text, /Parts Supplier/);
+  assert.match(text, /Ana/);
+});
+
+test("repair create calculates total and auto-generates linked payable", async () => {
+  const runs = [];
+  const response = await handleRequest(await authedRequest("https://example.test/repairs/new", "encoder", { method: "POST", body: repairBody() }), envWithRows({
+    runs,
+    createdRepairId: 41,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /Repair%20saved/);
+  assert.match(runs[0].sql, /INSERT INTO repairs/);
+  assert.equal(runs[0].params[8], "1750");
+  assert.match(runs.at(-1).sql, /INSERT INTO payables/);
+  assert.equal(runs.at(-1).params[3], "REPAIR-000041");
+  assert.equal(runs.at(-1).params[5], "1750");
+});
+
+test("repair edit updates existing linked payable", async () => {
+  const runs = [];
+  const response = await handleRequest(await authedRequest("https://example.test/repairs/1/edit", "admin", { method: "POST", body: repairBody({ labor_cost: "700" }) }), envWithRows({
+    runs,
+    repairs: [{ id: 1, repair_date: "2026-07-15", repair_description: "Old repair" }],
+    linkedPayable: { id: 9 },
+  }));
+  assert.equal(response.status, 303);
+  assert.match(runs[0].sql, /UPDATE repairs SET/);
+  assert.match(runs.at(-1).sql, /UPDATE payables SET/);
+  assert.equal(runs.at(-1).params[5], "1950");
+});
+
+test("repair validation rejects required and negative values", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/repairs/new", "admin", { method: "POST", body: repairBody({ repair_date: "", repair_description: "" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /repair date is required/);
+
+  response = await handleRequest(await authedRequest("https://example.test/repairs/new", "admin", { method: "POST", body: repairBody({ parts_cost: "-1" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /parts cost cannot be negative/);
+});
+
+test("payables list, CSV export, and repair-linked delete protection work", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/payables?q=BILL&page=2", "accounting"), envWithRows({
+    payablesCount: 30,
+    payables: [{ id: 1, payable_date: "2026-07-16", reference_no: "BILL-1", supplier_name: "Parts Supplier", source_type: "Manual", description: "Parts bill", amount: 1200, due_date: "2026-07-30", status: "Open", linked_repair_id: "" }],
+  }));
+  let text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /BILL-1/);
+  assert.match(text, /Page 2 of 2/);
+
+  response = await handleRequest(await authedRequest("https://example.test/payables/export.csv?q=BILL", "viewer"), envWithRows({
+    payables: [{ id: 1, payable_date: "2026-07-16", reference_no: "BILL-1", supplier_name: "Parts Supplier", source_type: "Manual", description: "Parts bill", amount: 1200, due_date: "2026-07-30", status: "Open", linked_repair_id: "" }],
+  }));
+  text = await response.text();
+  assert.match(text, /ID,Date,Supplier,Source,Reference No\.,Description,Amount,Due Date,Status,Linked Repair/);
+  assert.match(text, /"1200"/);
+
+  response = await handleRequest(await authedRequest("https://example.test/payables/1/delete", "admin", { method: "POST" }), envWithRows({
+    payables: [{ id: 1, linked_repair_id: 2 }],
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /Cannot%20delete%20a%20repair-linked%20payable/);
+});
+
+test("payable create validates required and negative amount", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/payables/new", "accounting", { method: "POST", body: payableBody({ payable_date: "", description: "" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /payable date is required/);
+
+  response = await handleRequest(await authedRequest("https://example.test/payables/new", "accounting", { method: "POST", body: payableBody({ amount: "-1" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /amount cannot be negative/);
+});
+
+test("advances page lists vale and cash advance with independent exports", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/advances?q=Joel&vale_page=2&cash_page=2", "admin"), envWithRows({
+    valeCount: 30,
+    cashCount: 30,
+    vale: [{ id: 1, employee_name: "Joel Helper", date_granted: "2026-07-16", amount: 1000, installment_amount: 250, balance: 750, status: "Open" }],
+    cashAdvances: [{ id: 2, employee_name: "Joel Helper", date_granted: "2026-07-16", amount: 500, balance: 500, applied: 0, status: "Open" }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Vale/);
+  assert.match(text, /Cash Advance/);
+  assert.match(text, /Joel Helper/);
+  assert.match(text, /\/advances\/vale\/export\.csv\?q=Joel/);
+  assert.match(text, /\/advances\/cash\/export\.csv\?q=Joel/);
+  assert.match(text, /vale_page=1/);
+  assert.match(text, /cash_page=1/);
+});
+
+test("vale and cash advance create default balances and clean values", async () => {
+  let runs = [];
+  let response = await handleRequest(await authedRequest("https://example.test/advances/vale/new", "encoder", { method: "POST", body: advanceBody({ balance: "" }) }), envWithRows({ runs }));
+  assert.equal(response.status, 303);
+  assert.match(runs[0].sql, /INSERT INTO vale_records/);
+  assert.equal(runs[0].params[2], "1000");
+  assert.equal(runs[0].params[3], "1000");
+  assert.equal(runs[0].params[6], "250");
+
+  runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/advances/cash/new", "admin", { method: "POST", body: advanceBody({ applied: "1" }) }), envWithRows({ runs }));
+  assert.equal(response.status, 303);
+  assert.match(runs[0].sql, /INSERT INTO cash_advances/);
+  assert.equal(runs[0].params[2], "1000");
+  assert.equal(runs[0].params[3], "1000");
+  assert.equal(runs[0].params[6], "1");
+});
+
+test("advance validation and permissions are enforced", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/advances/vale/new", "admin", { method: "POST", body: advanceBody({ employee_id: "", amount: "-1" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  const text = await response.text();
+  assert.match(text, /employee is required/);
+  assert.match(text, /amount cannot be negative/);
+
+  response = await handleRequest(await authedRequest("https://example.test/advances/cash/new", "viewer", { method: "POST", body: advanceBody() }), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/advances", "accounting"), envWithRows());
+  assert.equal(response.status, 403);
+});
+
+test("repairs accounting access is blocked while payables edit access is allowed", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/repairs", "accounting"), envWithRows());
+  assert.equal(response.status, 403);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/payables/new", "accounting", { method: "POST", body: payableBody() }), envWithRows({ runs }));
+  assert.equal(response.status, 303);
+  assert.match(runs[0].sql, /INSERT INTO payables/);
 });
