@@ -14,6 +14,20 @@ const MASTER = {
     search: ["employee_code", "full_name", "contact_no"],
     columns: ["employee_code", "full_name", "employee_type", "payroll_basis", "employment_status"],
     labels: ["Code", "Name", "Type", "Basis", "Status"],
+    required: ["full_name", "employee_type"],
+    unique: ["employee_code"],
+    numeric: ["daily_rate", "trip_rate"],
+    defaults: { employment_status: "Active", payroll_basis: "Per Trip", daily_rate: 0, trip_rate: 0 },
+    deleteRefs: [
+      ["assets", "assigned_employee_id", "assigned fleet/equipment"],
+      ["recurring_trip_masters", "default_driver_id", "recurring trips"],
+      ["trips", "driver_id", "trips"],
+      ["trip_helpers", "employee_id", "trip helper assignments"],
+      ["vale_records", "employee_id", "vale records"],
+      ["cash_advances", "employee_id", "cash advances"],
+      ["payroll_entries", "employee_id", "payroll entries"],
+      ["payroll_trips", "employee_id", "payroll trip claims"],
+    ],
     fields: [
       ["employee_code", "Employee code"], ["full_name", "Full name"], ["employee_type", "Employee type"],
       ["contact_no", "Contact no"], ["employment_status", "Employment status"], ["payroll_basis", "Payroll basis"],
@@ -28,6 +42,14 @@ const MASTER = {
     search: ["asset_code", "plate_no", "make_model"],
     columns: ["asset_code", "asset_type", "plate_no", "make_model", "status"],
     labels: ["Code", "Type", "Plate", "Model", "Status"],
+    required: ["asset_code", "asset_type"],
+    unique: ["asset_code"],
+    defaults: { status: "Available" },
+    deleteRefs: [
+      ["recurring_trip_masters", "default_asset_id", "recurring trips"],
+      ["trips", "asset_id", "trips"],
+      ["repairs", "asset_id", "repairs"],
+    ],
     fields: [
       ["asset_code", "Asset code"], ["asset_type", "Asset type"], ["plate_no", "Plate no"],
       ["make_model", "Make/model"], ["capacity_desc", "Capacity"], ["status", "Status"], ["notes", "Notes"],
@@ -41,6 +63,16 @@ const MASTER = {
     search: ["client_code", "client_name", "contact_person", "contact_no"],
     columns: ["client_code", "client_name", "contact_person", "contact_no", "terms_days"],
     labels: ["Code", "Client", "Contact", "Phone", "Terms"],
+    required: ["client_name"],
+    unique: ["client_code", "client_name"],
+    numeric: ["terms_days"],
+    defaults: { terms_days: 30 },
+    deleteRefs: [
+      ["recurring_trip_masters", "client_id", "recurring trips"],
+      ["trips", "client_id", "trips"],
+      ["billing_statements", "client_id", "billing statements"],
+      ["collections", "client_id", "collections"],
+    ],
     fields: [
       ["client_code", "Client code"], ["client_name", "Client name"], ["billing_address", "Billing address"],
       ["contact_person", "Contact person"], ["contact_no", "Contact no"], ["terms_days", "Terms days", "number"], ["notes", "Notes"],
@@ -54,6 +86,12 @@ const MASTER = {
     search: ["supplier_name", "contact_person", "contact_no", "address"],
     columns: ["supplier_name", "contact_person", "contact_no", "address"],
     labels: ["Supplier", "Contact", "Phone", "Address"],
+    required: ["supplier_name"],
+    unique: ["supplier_name"],
+    deleteRefs: [
+      ["repairs", "supplier_id", "repairs"],
+      ["payables", "supplier_id", "payables"],
+    ],
     fields: [
       ["supplier_name", "Supplier name"], ["contact_person", "Contact person"],
       ["contact_no", "Contact no"], ["address", "Address"], ["notes", "Notes"],
@@ -108,16 +146,72 @@ function predicate(spec, query) {
   };
 }
 
+function masterValues(spec, data) {
+  const values = {};
+  for (const [name] of spec.fields) {
+    let value = (data[name] ?? spec.defaults?.[name] ?? "").toString().trim();
+    if (spec.numeric?.includes(name)) value = String(Number(value || 0));
+    values[name] = value;
+  }
+  return values;
+}
+
+function messagePanel(url) {
+  const ok = url.searchParams.get("ok");
+  const error = url.searchParams.get("error");
+  if (!ok && !error) return "";
+  return `<section class="panel"><p class="${error ? "error" : "success"}">${esc(error || ok)}</p></section>`;
+}
+
+function pagination(base, query, page, total) {
+  const pages = Math.max(1, Math.ceil(total / 25));
+  if (pages <= 1) return `<p class="muted">Page 1 of 1</p>`;
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  const link = (target, label, disabled = false) => {
+    params.set("page", String(target));
+    return disabled ? `<span class="button secondary disabled">${esc(label)}</span>` : `<a class="button secondary" href="${base}?${params.toString()}">${esc(label)}</a>`;
+  };
+  return `<div class="pagination">${link(Math.max(1, page - 1), "Previous", page <= 1)}<span>Page ${page} of ${pages}</span>${link(Math.min(pages, page + 1), "Next", page >= pages)}</div>`;
+}
+
+async function validateMaster(env, spec, values, id = null) {
+  const errors = [];
+  for (const field of spec.required || []) {
+    if (!values[field]) errors.push(`${field.replaceAll("_", " ")} is required.`);
+  }
+  for (const field of spec.unique || []) {
+    if (!values[field]) continue;
+    const params = id ? [values[field], id] : [values[field]];
+    const row = await first(env, `SELECT id FROM ${spec.table} WHERE ${field}=?${id ? " AND id<>?" : ""} LIMIT 1`, params);
+    if (row) errors.push(`${field.replaceAll("_", " ")} must be unique.`);
+  }
+  return errors;
+}
+
+function renderMasterForm(user, path, spec, row, id, errors = []) {
+  const fields = spec.fields.map(([name, label, kind]) => kind === "number" ? numberInput(name, label, row[name] ?? spec.defaults?.[name] ?? 0) : textInput(name, label, row[name] ?? spec.defaults?.[name] ?? ""));
+  const deleteForm = id ? `<form method="post" action="${path}/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this ${esc(spec.title)} record? This is blocked when related records exist.');"><button class="danger">Delete</button><span class="muted">Deletion is guarded when this record is used by trips, billing, payroll, or related records.</span></form>` : "";
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  return `${errorBox}${formPanel(id ? `${path}/${id}/edit` : `${path}/new`, fields, "Save")}${deleteForm}`;
+}
+
 async function masterList(request, env, user, path, spec) {
   const access = requireView(user, spec.page);
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const offset = (page - 1) * 25;
   const where = predicate(spec, query);
-  const rows = await all(env, `SELECT * FROM ${spec.table}${where.sql} ORDER BY ${spec.order} LIMIT 100`, where.params);
-  const bodyRows = rows.map((row) => `<tr>${spec.columns.map((col, index) => index === 0 ? `<td><a href="${path}/${row.id}/edit">${esc(row[col])}</a></td>` : `<td>${esc(row[col])}</td>`).join("")}<td>${canEdit(user, spec.page) ? `<a href="${path}/${row.id}/edit">Edit</a>` : ""}</td></tr>`);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search ${esc(spec.title)}"><button>Search</button></form><div>${canEdit(user, spec.page) ? `<a class="button" href="${path}/new">New Record</a>` : ""} <a class="button secondary" href="${path}/export.csv">Export CSV</a></div></div>`;
-  return html(layout({ title: spec.title, user, path, content: `<section class="panel">${toolbar}</section>${table([...spec.labels, "Actions"], bodyRows)}` }));
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM ${spec.table}${where.sql}`, where.params);
+  const rows = await all(env, `SELECT * FROM ${spec.table}${where.sql} ORDER BY ${spec.order} LIMIT 25 OFFSET ?`, [...where.params, offset]);
+  const bodyRows = rows.map((row) => `<tr>${spec.columns.map((col, index) => index === 0 ? `<td>${canEdit(user, spec.page) ? `<a href="${path}/${row.id}/edit">${esc(row[col])}</a>` : esc(row[col])}</td>` : `<td>${esc(row[col])}</td>`).join("")}<td>${canEdit(user, spec.page) ? `<a href="${path}/${row.id}/edit">Edit</a>` : ""}</td></tr>`);
+  const exportParams = new URLSearchParams();
+  if (query) exportParams.set("q", query);
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search ${esc(spec.title)}"><button>Search</button></form><div>${canEdit(user, spec.page) ? `<a class="button" href="${path}/new">New Record</a>` : ""} <a class="button secondary" href="${path}/export.csv${exportParams.toString() ? `?${exportParams.toString()}` : ""}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table([...spec.labels, "Actions"], bodyRows, { empty: `No ${spec.title.toLowerCase()} found.` })}${pagination(path, query, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: spec.title, user, path, content }));
 }
 
 async function masterForm(request, env, user, path, spec, id = null) {
@@ -127,21 +221,53 @@ async function masterForm(request, env, user, path, spec, id = null) {
   if (id && !row) return html("Not found", 404);
   if (request.method === "POST") {
     const data = await parseForm(request);
+    const valuesByField = masterValues(spec, data);
+    const errors = await validateMaster(env, spec, valuesByField, id);
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, valuesByField, id, errors) }), 400);
     const fields = spec.fields.map(([name]) => name);
-    const values = fields.map((name) => data[name] ?? "");
+    const values = fields.map((name) => valuesByField[name]);
     if (id) {
-      await run(env, `UPDATE ${spec.table} SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...values, id]);
+      try {
+        await run(env, `UPDATE ${spec.table} SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...values, id]);
+      } catch (error) {
+        return html(layout({ title: `Edit ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, valuesByField, id, [`Could not save record: ${error.message || error}`]) }), 400);
+      }
+      return redirect(`${path}?ok=${encodeURIComponent(`${spec.title} updated.`)}`);
     } else {
-      await run(env, `INSERT INTO ${spec.table} (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, values);
+      try {
+        await run(env, `INSERT INTO ${spec.table} (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, values);
+      } catch (error) {
+        return html(layout({ title: `New ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, valuesByField, id, [`Could not save record: ${error.message || error}`]) }), 400);
+      }
+      return redirect(`${path}?ok=${encodeURIComponent(`${spec.title} created.`)}`);
     }
-    return redirect(path);
   }
-  const fields = spec.fields.map(([name, label, kind]) => kind === "number" ? numberInput(name, label, row[name] ?? 0) : textInput(name, label, row[name] ?? ""));
-  return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: formPanel(id ? `${path}/${id}/edit` : `${path}/new`, fields) }));
+  return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, row, id) }));
 }
 
-async function masterExport(env, spec) {
-  const rows = await all(env, `SELECT ${spec.columns.join(", ")} FROM ${spec.table} ORDER BY ${spec.order}`);
+async function masterDelete(request, env, user, path, spec, id) {
+  const access = requireEdit(user, spec.page);
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const row = await first(env, `SELECT id FROM ${spec.table} WHERE id=?`, [id]);
+  if (!row) return redirect(`${path}?error=${encodeURIComponent("Record not found.")}`);
+  for (const [tableName, field, label] of spec.deleteRefs || []) {
+    const ref = await first(env, `SELECT COUNT(*) AS total FROM ${tableName} WHERE ${field}=?`, [id]);
+    if (Number(ref?.total || 0) > 0) {
+      return redirect(`${path}?error=${encodeURIComponent(`Cannot delete because this record is used by ${label}.`)}`);
+    }
+  }
+  await run(env, `DELETE FROM ${spec.table} WHERE id=?`, [id]);
+  return redirect(`${path}?ok=${encodeURIComponent(`${spec.title} deleted.`)}`);
+}
+
+async function masterExport(request, env, user, path, spec) {
+  const access = requireView(user, spec.page);
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const where = predicate(spec, query);
+  const rows = await all(env, `SELECT ${spec.columns.join(", ")} FROM ${spec.table}${where.sql} ORDER BY ${spec.order}`, where.params);
   const lines = [spec.labels.join(",")];
   for (const row of rows) lines.push(spec.columns.map((col) => `"${String(row[col] ?? "").replaceAll('"', '""')}"`).join(","));
   return csv(lines.join("\n"), `${spec.table}.csv`);
@@ -261,7 +387,9 @@ export async function handleRequest(request, env) {
     if (path === `${base}/new`) return masterForm(request, env, user, base, spec);
     const edit = path.match(new RegExp(`^${base}/(\\d+)/edit$`));
     if (edit) return masterForm(request, env, user, base, spec, Number(edit[1]));
-    if (path === `${base}/export.csv`) return masterExport(env, spec);
+    const del = path.match(new RegExp(`^${base}/(\\d+)/delete$`));
+    if (del) return masterDelete(request, env, user, base, spec, Number(del[1]));
+    if (path === `${base}/export.csv`) return masterExport(request, env, user, base, spec);
   }
   if (path === "/recurring-trips") return recurringList(env, user, path);
   if (path === "/trips") return tripList(env, user, path);
