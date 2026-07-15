@@ -2,7 +2,7 @@ import { canEdit, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
 import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
-import { choiceLabel, nextTripTicketNo, tripBillableTotal, tripExtraTotal } from "./services.mjs";
+import { EXTRA_FIELDS, HELPER_LIMITS, choiceLabel, nextTripTicketNo, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
 
 const MASTER = {
@@ -171,6 +171,17 @@ function pagination(base, query, page, total) {
   const link = (target, label, disabled = false) => {
     params.set("page", String(target));
     return disabled ? `<span class="button secondary disabled">${esc(label)}</span>` : `<a class="button secondary" href="${base}?${params.toString()}">${esc(label)}</a>`;
+  };
+  return `<div class="pagination">${link(Math.max(1, page - 1), "Previous", page <= 1)}<span>Page ${page} of ${pages}</span>${link(Math.min(pages, page + 1), "Next", page >= pages)}</div>`;
+}
+
+function paginationWithParams(base, params, page, total) {
+  const pages = Math.max(1, Math.ceil(total / 25));
+  if (pages <= 1) return `<p class="muted">Page 1 of 1</p>`;
+  const link = (target, label, disabled = false) => {
+    const next = new URLSearchParams(params);
+    next.set("page", String(target));
+    return disabled ? `<span class="button secondary disabled">${esc(label)}</span>` : `<a class="button secondary" href="${esc(`${base}?${next.toString()}`)}">${esc(label)}</a>`;
   };
   return `<div class="pagination">${link(Math.max(1, page - 1), "Previous", page <= 1)}<span>Page ${page} of ${pages}</span>${link(Math.min(pages, page + 1), "Next", page >= pages)}</div>`;
 }
@@ -493,6 +504,286 @@ async function tripDetail(env, user, path, id, print = false) {
   return html(layout({ title: "Trip Details", user, path, content }));
 }
 
+const TRIP_MONEY_FIELDS = [
+  "base_trip_rate", "driver_pay_rate", "helper_pay_rate", "fuel_surcharge", "loading_fee",
+  "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges",
+];
+
+const TRIP_STATUSES = ["Planned", "Ongoing", "Completed", "Cancelled"];
+
+function moneyValue(value) {
+  const number = Number(value || 0);
+  return String(Number.isFinite(number) ? number : 0);
+}
+
+function tripWhere(query, status) {
+  const clauses = [];
+  const params = [];
+  if (query) {
+    clauses.push("(t.trip_ticket_no LIKE ? OR t.reference_no LIKE ? OR c.client_name LIKE ? OR t.origin LIKE ? OR t.destination LIKE ? OR e.full_name LIKE ? OR a.asset_code LIKE ?)");
+    params.push(...Array(7).fill(`%${query}%`));
+  }
+  if (status && TRIP_STATUSES.includes(status)) {
+    clauses.push("t.status=?");
+    params.push(status);
+  }
+  return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+function tripValues(data) {
+  const values = {
+    trip_ticket_no: (data.trip_ticket_no || "").trim(),
+    reference_no: (data.reference_no || "").trim(),
+    trip_type: data.trip_type === "Recurring Trip" ? "Recurring Trip" : "Spot Trip",
+    recurring_master_id: data.recurring_master_id || null,
+    trip_date: (data.trip_date || "").trim(),
+    client_id: data.client_id || null,
+    job_description: (data.job_description || "").trim(),
+    origin: (data.origin || "").trim(),
+    destination: (data.destination || "").trim(),
+    asset_id: data.asset_id || null,
+    driver_id: data.driver_id || null,
+    dispatch_time: data.dispatch_time || null,
+    arrival_time: data.arrival_time || null,
+    status: TRIP_STATUSES.includes(data.status) ? data.status : "Planned",
+    notes: (data.notes || "").trim(),
+  };
+  for (const field of TRIP_MONEY_FIELDS) values[field] = moneyValue(data[field]);
+  if (values.trip_type === "Spot Trip") values.recurring_master_id = null;
+  return values;
+}
+
+function parsePayItems(raw, employeeType) {
+  if (!raw) return { items: [], errors: [] };
+  let rows;
+  try {
+    rows = JSON.parse(raw);
+  } catch {
+    return { items: [], errors: [`Invalid ${employeeType.toLowerCase()} pay-item data.`] };
+  }
+  if (!Array.isArray(rows)) return { items: [], errors: [`Invalid ${employeeType.toLowerCase()} pay-item data.`] };
+  const items = [];
+  const errors = [];
+  rows.forEach((row, index) => {
+    const label = String(row?.label || "").trim();
+    const amount = Number(row?.amount || 0);
+    if (!label || !Number.isFinite(amount) || amount <= 0) {
+      errors.push(`${employeeType} pay item ${index + 1} needs a label and an amount greater than zero.`);
+    } else {
+      items.push({ employee_type: employeeType, label, amount: String(amount), sort_order: index + 1 });
+    }
+  });
+  return { items, errors };
+}
+
+async function tripChoices(env, currentMasterId = "") {
+  return await Promise.all([
+    all(env, "SELECT * FROM clients WHERE active=1 ORDER BY client_name"),
+    all(env, "SELECT * FROM assets ORDER BY asset_code"),
+    all(env, "SELECT * FROM employees WHERE active=1 AND employee_type='Driver' ORDER BY full_name"),
+    all(env, "SELECT * FROM employees WHERE active=1 AND employee_type='Helper' ORDER BY full_name, id"),
+    all(env, `SELECT r.*, c.client_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id WHERE r.active=1${currentMasterId ? " OR r.id=?" : ""} ORDER BY r.master_code`, currentMasterId ? [currentMasterId] : []),
+  ]);
+}
+
+async function loadTrip(env, id) {
+  const trip = await first(env, `SELECT t.*, c.client_name, a.asset_code, a.plate_no, a.make_model, e.full_name AS driver_name, r.master_code AS recurring_code FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id LEFT JOIN recurring_trip_masters r ON r.id=t.recurring_master_id WHERE t.id=?`, [id]);
+  if (!trip) return null;
+  trip.helpers = await all(env, "SELECT th.*, e.full_name, e.employee_code, e.employee_type, e.payroll_basis FROM trip_helpers th JOIN employees e ON e.id=th.employee_id WHERE th.trip_id=? ORDER BY th.helper_order, th.id", [id]);
+  trip.pay_items = await all(env, "SELECT * FROM trip_employee_pay_items WHERE trip_id=? ORDER BY employee_type, sort_order, id", [id]);
+  return trip;
+}
+
+async function validateTrip(env, values, helpers, payItems, id = null) {
+  const errors = [];
+  if (!values.trip_date) errors.push("trip date is required.");
+  if (!values.client_id) errors.push("client is required.");
+  if (values.trip_type === "Recurring Trip" && !values.recurring_master_id) errors.push("Choose a recurring trip master.");
+  if (values.trip_ticket_no) {
+    const duplicate = await first(env, `SELECT id FROM trips WHERE trip_ticket_no=?${id ? " AND id<>?" : ""} LIMIT 1`, id ? [values.trip_ticket_no, id] : [values.trip_ticket_no]);
+    if (duplicate) errors.push("This trip ticket number is already in use.");
+  }
+  for (const field of TRIP_MONEY_FIELDS) {
+    const amount = Number(values[field] || 0);
+    if (!Number.isFinite(amount)) errors.push(`${field.replaceAll("_", " ")} must be a valid amount.`);
+    if (amount < 0) errors.push(`${field.replaceAll("_", " ")} cannot be negative.`);
+  }
+  const helperIds = helpers.filter(Boolean);
+  if (helperIds.length !== new Set(helperIds).size) errors.push("Helper selections must be unique.");
+  if (!helpers[0] && (helpers[1] || helpers[2])) errors.push("Fill helper positions in order.");
+  if (!helpers[1] && helpers[2]) errors.push("Fill helper positions in order.");
+  if (values.asset_id) {
+    const asset = await first(env, "SELECT asset_type FROM assets WHERE id=?", [values.asset_id]);
+    const maximum = HELPER_LIMITS[asset?.asset_type] ?? 3;
+    if (helperIds.length > maximum) errors.push(`${asset?.asset_type || "Selected unit"} allows at most ${maximum} helper(s).`);
+  }
+  if (payItems.some((item) => item.employee_type === "Helper") && helperIds.length === 0) {
+    errors.push("Assign at least one helper before adding Helper pay items.");
+  }
+  return errors;
+}
+
+async function nextTicket(env, dateValue) {
+  const row = await first(env, "SELECT trip_ticket_no FROM trips WHERE trip_ticket_no LIKE ? ORDER BY trip_ticket_no DESC LIMIT 1", [`TT-${String(dateValue).slice(0, 4)}-%`]);
+  const last = Number(String(row?.trip_ticket_no || "0").split("-").at(-1) || 0);
+  return nextTripTicketNo(dateValue, last);
+}
+
+function payItemsJson(items, type) {
+  return JSON.stringify((items || []).filter((item) => item.employee_type === type).map((item) => ({ label: item.label, amount: item.amount })));
+}
+
+async function renderTripForm(env, row = {}, id = null, errors = []) {
+  const existingHelpers = row.helpers || [];
+  const [clients, assets, drivers, helpers, masters] = await tripChoices(env, row.recurring_master_id || "");
+  const fields = [
+    textInput("trip_ticket_no", "Trip Ticket / Waybill", row.trip_ticket_no || ""),
+    textInput("reference_no", "Ref. No.", row.reference_no || ""),
+    textInput("trip_date", "Trip date", row.trip_date || todayISO(), 'type="date" required'),
+    selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], row.trip_type || "Spot Trip", (r) => r.name, ""),
+    selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r)),
+    selectInput("status", "Status", TRIP_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Planned", (r) => r.name, ""),
+    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r)),
+    textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'),
+    textInput("origin", "Origin", row.origin || ""),
+    textInput("destination", "Destination", row.destination || ""),
+    textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'),
+    textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'),
+    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r)),
+    selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r)),
+    selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r)),
+    selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r)),
+    selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r)),
+    numberInput("driver_pay_rate", "Driver pay rate", row.driver_pay_rate ?? 0),
+    numberInput("helper_pay_rate", "Helper pay rate", row.helper_pay_rate ?? 0),
+    numberInput("base_trip_rate", "Base trip rate", row.base_trip_rate ?? 0),
+    ...EXTRA_FIELDS.map((field) => numberInput(field, field.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase()), row[field] ?? 0)),
+    textareaInput("driver_pay_items", "Driver pay items JSON", row.driver_pay_items ?? payItemsJson(row.pay_items, "Driver"), 'rows="2" placeholder=\'[{"label":"Allowance","amount":100}]\''),
+    textareaInput("helper_pay_items", "Helper pay items JSON", row.helper_pay_items ?? payItemsJson(row.pay_items, "Helper"), 'rows="2" placeholder=\'[{"label":"Loading","amount":50}]\''),
+    textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
+  ];
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  return `${errorBox}${formPanel(id ? `/trips/${id}/edit` : "/trips/new", fields, "Save Trip")}`;
+}
+
+async function saveTrip(env, values, helpers, payItems, id = null) {
+  const driverAdditional = payItems.filter((item) => item.employee_type === "Driver").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const helperAdditional = payItems.filter((item) => item.employee_type === "Helper").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const fields = ["trip_ticket_no", "reference_no", "trip_type", "recurring_master_id", "trip_date", "client_id", "job_description", "origin", "destination", "asset_id", "driver_id", "dispatch_time", "arrival_time", "status", "base_trip_rate", "driver_pay_rate", "helper_pay_rate", "driver_additional_pay", "helper_additional_pay", ...EXTRA_FIELDS, "notes"];
+  const paramsByField = { ...values, driver_additional_pay: String(driverAdditional), helper_additional_pay: String(helperAdditional) };
+  let tripId = id;
+  if (id) {
+    await run(env, `UPDATE trips SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...fields.map((field) => Object.hasOwn(paramsByField, field) ? paramsByField[field] : ""), id]);
+  } else {
+    await run(env, `INSERT INTO trips (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => Object.hasOwn(paramsByField, field) ? paramsByField[field] : ""));
+    const created = await first(env, "SELECT id FROM trips WHERE trip_ticket_no=? LIMIT 1", [values.trip_ticket_no]);
+    tripId = created?.id;
+  }
+  await run(env, "DELETE FROM trip_helpers WHERE trip_id=?", [tripId]);
+  for (const [index, helperId] of helpers.filter(Boolean).entries()) {
+    await run(env, "INSERT INTO trip_helpers (trip_id, employee_id, helper_order) VALUES (?,?,?)", [tripId, helperId, index + 1]);
+  }
+  await run(env, "DELETE FROM trip_employee_pay_items WHERE trip_id=?", [tripId]);
+  for (const item of payItems) {
+    await run(env, "INSERT INTO trip_employee_pay_items (trip_id, employee_type, label, amount, sort_order) VALUES (?,?,?,?,?)", [tripId, item.employee_type, item.label, item.amount, item.sort_order]);
+  }
+  return tripId;
+}
+
+async function tripListPage(request, env, user, path) {
+  const access = requireView(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const status = (url.searchParams.get("status") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const where = tripWhere(query, status);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY t.trip_date DESC, t.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((t) => `<tr><td><a href="/trips/${t.id}">${esc(t.trip_ticket_no)}</a></td><td>${esc(t.reference_no || "—")}</td><td>${esc(t.trip_date)}</td><td>${esc(t.client_name || "")}</td><td>${esc(t.origin)} → ${esc(t.destination)}</td><td>${esc(t.driver_name || "")}${t.helper_names ? `<small class="cell-detail">${esc(t.helper_names)}</small>` : ""}</td><td>${esc(t.asset_code || "")}</td><td><span class="status">${esc(t.status)}</span></td>${moneyCell(t.base_trip_rate)}${moneyCell(tripExtraTotal(t))}${moneyCell(tripBillableTotal(t))}<td><a href="/trips/${t.id}">View</a> <a href="/trips/${t.id}/print" target="_blank">Print</a>${canEdit(user, "Trips") ? ` <a href="/trips/${t.id}/edit">Edit</a>` : ""}</td></tr>`);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (status) params.set("status", status);
+  const statusOptions = `<select name="status"><option value="">All statuses</option>${TRIP_STATUSES.map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
+  const exportHref = `/trips/export.csv${params.toString() ? `?${params.toString()}` : ""}`;
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search trips">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Trips") ? `<a class="button" href="/trips/new">New Trip</a>` : ""} <a class="button secondary" href="${esc(exportHref)}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Trip Ticket / Waybill", "Ref. No.", "Date", "Client", "Route", "Driver / Helpers", "Unit", "Status", "Base", "Extra", "Total", "Actions"], body, { empty: "No trips found." })}${paginationWithParams("/trips", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Trips List", user, path, content }));
+}
+
+async function tripFormPage(request, env, user, path, id = null) {
+  const access = requireEdit(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  const row = id ? await loadTrip(env, id) : { trip_date: todayISO(), trip_type: "Spot Trip", status: "Planned" };
+  if (id && !row) return html("Not found", 404);
+  if (request.method === "POST") {
+    const data = await parseForm(request);
+    const values = tripValues(data);
+    const helpers = [data.helper_1 || "", data.helper_2 || "", data.helper_3 || ""];
+    const driverPay = parsePayItems(data.driver_pay_items, "Driver");
+    const helperPay = parsePayItems(data.helper_pay_items, "Helper");
+    const payItems = [...driverPay.items, ...helperPay.items];
+    if (!values.trip_ticket_no && values.trip_date) values.trip_ticket_no = await nextTicket(env, values.trip_date);
+    const errors = [...driverPay.errors, ...helperPay.errors, ...(await validateTrip(env, values, helpers, payItems, id))];
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, { ...values, ...data }, id, errors) }), 400);
+    try {
+      const tripId = await saveTrip(env, values, helpers, payItems, id);
+      return redirect(`/trips/${tripId}?ok=${encodeURIComponent(id ? "Trip record updated." : "Trip record saved.")}`);
+    } catch (error) {
+      return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, { ...values, ...data }, id, [`Could not save trip: ${error.message || error}`]) }), 400);
+    }
+  }
+  return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, row, id) }));
+}
+
+async function tripDetailPage(request, env, user, path, id, print = false) {
+  const access = requireView(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  const trip = await loadTrip(env, id);
+  if (!trip) return html("Not found", 404);
+  const helperNames = (trip.helpers || []).map((row) => row.full_name).join("; ") || "None";
+  const extraRows = EXTRA_FIELDS.filter((field) => Number(trip[field] || 0)).map((field) => `<dt>${esc(field.replaceAll("_", " "))}</dt><dd>${esc(peso(trip[field]))}</dd>`).join("");
+  const payRows = (trip.pay_items || []).map((item) => `<div class="detail-pay-row"><span>${esc(item.label)} <small>${esc(item.employee_type)}</small></span><strong>${esc(peso(item.amount))}</strong></div>`).join("") || `<p class="muted">No additional pay items.</p>`;
+  const main = `<section class="panel detail-hero"><div><span class="dialog-kicker">${esc(trip.trip_type)} · Trip Ticket / Waybill</span><h3>${esc(trip.trip_ticket_no)}</h3><p>${esc(trip.client_name || "No client")} · ${esc(trip.trip_date)} · Ref. No.: ${esc(trip.reference_no || "—")}</p></div><span class="status detail-status">${esc(trip.status)}</span></section><div class="detail-grid"><section class="panel"><h3>Route & Schedule</h3><dl class="detail-list"><dt>Item / Job</dt><dd>${esc(trip.job_description || "—")}</dd><dt>Origin</dt><dd>${esc(trip.origin || "—")}</dd><dt>Destination</dt><dd>${esc(trip.destination || "—")}</dd><dt>Dispatch</dt><dd>${esc(trip.dispatch_time || "—")}</dd><dt>Arrival</dt><dd>${esc(trip.arrival_time || "—")}</dd><dt>Recurring Master</dt><dd>${esc(trip.recurring_code || "—")}</dd></dl></section><section class="panel"><h3>Unit & Crew</h3><dl class="detail-list"><dt>Asset</dt><dd>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · ") || "—")}</dd><dt>Driver</dt><dd>${esc(trip.driver_name || "—")}</dd><dt>Helpers</dt><dd>${esc(helperNames)}</dd><dt>Driver Pay Rate</dt><dd>${esc(peso(trip.driver_pay_rate))}</dd><dt>Helper Pay Pool</dt><dd>${esc(peso(trip.helper_pay_rate))}</dd></dl></section><section class="panel"><h3>Billing Breakdown</h3><dl class="detail-list"><dt>Base Trip Rate</dt><dd>${esc(peso(trip.base_trip_rate))}</dd>${extraRows}<dt class="detail-total">Billable Total</dt><dd class="detail-total">${esc(peso(tripBillableTotal(trip)))}</dd></dl></section><section class="panel"><h3>Employee Pay Items</h3>${payRows}</section></div>${trip.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(trip.notes)}</p></section>` : ""}`;
+  if (print) {
+    const extraTable = EXTRA_FIELDS.filter((field) => Number(trip[field] || 0)).map((field) => `<tr><td>${esc(field.replaceAll("_", " "))}</td><td class="num">${esc(peso(trip[field]))}</td></tr>`).join("");
+    const payTable = (trip.pay_items || []).map((item) => `<tr><td>${esc(item.label)}</td><td>${esc(item.employee_type)}</td><td class="num">${esc(peso(item.amount))}</td></tr>`).join("") || `<tr><td colspan="3">No additional employee pay items.</td></tr>`;
+    return html(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(trip.trip_ticket_no)}</title><style>@page{size:A4 portrait;margin:12mm}body{font:12px Arial,sans-serif;color:#111}button{margin-bottom:10px}.header{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:14px;padding-bottom:8px}h1{margin:0;font-size:22px}table{width:100%;border-collapse:collapse;margin:10px 0}td,th{border:1px solid #333;padding:6px;vertical-align:top}.label{font-weight:bold;width:22%;background:#f3f3f3}.num{text-align:right}.signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:70px}.signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Print</button><div class="header"><div><h1>GMT Trucking</h1><strong>Trip Ticket / Waybill</strong></div><div><strong>${esc(trip.trip_ticket_no)}</strong><br>${esc(trip.trip_date)}</div></div><table><tr><td class="label">Trip Ticket / Waybill</td><td>${esc(trip.trip_ticket_no)}</td><td class="label">Ref. No.</td><td>${esc(trip.reference_no || "—")}</td></tr><tr><td class="label">Date</td><td>${esc(trip.trip_date)}</td><td class="label">Type / Status</td><td>${esc(trip.trip_type)} / ${esc(trip.status)}</td></tr><tr><td class="label">Client</td><td colspan="3">${esc(trip.client_name || "")}</td></tr><tr><td class="label">Item / Job</td><td colspan="3">${esc(trip.job_description || "")}</td></tr><tr><td class="label">Origin</td><td>${esc(trip.origin || "")}</td><td class="label">Destination</td><td>${esc(trip.destination || "")}</td></tr><tr><td class="label">Unit</td><td>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · "))}</td><td class="label">Driver</td><td>${esc(trip.driver_name || "")}</td></tr><tr><td class="label">Helpers</td><td colspan="3">${esc(helperNames)}</td></tr><tr><td class="label">Dispatch</td><td>${esc(trip.dispatch_time || "")}</td><td class="label">Arrival</td><td>${esc(trip.arrival_time || "")}</td></tr></table><table><thead><tr><th>Charge</th><th class="num">Amount</th></tr></thead><tbody><tr><td>Base Trip Rate</td><td class="num">${esc(peso(trip.base_trip_rate))}</td></tr>${extraTable}<tr><th>Total</th><th class="num">${esc(peso(tripBillableTotal(trip)))}</th></tr></tbody></table><table><thead><tr><th>Employee Pay Item</th><th>Type</th><th class="num">Amount</th></tr></thead><tbody>${payTable}</tbody></table>${trip.notes ? `<p><strong>Notes:</strong><br>${esc(trip.notes)}</p>` : ""}<div class="signatures"><div>Prepared By</div><div>Driver</div><div>Client / Receiver</div></div></body></html>`);
+  }
+  const actions = `<div class="detail-toolbar"><a class="button secondary" href="/trips">← Trips List</a><div><a class="button secondary" href="/trips/${id}/print" target="_blank">Print Ticket</a>${canEdit(user, "Trips") ? ` <a class="button" href="/trips/${id}/edit">Edit Details</a>` : ""}</div></div>`;
+  const deleteForm = canEdit(user, "Trips") ? `<section class="detail-danger"><form method="post" action="/trips/${id}/delete" onsubmit="return confirm('Delete this trip? This cannot be undone.');"><button class="danger-button">Delete Trip</button></form></section>` : "";
+  return html(layout({ title: "Trip Details", user, path, content: `${messagePanel(new URL(request.url))}${actions}${main}${deleteForm}` }));
+}
+
+async function tripDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const row = await first(env, "SELECT trip_ticket_no FROM trips WHERE id=?", [id]);
+  if (!row) return redirect("/trips?error=Trip%20not%20found.");
+  for (const [tableName, label] of [["billing_lines", "billing"], ["payroll_trips", "payroll"]]) {
+    const ref = await first(env, `SELECT COUNT(*) AS total FROM ${tableName} WHERE trip_id=?`, [id]);
+    if (Number(ref?.total || 0) > 0) return redirect(`/trips?error=${encodeURIComponent(`This trip is already used by ${label} and cannot be deleted.`)}`);
+  }
+  await run(env, "DELETE FROM trip_helpers WHERE trip_id=?", [id]);
+  await run(env, "DELETE FROM trip_employee_pay_items WHERE trip_id=?", [id]);
+  await run(env, "DELETE FROM trips WHERE id=?", [id]);
+  return redirect(`/trips?ok=${encodeURIComponent(`Trip ${row.trip_ticket_no} deleted.`)}`);
+}
+
+async function tripExportPage(request, env, user, path) {
+  const access = requireView(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const where = tripWhere((url.searchParams.get("q") || "").trim(), (url.searchParams.get("status") || "").trim());
+  const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY t.id`, where.params);
+  const lines = ["ID,Trip Ticket / Waybill,Ref. No.,Type,Date,Client,Route,Asset,Driver,Helpers,Status,Base Rate,Extra Charges,Billable Total"];
+  for (const row of rows) {
+    lines.push([row.id, row.trip_ticket_no, row.reference_no || "", row.trip_type, row.trip_date, row.client_name || "", `${row.origin || ""} -> ${row.destination || ""}`, row.asset_code || "", row.driver_name || "", row.helper_names || "", row.status, row.base_trip_rate || 0, tripExtraTotal(row), tripBillableTotal(row)].map((value) => `"${String(value).replaceAll('"', '""')}"`).join(","));
+  }
+  return csv(lines.join("\n"), "trips.csv");
+}
+
 async function reportList(env, user, path) {
   const access = requireView(user, "Reports");
   if (access) return errorResponse(access, user, path);
@@ -535,12 +826,17 @@ export async function handleRequest(request, env) {
   match = path.match(/^\/recurring-trips\/(\d+)\/delete$/);
   if (match) return recurringDeletePage(request, env, user, path, Number(match[1]));
   if (path === "/recurring-trips/export.csv") return recurringExportPage(request, env, user, path);
-  if (path === "/trips") return tripList(env, user, path);
-  if (path === "/trips/new") return tripForm(request, env, user, path);
+  if (path === "/trips") return tripListPage(request, env, user, path);
+  if (path === "/trips/new") return tripFormPage(request, env, user, path);
+  if (path === "/trips/export.csv") return tripExportPage(request, env, user, path);
   match = path.match(/^\/trips\/(\d+)\/print$/);
-  if (match) return tripDetail(env, user, path, Number(match[1]), true);
+  if (match) return tripDetailPage(request, env, user, path, Number(match[1]), true);
+  match = path.match(/^\/trips\/(\d+)\/edit$/);
+  if (match) return tripFormPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/trips\/(\d+)\/delete$/);
+  if (match) return tripDeletePage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/trips\/(\d+)$/);
-  if (match) return tripDetail(env, user, path, Number(match[1]));
+  if (match) return tripDetailPage(request, env, user, path, Number(match[1]));
   if (path === "/reports") return reportList(env, user, path);
   if (path === "/repairs") return placeholder("Repairs", user, path, "Repairs");
   if (path === "/payables") return placeholder("Payables", user, path, "Payables");

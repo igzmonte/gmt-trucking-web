@@ -30,7 +30,11 @@ function envWithRows(rows = {}) {
           },
           async all() {
             if (state.sql.includes("FROM trips t")) return { results: rows.trips || [] };
+            if (state.sql.includes("FROM trip_helpers th")) return { results: rows.tripHelpers || [] };
+            if (state.sql.includes("FROM trip_employee_pay_items")) return { results: rows.payItems || [] };
             if (state.sql.includes("FROM recurring_trip_masters r")) return { results: filtered("recurring").slice(0, 25) };
+            if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Driver'")) return { results: rows.drivers || filtered("employees").filter((row) => row.employee_type === "Driver").slice(0, 25) };
+            if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Helper'")) return { results: rows.helpers || filtered("employees").filter((row) => row.employee_type === "Helper").slice(0, 25) };
             if (state.sql.includes("FROM employees")) return { results: filtered("employees").slice(0, 25) };
             if (state.sql.includes("FROM assets")) return { results: filtered("assets").slice(0, 25) };
             if (state.sql.includes("FROM clients")) return { results: filtered("clients").slice(0, 25) };
@@ -39,6 +43,8 @@ function envWithRows(rows = {}) {
           },
           async first() {
             if (state.sql.includes("FROM users")) return rows.user || null;
+            if (state.sql.includes("COUNT(*) AS total FROM trips WHERE")) return { total: (rows.refs || {}).trips || 0 };
+            if (state.sql.includes("COUNT(*) AS total FROM trips")) return { total: rows.tripsCount ?? filtered("trips").length };
             if (state.sql.includes("COUNT(*) AS total FROM recurring_trip_masters") && state.sql.includes("LIKE")) return { total: rows.recurringCount ?? filtered("recurring").length };
             if (state.sql.includes("COUNT(*) AS total FROM employees") && state.sql.includes("LIKE")) return { total: rows.employeesCount ?? filtered("employees").length };
             if (state.sql.includes("COUNT(*) AS total FROM assets") && state.sql.includes("LIKE")) return { total: rows.assetsCount ?? filtered("assets").length };
@@ -49,12 +55,20 @@ function envWithRows(rows = {}) {
               const table = tableFrom();
               return { total: refs[table] || 0 };
             }
-            if (state.sql.includes("COUNT(*) AS total FROM trips")) return { total: 0 };
             if (state.sql.includes("COUNT(*) AS total FROM recurring_trip_masters")) return { total: rows.recurringCount ?? source("recurring").length };
             if (state.sql.includes("COUNT(*) AS total FROM employees")) return { total: rows.employeesCount ?? source("employees").length };
             if (state.sql.includes("COUNT(*) AS total FROM assets")) return { total: rows.assetsCount ?? source("assets").length };
             if (state.sql.includes("COUNT(*) AS total FROM clients")) return { total: rows.clientsCount ?? source("clients").length };
             if (state.sql.includes("COUNT(*) AS total FROM suppliers")) return { total: rows.suppliersCount ?? source("suppliers").length };
+            if (state.sql.includes("SELECT t.*,") && state.sql.includes("FROM trips t")) return byId("trips") || null;
+            if (state.sql.includes("SELECT trip_ticket_no FROM trips WHERE trip_ticket_no LIKE")) return rows.lastTicket || null;
+            if (state.sql.includes("SELECT id FROM trips WHERE trip_ticket_no=?")) {
+              if (rows.duplicateTrip) return { id: rows.duplicateTrip };
+              if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO trips"))) return { id: rows.createdTripId || 77 };
+              return null;
+            }
+            if (state.sql.includes("SELECT trip_ticket_no FROM trips WHERE id=?")) return byId("trips") || null;
+            if (state.sql.includes("SELECT asset_type FROM assets WHERE id=?")) return byId("assets") || null;
             if (state.sql.includes("SELECT id FROM recurring_trip_masters WHERE id=?")) return byId("recurring") || null;
             if (state.sql.includes("SELECT id FROM employees WHERE id=?")) return byId("employees") || null;
             if (state.sql.includes("SELECT id FROM assets WHERE id=?")) return byId("assets") || null;
@@ -88,6 +102,84 @@ async function authedRequest(url, role = "admin", init = {}) {
   const headers = new Headers(init.headers || {});
   headers.set("cookie", `gmt_session=${token}`);
   return new Request(url, { ...init, headers });
+}
+
+function tripBody(overrides = {}) {
+  return new URLSearchParams({
+    trip_ticket_no: "",
+    reference_no: "OR-123",
+    trip_type: "Spot Trip",
+    recurring_master_id: "",
+    trip_date: "2026-07-15",
+    client_id: "1",
+    job_description: "AAC Blocks",
+    origin: "Warehouse",
+    destination: "Site",
+    asset_id: "2",
+    driver_id: "3",
+    dispatch_time: "08:00",
+    arrival_time: "12:00",
+    status: "Planned",
+    base_trip_rate: "1000",
+    driver_pay_rate: "300",
+    helper_pay_rate: "200",
+    fuel_surcharge: "50",
+    loading_fee: "25",
+    unloading_fee: "0",
+    waiting_fee: "0",
+    tolls: "0",
+    additional_stop_charge: "0",
+    special_handling_fee: "0",
+    other_charges: "0",
+    helper_1: "",
+    helper_2: "",
+    helper_3: "",
+    driver_pay_items: "[]",
+    helper_pay_items: "[]",
+    notes: "Handle with care",
+    ...overrides,
+  });
+}
+
+function sampleTrip(overrides = {}) {
+  return {
+    id: 1,
+    trip_ticket_no: "TT-2026-000001",
+    reference_no: "OR-123",
+    trip_type: "Spot Trip",
+    recurring_master_id: null,
+    recurring_code: "",
+    trip_date: "2026-07-15",
+    client_id: 1,
+    client_name: "Client One",
+    job_description: "AAC Blocks",
+    origin: "Warehouse",
+    destination: "Site",
+    asset_id: 2,
+    asset_code: "UNIT-001",
+    plate_no: "ABC-123",
+    driver_id: 3,
+    driver_name: "Driver One",
+    dispatch_time: "08:00",
+    arrival_time: "12:00",
+    status: "Planned",
+    base_trip_rate: 1000,
+    driver_pay_rate: 300,
+    helper_pay_rate: 200,
+    driver_additional_pay: 100,
+    helper_additional_pay: 50,
+    fuel_surcharge: 50,
+    loading_fee: 25,
+    unloading_fee: 0,
+    waiting_fee: 0,
+    tolls: 0,
+    additional_stop_charge: 0,
+    special_handling_fee: 0,
+    other_charges: 0,
+    notes: "Handle with care",
+    helper_names: "Helper One",
+    ...overrides,
+  };
 }
 
 test("health endpoint is public and reports Cloudflare runtime", async () => {
@@ -317,4 +409,170 @@ test("trip create dropdown uses recurring template detail labels", async () => {
   assert.match(text, /RM-001/);
   assert.match(text, /Client One/);
   assert.match(text, /Delivery/);
+});
+
+test("trips list supports search, status filter, pagination, totals, and actions", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/trips?q=OR-123&status=Planned&page=2", "admin"), envWithRows({
+    tripsCount: 30,
+    trips: [sampleTrip()],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Trips List/);
+  assert.match(text, /Trip Ticket \/ Waybill/);
+  assert.match(text, /OR-123/);
+  assert.match(text, /Page 2 of 2/);
+  assert.match(text, /\/trips\/1\/edit/);
+  assert.match(text, /\/trips\/1\/print/);
+  assert.match(text, /\/trips\/export\.csv\?q=OR-123&amp;status=Planned/);
+});
+
+test("trips CSV export uses Django-compatible headers and raw totals", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/trips/export.csv?status=Planned", "viewer"), envWithRows({
+    trips: [sampleTrip()],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/csv; charset=utf-8");
+  assert.match(text, /ID,Trip Ticket \/ Waybill,Ref\. No\.,Type,Date,Client,Route,Asset,Driver,Helpers,Status,Base Rate,Extra Charges,Billable Total/);
+  assert.match(text, /"TT-2026-000001","OR-123"/);
+  assert.match(text, /"75","1075"/);
+});
+
+test("trip create auto-generates ticket and saves helpers plus pay items together", async () => {
+  const runs = [];
+  const body = tripBody({
+    helper_1: "4",
+    helper_2: "5",
+    driver_pay_items: JSON.stringify([{ label: "Driver allowance", amount: 100 }]),
+    helper_pay_items: JSON.stringify([{ label: "Loading", amount: 50 }]),
+  });
+  const response = await handleRequest(await authedRequest("https://example.test/trips/new", "encoder", { method: "POST", body }), envWithRows({
+    runs,
+    createdTripId: 88,
+    lastTicket: { trip_ticket_no: "TT-2026-000009" },
+    assets: [{ id: 2, asset_type: "Trailer Truck", asset_code: "UNIT-001" }],
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/trips\/88/);
+  assert.match(runs[0].sql, /INSERT INTO trips/);
+  assert.equal(runs[0].params[0], "TT-2026-000010");
+  assert.equal(runs[0].params[17], "100");
+  assert.equal(runs[0].params[18], "50");
+  assert.equal(runs.filter((run) => run.sql.includes("INSERT INTO trip_helpers")).length, 2);
+  assert.equal(runs.filter((run) => run.sql.includes("INSERT INTO trip_employee_pay_items")).length, 2);
+});
+
+test("trip edit clears recurring master for spot trips and preserves helper order", async () => {
+  const runs = [];
+  const body = tripBody({ trip_ticket_no: "TT-2026-000001", trip_type: "Spot Trip", recurring_master_id: "1", helper_1: "4", helper_2: "5" });
+  const response = await handleRequest(await authedRequest("https://example.test/trips/1/edit", "admin", { method: "POST", body }), envWithRows({
+    runs,
+    trips: [sampleTrip({ recurring_master_id: 1, trip_type: "Recurring Trip" })],
+    assets: [{ id: 2, asset_type: "Trailer Truck", asset_code: "UNIT-001" }],
+  }));
+  assert.equal(response.status, 303);
+  assert.match(runs[0].sql, /UPDATE trips SET/);
+  assert.equal(runs[0].params[3], null);
+  const helperRuns = runs.filter((run) => run.sql.includes("INSERT INTO trip_helpers"));
+  assert.deepEqual(helperRuns.map((run) => run.params.slice(1)), [["4", 1], ["5", 2]]);
+});
+
+test("trip validation rejects required, helper, recurring, and money errors", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ client_id: "", trip_date: "" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /trip date is required/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ trip_type: "Recurring Trip", recurring_master_id: "" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Choose a recurring trip master/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ helper_1: "4", helper_2: "4" }) }), envWithRows({
+    assets: [{ id: 2, asset_type: "Trailer Truck" }],
+  }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Helper selections must be unique/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ helper_2: "5" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Fill helper positions in order/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ helper_1: "4" }) }), envWithRows({
+    assets: [{ id: 2, asset_type: "Equipment" }],
+  }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /allows at most 0 helper/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ base_trip_rate: "-1" }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /base trip rate cannot be negative/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin", { method: "POST", body: tripBody({ helper_pay_items: JSON.stringify([{ label: "Loading", amount: 50 }]) }) }), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Assign at least one helper/);
+});
+
+test("trip detail and printable ticket show reference, item job, helpers, charges, and pay items", async () => {
+  const env = envWithRows({
+    trips: [sampleTrip()],
+    tripHelpers: [{ id: 1, employee_id: 4, helper_order: 1, full_name: "Helper One", employee_code: "EMP-004" }],
+    payItems: [{ id: 1, employee_type: "Driver", label: "Driver allowance", amount: 100, sort_order: 1 }],
+  });
+  let response = await handleRequest(await authedRequest("https://example.test/trips/1", "viewer"), env);
+  let text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Trip Ticket \/ Waybill/);
+  assert.match(text, /Ref\. No\.: OR-123/);
+  assert.match(text, /Item \/ Job/);
+  assert.match(text, /Helper One/);
+  assert.match(text, /Driver allowance/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/1/print", "viewer"), env);
+  text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /A4 portrait/);
+  assert.match(text, /Client \/ Receiver/);
+  assert.match(text, /Driver allowance/);
+});
+
+test("trip permissions allow viewer reads but block mutations and accounting access", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/trips/1/print", "viewer"), envWithRows({ trips: [sampleTrip()] }));
+  assert.equal(response.status, 200);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/new", "viewer", { method: "POST", body: tripBody() }), envWithRows());
+  assert.equal(response.status, 403);
+  assert.match(await response.text(), /do not have permission to edit/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips", "accounting"), envWithRows());
+  assert.equal(response.status, 403);
+});
+
+test("trip delete is POST-only, protected by billing and payroll, and removes unused trips", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/trips/1/delete", "admin"), envWithRows({ trips: [sampleTrip()] }));
+  assert.equal(response.status, 405);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/1/delete", "admin", { method: "POST" }), envWithRows({
+    trips: [sampleTrip()],
+    refs: { billing_lines: 1 },
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /already%20used%20by%20billing/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips/1/delete", "admin", { method: "POST" }), envWithRows({
+    trips: [sampleTrip()],
+    refs: { payroll_trips: 1 },
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /already%20used%20by%20payroll/);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/trips/1/delete", "admin", { method: "POST" }), envWithRows({
+    trips: [sampleTrip()],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /Trip%20TT-2026-000001%20deleted/);
+  assert.match(runs[0].sql, /DELETE FROM trip_helpers/);
+  assert.match(runs[1].sql, /DELETE FROM trip_employee_pay_items/);
+  assert.match(runs[2].sql, /DELETE FROM trips/);
 });
