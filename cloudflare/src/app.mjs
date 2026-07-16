@@ -2,7 +2,7 @@ import { canEdit, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
 import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
-import { EXTRA_FIELDS, HELPER_LIMITS, choiceLabel, nextTripTicketNo, tripBillableTotal, tripExtraTotal } from "./services.mjs";
+import { EXTRA_FIELDS, HELPER_LIMITS, calculateNet, choiceLabel, nextTripTicketNo, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
 
 const MASTER = {
@@ -1260,6 +1260,389 @@ async function advanceExportPage(request, env, user, path, type) {
   return csv(lines.join("\n"), `${spec.table}.csv`);
 }
 
+const PAYROLL_DEDUCTION_FIELDS = [
+  "vale_deduction", "cash_advance_deduction", "sss", "philhealth", "pagibig",
+  "withholding_tax", "change_deduction", "other_deduction",
+];
+
+function payrollWhere(query) {
+  if (!query) return { sql: "", params: [] };
+  return {
+    sql: " WHERE e.full_name LIKE ? OR e.employee_code LIKE ? OR p.employee_type LIKE ? OR p.remarks LIKE ?",
+    params: Array(4).fill(`%${query}%`),
+  };
+}
+
+function payrollMoneyValues(data) {
+  const values = {
+    days_count: numericText(data.days_count),
+    gross_pay: numericText(data.gross_pay),
+    additional_pay: numericText(data.additional_pay),
+  };
+  for (const field of PAYROLL_DEDUCTION_FIELDS) values[field] = numericText(data[field]);
+  return values;
+}
+
+function deductionTotal(row) {
+  return PAYROLL_DEDUCTION_FIELDS.reduce((sum, field) => sum + numeric(row?.[field]), 0);
+}
+
+function periodStartToday() {
+  return `${todayISO().slice(0, 8)}01`;
+}
+
+function parseExpectedIds(raw) {
+  try {
+    return JSON.parse(raw || "[]").map((value) => Number(value)).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function payrollEmployees(env) {
+  return await all(env, "SELECT * FROM employees WHERE active=1 ORDER BY full_name, id");
+}
+
+async function loadPayrollEmployee(env, id) {
+  if (!id) return null;
+  return await first(env, "SELECT * FROM employees WHERE id=? AND active=1", [id]);
+}
+
+async function payrollTripItems(env, tripId, employeeType) {
+  return await all(env, "SELECT * FROM trip_employee_pay_items WHERE trip_id=? AND employee_type=? ORDER BY sort_order, id", [tripId, employeeType]);
+}
+
+async function payrollEligibleTrips(env, employee, periodFrom, periodTo) {
+  if (!employee || !periodFrom || !periodTo) return [];
+  if (employee.employee_type === "Driver") {
+    return await all(env, `SELECT t.*, a.asset_code, (SELECT COUNT(*) FROM trip_helpers th WHERE th.trip_id=t.id) AS helper_count FROM trips t LEFT JOIN assets a ON a.id=t.asset_id WHERE t.trip_date BETWEEN ? AND ? AND t.status IN ('Completed','Billed','Paid') AND t.driver_id=? AND NOT EXISTS (SELECT 1 FROM payroll_trips pt WHERE pt.trip_id=t.id AND pt.employee_id=?) ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [periodFrom, periodTo, employee.id, employee.id]);
+  }
+  if (employee.employee_type === "Helper") {
+    return await all(env, `SELECT t.*, a.asset_code, (SELECT COUNT(*) FROM trip_helpers th2 WHERE th2.trip_id=t.id) AS helper_count FROM trips t JOIN trip_helpers th ON th.trip_id=t.id LEFT JOIN assets a ON a.id=t.asset_id WHERE t.trip_date BETWEEN ? AND ? AND t.status IN ('Completed','Billed','Paid') AND th.employee_id=? AND NOT EXISTS (SELECT 1 FROM payroll_trips pt WHERE pt.trip_id=t.id AND pt.employee_id=?) ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [periodFrom, periodTo, employee.id, employee.id]);
+  }
+  return [];
+}
+
+async function payrollAdvancePlan(env, table, employeeId) {
+  return await all(env, `SELECT * FROM ${table} WHERE employee_id=? AND status='Open' AND balance>0 ORDER BY date_granted, id`, [employeeId]);
+}
+
+async function payrollPreview(env, employeeId, periodFrom, periodTo) {
+  const employee = await loadPayrollEmployee(env, employeeId);
+  if (!employee) return null;
+  const trips = await payrollEligibleTrips(env, employee, periodFrom, periodTo);
+  let gross = 0;
+  const lineTotals = new Map();
+  const tripRows = [];
+  for (const trip of trips) {
+    const helperCount = Math.max(0, Number(trip.helper_count || 0));
+    const baseAmount = employee.employee_type === "Driver" ? numeric(trip.driver_pay_rate) : helperCount ? numeric(trip.helper_pay_rate) / helperCount : 0;
+    gross += baseAmount;
+    tripRows.push({ ...trip, payroll_amount: baseAmount });
+    const items = await payrollTripItems(env, trip.id, employee.employee_type);
+    if (items.length) {
+      for (const item of items) {
+        const amount = employee.employee_type === "Helper" ? (helperCount ? numeric(item.amount) / helperCount : 0) : numeric(item.amount);
+        if (amount > 0) lineTotals.set(item.label, numeric(lineTotals.get(item.label)) + amount);
+      }
+    } else {
+      const fallback = employee.employee_type === "Driver" ? numeric(trip.driver_additional_pay) : numeric(trip.helper_additional_pay);
+      const amount = employee.employee_type === "Helper" ? (helperCount ? fallback / helperCount : 0) : fallback;
+      if (amount > 0) lineTotals.set(employee.employee_type === "Driver" ? "Driver Pay Item" : "Helper Pay Item", numeric(lineTotals.get(employee.employee_type === "Driver" ? "Driver Pay Item" : "Helper Pay Item")) + amount);
+    }
+  }
+  const additionalLines = [...lineTotals.entries()].map(([label, amount], index) => ({ employee_type: employee.employee_type, label, amount, sort_order: index + 1 }));
+  const additionalPay = additionalLines.reduce((sum, line) => sum + numeric(line.amount), 0);
+  const valePlan = await payrollAdvancePlan(env, "vale_records", employee.id);
+  const cashPlan = await payrollAdvancePlan(env, "cash_advances", employee.id);
+  const valeDeduction = valePlan.reduce((sum, row) => sum + Math.min(numeric(row.balance), numeric(row.installment_amount) || numeric(row.balance)), 0);
+  const cashDeduction = cashPlan.reduce((sum, row) => sum + numeric(row.balance), 0);
+  let unitDescription = "Manual payroll entry";
+  if (employee.employee_type === "Driver") unitDescription = `${trips.length} trip(s)`;
+  else if (employee.employee_type === "Helper") unitDescription = `${trips.length} helper trip(s)`;
+  else if (employee.employee_type === "Operator" || employee.payroll_basis === "Per Day") unitDescription = "Enter days worked manually or override amount";
+  return {
+    employee,
+    employee_type: employee.employee_type,
+    payroll_basis: employee.payroll_basis || "Manual",
+    period_from: periodFrom,
+    period_to: periodTo,
+    unit_description: unitDescription,
+    trips,
+    tripRows,
+    trips_count: trips.length,
+    gross_pay: gross,
+    additional_pay: additionalPay,
+    driver_trip_additional_pay: employee.employee_type === "Driver" ? additionalPay : 0,
+    helper_trip_additional_pay: employee.employee_type === "Helper" ? additionalPay : 0,
+    additionalLines,
+    valePlan,
+    cashPlan,
+    vale_deduction: valeDeduction,
+    cash_advance_deduction: cashDeduction,
+  };
+}
+
+function payrollTripTable(preview) {
+  const rows = (preview?.tripRows || []).map((row) => `<tr><td>${esc(row.trip_date)}</td><td><a href="/trips/${row.id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.origin || "")} → ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
+  return table(["Date", "Trip Ticket / Waybill", "Unit", "Route", "Item / Job", "Base Pay"], rows, { empty: "No eligible trip rows. Enter Per-Day or Manual earnings above." });
+}
+
+function payrollFormContent(employees, selection, preview, values = {}, errors = []) {
+  const employeeId = selection.employee || values.employee || "";
+  const periodFrom = selection.period_from || values.period_from || periodStartToday();
+  const periodTo = selection.period_to || values.period_to || todayISO();
+  const selector = `<section class="panel payroll-selector"><h3>1. Select Employee & Period</h3><form method="get" class="selector-row"><label>Employee<select name="employee" required><option value="">Select employee</option>${employees.map((employee) => `<option value="${esc(employee.id)}"${String(employeeId) === String(employee.id) ? " selected" : ""}>${esc(choiceLabel("employee", employee))}</option>`).join("")}</select></label><label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Payroll</button></form></section>`;
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  if (!preview) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select an employee and period, then choose <strong>Preview Payroll</strong>.</p></section>`;
+  const formValues = {
+    pay_date: todayISO(),
+    unit_description: preview.unit_description,
+    days_count: 0,
+    gross_pay: preview.gross_pay,
+    additional_pay: preview.additional_pay,
+    vale_deduction: preview.vale_deduction,
+    cash_advance_deduction: preview.cash_advance_deduction,
+    sss: 0, philhealth: 0, pagibig: 0, withholding_tax: 0, change_deduction: 0, other_deduction: 0,
+    remarks: "",
+    ...values,
+  };
+  const hidden = `<input type="hidden" name="employee" value="${esc(preview.employee.id)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify(preview.trips.map((trip) => trip.id)))}">`;
+  const fields = [
+    textInput("pay_date", "Pay date", formValues.pay_date, 'type="date" required'),
+    textInput("unit_description", "Unit description", formValues.unit_description),
+    numberInput("days_count", "Days count", formValues.days_count),
+    numberInput("gross_pay", "Gross pay", formValues.gross_pay),
+    numberInput("additional_pay", "Additional pay", formValues.additional_pay),
+    numberInput("vale_deduction", "Vale deduction", formValues.vale_deduction),
+    numberInput("cash_advance_deduction", "Cash advance deduction", formValues.cash_advance_deduction),
+    numberInput("sss", "SSS", formValues.sss),
+    numberInput("philhealth", "PhilHealth", formValues.philhealth),
+    numberInput("pagibig", "Pag-IBIG", formValues.pagibig),
+    numberInput("withholding_tax", "Withholding tax", formValues.withholding_tax),
+    numberInput("change_deduction", "Change deduction", formValues.change_deduction),
+    numberInput("other_deduction", "Other deduction", formValues.other_deduction),
+    textareaInput("remarks", "Remarks", formValues.remarks, 'rows="3"'),
+  ];
+  const previewSummary = `<section class="panel">${cards([["Employee", preview.employee.full_name], ["Type / Basis", `${preview.employee_type} / ${preview.payroll_basis}`], ["Eligible Trips", String(preview.trips_count)], ["Preview Gross", peso(preview.gross_pay)]])}<dl class="payroll-limits"><dt>Remaining Vale</dt><dd>${esc(peso(preview.vale_deduction))}</dd><dt>Remaining Cash Advance</dt><dd>${esc(peso(preview.cash_advance_deduction))}</dd></dl></section>`;
+  const additional = preview.additionalLines.length ? `<section class="panel"><h3>Trip Pay Items</h3>${preview.additionalLines.map((line) => `<div class="detail-pay-row"><span>${esc(line.label)}</span><strong>${esc(peso(line.amount))}</strong></div>`).join("")}</section>` : "";
+  return `${errorBox}${selector}${previewSummary}<form method="post" action="/payroll/new" class="panel">${hidden}<div class="grid">${fields.join("")}</div><p><button>Save Payroll</button> <a class="button secondary" href="/payroll">Cancel</a></p></form><section class="panel payroll-preview-table"><h3>Eligible Trip Earnings</h3></section>${payrollTripTable(preview)}${additional}`;
+}
+
+function payrollCleaned(data, preview) {
+  const amounts = payrollMoneyValues(data);
+  const deductions = Object.fromEntries(PAYROLL_DEDUCTION_FIELDS.map((field) => [field, amounts[field]]));
+  return {
+    employee_id: data.employee,
+    period_from: data.period_from,
+    period_to: data.period_to,
+    pay_date: data.pay_date || todayISO(),
+    unit_description: (data.unit_description || preview?.unit_description || "").trim(),
+    days_count: amounts.days_count,
+    gross_pay: amounts.gross_pay,
+    additional_pay: amounts.additional_pay,
+    deductions,
+    remarks: (data.remarks || "").trim(),
+    expected_trip_ids: parseExpectedIds(data.expected_trip_ids),
+  };
+}
+
+function validatePayroll(cleaned, preview) {
+  const errors = [];
+  if (!cleaned.employee_id || !cleaned.period_from || !cleaned.period_to) errors.push("Employee and payroll period are required.");
+  if (cleaned.period_from && cleaned.period_to && cleaned.period_from > cleaned.period_to) errors.push("Period end must be on or after period start.");
+  for (const field of ["days_count", "gross_pay", ...PAYROLL_DEDUCTION_FIELDS]) {
+    const value = field in cleaned ? cleaned[field] : cleaned.deductions[field];
+    if (numeric(value) < 0) errors.push(`${field.replaceAll("_", " ")} cannot be negative.`);
+  }
+  if (preview) {
+    if (numeric(cleaned.deductions.vale_deduction) > numeric(preview.vale_deduction)) errors.push("Deduction cannot exceed the remaining Vale total.");
+    if (numeric(cleaned.deductions.cash_advance_deduction) > numeric(preview.cash_advance_deduction)) errors.push("Deduction cannot exceed the remaining Cash Advance balance.");
+    const freshIds = preview.trips.map((trip) => Number(trip.id));
+    if (JSON.stringify(freshIds) !== JSON.stringify(cleaned.expected_trip_ids)) errors.push("Payroll eligibility changed. Preview the period again before saving.");
+  }
+  return errors;
+}
+
+async function createdPayrollId(env, values) {
+  const row = await first(env, "SELECT id FROM payroll_entries WHERE employee_id=? AND pay_date=? ORDER BY id DESC LIMIT 1", [values.employee_id, values.pay_date]);
+  return row?.id;
+}
+
+async function applyAdvancePlan(env, table, plan, requested, { cash = false } = {}) {
+  let remaining = numeric(requested);
+  for (const row of plan) {
+    if (remaining <= 0) break;
+    const applied = Math.min(remaining, numeric(row.balance));
+    const balance = Math.max(0, numeric(row.balance) - applied);
+    const status = balance <= 0 ? "Paid" : "Open";
+    if (cash) await run(env, `UPDATE ${table} SET balance=?, status=?, applied=? WHERE id=?`, [String(balance), status, balance <= 0 ? "1" : "0", row.id]);
+    else await run(env, `UPDATE ${table} SET balance=?, status=? WHERE id=?`, [String(balance), status, row.id]);
+    remaining -= applied;
+  }
+  if (remaining > 0) throw new Error("The requested advance deduction is greater than the available open balance.");
+}
+
+async function savePayroll(env, cleaned, preview) {
+  const manualAdditional = numeric(cleaned.additional_pay) - numeric(preview.additional_pay);
+  const netPay = calculateNet(cleaned.gross_pay, cleaned.additional_pay, cleaned.deductions);
+  const values = {
+    pay_date: cleaned.pay_date,
+    period_from: cleaned.period_from,
+    period_to: cleaned.period_to,
+    employee_id: cleaned.employee_id,
+    employee_type: preview.employee_type,
+    payroll_basis: preview.payroll_basis,
+    unit_description: cleaned.unit_description || preview.unit_description,
+    trips_count: String(preview.trips.length),
+    days_count: cleaned.days_count,
+    gross_pay: cleaned.gross_pay,
+    additional_pay: cleaned.additional_pay,
+    driver_trip_additional_pay: String(preview.driver_trip_additional_pay),
+    helper_trip_additional_pay: String(preview.helper_trip_additional_pay),
+    ...cleaned.deductions,
+    net_pay: String(netPay),
+    remarks: cleaned.remarks,
+  };
+  const fields = Object.keys(values);
+  const result = await run(env, `INSERT INTO payroll_entries (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
+  const payrollId = result?.meta?.last_row_id || await createdPayrollId(env, values);
+  for (const trip of preview.trips) await run(env, "INSERT INTO payroll_trips (payroll_id, trip_id, employee_id) VALUES (?,?,?)", [payrollId, trip.id, cleaned.employee_id]);
+  const lines = [...preview.additionalLines];
+  if (manualAdditional) lines.push({ employee_type: "Manual", label: "Manual Additional Pay", amount: manualAdditional, sort_order: lines.length + 1 });
+  for (const line of lines.filter((line) => numeric(line.amount))) {
+    await run(env, "INSERT INTO payroll_additional_lines (payroll_id, employee_type, label, amount, sort_order) VALUES (?,?,?,?,?)", [payrollId, line.employee_type, line.label, String(line.amount), line.sort_order]);
+  }
+  await applyAdvancePlan(env, "vale_records", preview.valePlan, cleaned.deductions.vale_deduction);
+  await applyAdvancePlan(env, "cash_advances", preview.cashPlan, cleaned.deductions.cash_advance_deduction, { cash: true });
+  return payrollId;
+}
+
+async function payrollListPage(request, env, user, path) {
+  const access = requireView(user, "Payroll");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const where = payrollWhere(query);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT p.*, e.full_name, e.employee_code FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql} ORDER BY p.pay_date DESC, p.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((row) => `<tr><td>${esc(row.pay_date)}</td><td>${esc(row.period_from)} – ${esc(row.period_to)}</td><td><a href="/payroll/${row.id}">${esc(row.full_name || "")}</a><small class="cell-detail">${esc(row.employee_code || "")}</small></td><td>${esc(row.employee_type)}<small class="cell-detail">${esc(row.payroll_basis)}</small></td><td>${esc(row.trips_count)}</td><td>${esc(row.days_count)}</td>${moneyCell(row.gross_pay)}${moneyCell(row.additional_pay)}${moneyCell(deductionTotal(row))}<td class="num"><strong>${esc(peso(row.net_pay))}</strong></td><td><a href="/payroll/${row.id}">View</a> <a href="/payroll/${row.id}/print" target="_blank">Print</a></td></tr>`);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search employee, type, or remarks"><button>Search</button></form><div>${canEdit(user, "Payroll") ? `<a class="button" href="/payroll/new">New Payroll</a>` : ""} <a class="button secondary" href="${esc(`/payroll/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Pay Date", "Period", "Employee", "Type / Basis", "Trips", "Days", "Gross", "Additional", "Deductions", "Net", "Actions"], body, { empty: "No payroll entries found." })}${paginationWithParams("/payroll", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Payroll", user, path, content }));
+}
+
+async function payrollNewPage(request, env, user, path) {
+  const access = requireEdit(user, "Payroll");
+  if (access) return errorResponse(access, user, path);
+  const employees = await payrollEmployees(env);
+  const source = request.method === "POST" ? await parseForm(request) : Object.fromEntries(new URL(request.url).searchParams.entries());
+  const selection = {
+    employee: source.employee || "",
+    period_from: source.period_from || periodStartToday(),
+    period_to: source.period_to || todayISO(),
+  };
+  const preview = selection.employee ? await payrollPreview(env, selection.employee, selection.period_from, selection.period_to) : null;
+  if (request.method === "POST") {
+    const cleaned = payrollCleaned(source, preview);
+    const errors = preview ? validatePayroll(cleaned, preview) : ["Employee or payroll period is invalid. Preview the period again."];
+    if (errors.length) return html(layout({ title: "New Payroll", user, path, content: payrollFormContent(employees, selection, preview, source, errors) }), 400);
+    try {
+      const id = await savePayroll(env, cleaned, preview);
+      return redirect(`/payroll/${id}?ok=${encodeURIComponent("Payroll entry saved and advance deductions applied.")}`);
+    } catch (error) {
+      return html(layout({ title: "New Payroll", user, path, content: payrollFormContent(employees, selection, preview, source, [error.message || String(error)]) }), 400);
+    }
+  }
+  return html(layout({ title: "New Payroll", user, path, content: payrollFormContent(employees, selection, preview) }));
+}
+
+async function loadPayrollEntry(env, id) {
+  const entry = await first(env, "SELECT p.*, e.full_name, e.employee_code FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id WHERE p.id=?", [id]);
+  if (!entry) return null;
+  entry.trips = await all(env, `SELECT pt.*, t.trip_date, t.trip_ticket_no, t.origin, t.destination, t.job_description, t.driver_pay_rate, t.helper_pay_rate, t.driver_additional_pay, t.helper_additional_pay, a.asset_code, (SELECT COUNT(*) FROM trip_helpers th WHERE th.trip_id=t.id) AS helper_count FROM payroll_trips pt JOIN trips t ON t.id=pt.trip_id LEFT JOIN assets a ON a.id=t.asset_id WHERE pt.payroll_id=? ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [id]);
+  entry.lines = await all(env, "SELECT * FROM payroll_additional_lines WHERE payroll_id=? ORDER BY sort_order, id", [id]);
+  entry.remaining_vale = (await all(env, "SELECT balance FROM vale_records WHERE employee_id=? AND balance>0", [entry.employee_id])).reduce((sum, row) => sum + numeric(row.balance), 0);
+  entry.remaining_cash = (await all(env, "SELECT balance FROM cash_advances WHERE employee_id=? AND balance>0", [entry.employee_id])).reduce((sum, row) => sum + numeric(row.balance), 0);
+  return entry;
+}
+
+function payrollTripAmount(entry, trip) {
+  if (entry.employee_type === "Driver") return numeric(trip.driver_pay_rate);
+  if (entry.employee_type === "Helper") return numeric(trip.helper_count) ? numeric(trip.helper_pay_rate) / numeric(trip.helper_count) : 0;
+  return 0;
+}
+
+function payrollDetailContent(entry, user, print = false) {
+  const deductions = [
+    ["Vale", entry.vale_deduction], ["Cash Advance", entry.cash_advance_deduction],
+    ["SSS", entry.sss], ["PhilHealth", entry.philhealth], ["Pag-IBIG", entry.pagibig],
+    ["Withholding Tax", entry.withholding_tax], ["Change Deduction", entry.change_deduction], ["Other Deduction", entry.other_deduction],
+  ];
+  const tripRows = (entry.trips || []).map((trip) => ({ ...trip, payroll_amount: payrollTripAmount(entry, trip) }));
+  if (print) {
+    const rows = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td class="center">1</td><td class="num">${esc(money(row.payroll_amount))}</td><td>${esc(row.trip_ticket_no)}</td><td>${esc(row.origin || "")} to ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td><td class="num">${esc(money(row.payroll_amount))}</td></tr>`).join("") || `<tr><td colspan="7" class="center">No trip-level payroll detail captured for this entry.</td></tr>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Payroll #${esc(entry.id)}</title><style>@page{size:A5 landscape;margin:8mm}body{font:12px Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm 4mm 24mm}.print-button{margin-bottom:8px}.top{display:flex;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0 0 5px}.top h2{font-size:16px;margin:0;text-align:right}.meta{font-size:14px;margin:3px 0}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}th{background:#f0f0f0}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.center{text-align:center}.summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}.net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}.remarks-box{min-height:78px;white-space:pre-wrap}.remaining-balances{margin-top:8px}.signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><h1>Payroll for ${esc(entry.period_from)} to ${esc(entry.period_to)}</h1><div class="meta"><strong>Payroll ID:</strong> ${esc(entry.id)}</div><div class="meta"><strong>Name of ${esc(entry.employee_type)}:</strong> ${esc(entry.full_name || "")}</div><div class="meta"><strong>Work:</strong> ${esc(entry.unit_description || "")}</div></div><h2>${esc(entry.pay_date)}</h2></div><table><thead><tr><th>Date</th><th>Trips</th><th>Rate</th><th>Trip Ticket / Waybill</th><th>Origin-Destination</th><th>Item / Job</th><th>Amount</th></tr></thead><tbody>${rows}<tr><td></td><td class="center"><strong>${esc(entry.trips_count)}</strong></td><td colspan="4" class="num"><strong>Gross Pay</strong></td><td class="num"><strong>${esc(peso(entry.gross_pay))}</strong></td></tr></tbody></table><div class="summary"><table><tr><th colspan="2">Payroll Summary</th></tr><tr><td>Days Count</td><td>${esc(entry.days_count)}</td></tr><tr><td>Additional Pay</td><td class="num">${esc(peso(entry.additional_pay))}</td></tr></table><div><table><tr><th>Remarks</th></tr><tr><td class="remarks-box">${esc(entry.remarks || "")}</td></tr></table><table class="remaining-balances"><tr><td>Remaining Vale</td><td class="num">${esc(peso(entry.remaining_vale))}</td></tr><tr><td>Remaining Cash Advance</td><td class="num">${esc(peso(entry.remaining_cash))}</td></tr></table></div><div><table><tr><th colspan="2">Deductions</th></tr>${deductions.map(([label, amount]) => `<tr><td>${esc(label)}</td><td class="num">${numeric(amount) ? esc(peso(amount)) : ""}</td></tr>`).join("")}</table><div class="net">Net Pay: ${esc(peso(entry.net_pay))}</div></div></div><div class="signature">Received by: / Employee Signature</div></div></body></html>`;
+  }
+  const tripBody = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td><a href="/trips/${row.trip_id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.origin || "")} → ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
+  const lines = (entry.lines || []).map((line) => `<div class="detail-pay-row"><span>${esc(line.label)} <small>${esc(line.employee_type)}</small></span><strong>${esc(peso(line.amount))}</strong></div>`).join("") || `<p class="muted">No additional lines.</p>`;
+  const main = `<section class="panel detail-hero"><div><span class="dialog-kicker">Payroll #${esc(entry.id)}</span><h3>${esc(entry.full_name || "")}</h3><p>${esc(entry.period_from)} – ${esc(entry.period_to)} · ${esc(entry.employee_type)} / ${esc(entry.payroll_basis)}</p></div><strong>${esc(peso(entry.net_pay))}</strong></section><div class="detail-grid"><section class="panel"><h3>Payroll Summary</h3><dl class="detail-list"><dt>Pay Date</dt><dd>${esc(entry.pay_date)}</dd><dt>Work</dt><dd>${esc(entry.unit_description)}</dd><dt>Trips</dt><dd>${esc(entry.trips_count)}</dd><dt>Gross</dt><dd>${esc(peso(entry.gross_pay))}</dd><dt>Additional</dt><dd>${esc(peso(entry.additional_pay))}</dd><dt>Deductions</dt><dd>${esc(peso(deductionTotal(entry)))}</dd><dt class="detail-total">Net Pay</dt><dd class="detail-total">${esc(peso(entry.net_pay))}</dd></dl></section><section class="panel"><h3>Deductions</h3><dl class="detail-list">${deductions.map(([label, amount]) => `<dt>${esc(label)}</dt><dd>${esc(peso(amount))}</dd>`).join("")}</dl></section><section class="panel"><h3>Remarks</h3><p>${esc(entry.remarks || "")}</p><dl class="detail-list"><dt>Remaining Vale</dt><dd>${esc(peso(entry.remaining_vale))}</dd><dt>Remaining Cash Advance</dt><dd>${esc(peso(entry.remaining_cash))}</dd></dl></section><section class="panel"><h3>Additional Lines</h3>${lines}</section></div><section class="panel"><h3>Claimed Trips</h3></section>${table(["Date", "Trip Ticket / Waybill", "Unit", "Route", "Item / Job", "Amount"], tripBody, { empty: "No trip-level payroll detail captured for this entry." })}`;
+  const actions = `<div class="detail-toolbar"><a class="button secondary" href="/payroll">← Payroll List</a><div><a class="button secondary" href="/payroll/${entry.id}/print" target="_blank">Printable Payroll</a></div></div>`;
+  const deleteForm = canEdit(user, "Payroll") ? `<section class="detail-danger"><form method="post" action="/payroll/${entry.id}/delete" onsubmit="return confirm('Delete this payroll? Claimed trips will be released and advance deductions restored.');"><button class="danger-button">Delete and Reverse Payroll</button></form></section>` : "";
+  return `${actions}${main}${deleteForm}`;
+}
+
+async function payrollDetailPage(request, env, user, path, id, print = false) {
+  const access = requireView(user, "Payroll");
+  if (access) return errorResponse(access, user, path);
+  const entry = await loadPayrollEntry(env, id);
+  if (!entry) return html("Not found", 404);
+  if (print) return html(payrollDetailContent(entry, user, true));
+  return html(layout({ title: "Payroll Details", user, path, content: `${messagePanel(new URL(request.url))}${payrollDetailContent(entry, user)}` }));
+}
+
+async function restoreAdvances(env, table, employeeId, amount, { cash = false } = {}) {
+  let remaining = numeric(amount);
+  const rows = await all(env, `SELECT * FROM ${table} WHERE employee_id=? ORDER BY date_granted DESC, id DESC`, [employeeId]);
+  for (const row of rows) {
+    if (remaining <= 0) break;
+    const room = Math.max(0, numeric(row.amount) - numeric(row.balance));
+    const restored = Math.min(room, remaining);
+    if (restored <= 0) continue;
+    const balance = numeric(row.balance) + restored;
+    if (cash) await run(env, `UPDATE ${table} SET balance=?, status='Open', applied=0 WHERE id=?`, [String(balance), row.id]);
+    else await run(env, `UPDATE ${table} SET balance=?, status='Open' WHERE id=?`, [String(balance), row.id]);
+    remaining -= restored;
+  }
+  return remaining;
+}
+
+async function payrollDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Payroll");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const entry = await first(env, "SELECT * FROM payroll_entries WHERE id=?", [id]);
+  if (!entry) return redirect("/payroll?error=Payroll%20entry%20not%20found.");
+  await restoreAdvances(env, "vale_records", entry.employee_id, entry.vale_deduction);
+  await restoreAdvances(env, "cash_advances", entry.employee_id, entry.cash_advance_deduction, { cash: true });
+  await run(env, "DELETE FROM payroll_entries WHERE id=?", [id]);
+  return redirect(`/payroll?ok=${encodeURIComponent("Payroll deleted; Vale and Cash Advance deductions were restored.")}`);
+}
+
+async function payrollExportPage(request, env, user, path) {
+  const access = requireView(user, "Payroll");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const where = payrollWhere((url.searchParams.get("q") || "").trim());
+  const rows = await all(env, `SELECT p.*, e.employee_code, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql} ORDER BY p.pay_date DESC, p.id DESC`, where.params);
+  const lines = ["Payroll ID,Pay Date,Period From,Period To,Employee Code,Employee Name,Employee Type,Gross Pay,Additional Pay,Deductions,Net Pay,Remarks"];
+  for (const row of rows) lines.push(quotedCsvRow([row.id, row.pay_date, row.period_from, row.period_to, row.employee_code || "", row.full_name || "", row.employee_type, row.gross_pay, row.additional_pay, deductionTotal(row), row.net_pay, row.remarks || ""]));
+  return csv(lines.join("\n"), "payroll.csv");
+}
+
 async function reportList(env, user, path) {
   const access = requireView(user, "Reports");
   if (access) return errorResponse(access, user, path);
@@ -1336,8 +1719,16 @@ export async function handleRequest(request, env) {
   if (match) return advanceFormPage(request, env, user, path, match[1], Number(match[2]));
   match = path.match(/^\/advances\/(vale|cash)\/(\d+)\/delete$/);
   if (match) return advanceDeletePage(request, env, user, path, match[1], Number(match[2]));
+  if (path === "/payroll") return payrollListPage(request, env, user, path);
+  if (path === "/payroll/new") return payrollNewPage(request, env, user, path);
+  if (path === "/payroll/export.csv") return payrollExportPage(request, env, user, path);
+  match = path.match(/^\/payroll\/(\d+)\/print$/);
+  if (match) return payrollDetailPage(request, env, user, path, Number(match[1]), true);
+  match = path.match(/^\/payroll\/(\d+)\/delete$/);
+  if (match) return payrollDeletePage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/payroll\/(\d+)$/);
+  if (match) return payrollDetailPage(request, env, user, path, Number(match[1]));
   if (path === "/reports") return reportList(env, user, path);
-  if (path === "/payroll") return placeholder("Payroll", user, path, "Payroll");
   if (path === "/billing") return placeholder("Billing", user, path, "Billing");
   if (path === "/collections") return placeholder("Collections", user, path, "Collections");
   if (path === "/users") return placeholder("User Management", user, path, "User Management");

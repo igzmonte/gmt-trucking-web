@@ -29,13 +29,26 @@ function envWithRows(rows = {}) {
             return this;
           },
           async all() {
+            if (state.sql.trim().startsWith("SELECT p.") && state.sql.includes("FROM payroll_entries p")) return { results: rows.payroll || [] };
+            if (state.sql.trim().startsWith("SELECT pt.") && state.sql.includes("FROM payroll_trips pt")) return { results: rows.payrollTrips || [] };
+            if (state.sql.includes("FROM payroll_additional_lines")) return { results: rows.payrollLines || [] };
+            if (state.sql.includes("FROM vale_records WHERE")) return { results: rows.vale || [] };
+            if (state.sql.includes("FROM cash_advances WHERE")) return { results: rows.cashAdvances || [] };
             if (state.sql.includes("FROM repairs r")) return { results: rows.repairs || [] };
             if (state.sql.includes("FROM payables p")) return { results: rows.payables || [] };
             if (state.sql.includes("FROM vale_records v")) return { results: rows.vale || [] };
             if (state.sql.includes("FROM cash_advances c")) return { results: rows.cashAdvances || [] };
             if (state.sql.includes("FROM trips t")) return { results: rows.trips || [] };
             if (state.sql.includes("FROM trip_helpers th")) return { results: rows.tripHelpers || [] };
-            if (state.sql.includes("FROM trip_employee_pay_items")) return { results: rows.payItems || [] };
+            if (state.sql.includes("FROM trip_employee_pay_items")) {
+              const [tripId, employeeType] = state.params;
+              const payItems = (rows.payItems || []).filter((row) => {
+                const tripMatches = !tripId || row.trip_id == null || Number(row.trip_id) === Number(tripId);
+                const typeMatches = !employeeType || row.employee_type === employeeType;
+                return tripMatches && typeMatches;
+              });
+              return { results: payItems };
+            }
             if (state.sql.includes("FROM recurring_trip_masters r")) return { results: filtered("recurring").slice(0, 25) };
             if (state.sql.includes("FROM repairs ORDER BY")) return { results: rows.repairs || [] };
             if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Driver'")) return { results: rows.drivers || filtered("employees").filter((row) => row.employee_type === "Driver").slice(0, 25) };
@@ -48,6 +61,13 @@ function envWithRows(rows = {}) {
           },
           async first() {
             if (state.sql.includes("FROM users")) return rows.user || null;
+            if (state.sql.includes("COUNT(*) AS total FROM payroll_entries p")) return { total: rows.payrollCount ?? filtered("payroll").length };
+            if (state.sql.includes("SELECT p.*,") && state.sql.includes("FROM payroll_entries p")) return byId("payroll") || null;
+            if (state.sql.includes("SELECT id FROM payroll_entries WHERE employee_id=?")) {
+              if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO payroll_entries"))) return { id: rows.createdPayrollId || 51 };
+              return null;
+            }
+            if (state.sql.includes("SELECT * FROM payroll_entries WHERE id=?")) return byId("payroll") || null;
             if (state.sql.includes("COUNT(*) AS total FROM repairs r")) return { total: rows.repairsCount ?? filtered("repairs").length };
             if (state.sql.includes("COUNT(*) AS total FROM payables p")) return { total: rows.payablesCount ?? filtered("payables").length };
             if (state.sql.includes("COUNT(*) AS total FROM vale_records v")) return { total: rows.valeCount ?? filtered("vale").length };
@@ -245,6 +265,91 @@ function advanceBody(overrides = {}) {
     notes: "Preview",
     ...overrides,
   });
+}
+
+function payrollBody(overrides = {}) {
+  return new URLSearchParams({
+    employee: "3",
+    period_from: "2026-07-01",
+    period_to: "2026-07-31",
+    expected_trip_ids: "[1]",
+    pay_date: "2026-07-31",
+    unit_description: "1 trip(s)",
+    days_count: "0",
+    gross_pay: "3000",
+    additional_pay: "150",
+    vale_deduction: "500",
+    cash_advance_deduction: "1000",
+    sss: "0",
+    philhealth: "0",
+    pagibig: "0",
+    withholding_tax: "0",
+    change_deduction: "0",
+    other_deduction: "25",
+    remarks: "Payroll test",
+    ...overrides,
+  });
+}
+
+function payrollEmployee(overrides = {}) {
+  return {
+    id: 3,
+    employee_code: "PAY-D",
+    full_name: "Payroll Driver",
+    employee_type: "Driver",
+    payroll_basis: "Per Trip",
+    active: 1,
+    ...overrides,
+  };
+}
+
+function payrollTrip(overrides = {}) {
+  return sampleTrip({
+    id: 1,
+    trip_ticket_no: "TT-PAY-001",
+    trip_date: "2026-07-04",
+    status: "Completed",
+    driver_id: 3,
+    driver_pay_rate: 3000,
+    helper_pay_rate: 600,
+    driver_additional_pay: 150,
+    helper_additional_pay: 200,
+    helper_count: 2,
+    job_description: "Payroll delivery service",
+    ...overrides,
+  });
+}
+
+function payrollEntry(overrides = {}) {
+  return {
+    id: 51,
+    pay_date: "2026-07-31",
+    period_from: "2026-07-01",
+    period_to: "2026-07-31",
+    employee_id: 3,
+    employee_code: "PAY-D",
+    full_name: "Payroll Driver",
+    employee_type: "Driver",
+    payroll_basis: "Per Trip",
+    unit_description: "1 trip(s)",
+    trips_count: 1,
+    days_count: 0,
+    gross_pay: 3000,
+    additional_pay: 150,
+    driver_trip_additional_pay: 150,
+    helper_trip_additional_pay: 0,
+    vale_deduction: 500,
+    cash_advance_deduction: 1000,
+    sss: 0,
+    philhealth: 0,
+    pagibig: 0,
+    withholding_tax: 0,
+    change_deduction: 0,
+    other_deduction: 25,
+    net_pay: 1625,
+    remarks: "Payroll test",
+    ...overrides,
+  };
 }
 
 test("health endpoint is public and reports Cloudflare runtime", async () => {
@@ -802,4 +907,170 @@ test("repairs accounting access is blocked while payables edit access is allowed
   response = await handleRequest(await authedRequest("https://example.test/payables/new", "accounting", { method: "POST", body: payableBody() }), envWithRows({ runs }));
   assert.equal(response.status, 303);
   assert.match(runs[0].sql, /INSERT INTO payables/);
+});
+
+test("payroll list supports search pagination and filtered export links", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/payroll?q=Driver&page=2", "accounting"), envWithRows({
+    payrollCount: 30,
+    payroll: [payrollEntry()],
+  }));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.match(text, /Payroll/);
+  assert.match(text, /Payroll Driver/);
+  assert.match(text, /Page 2 of 2/);
+  assert.match(text, /\/payroll\/51/);
+  assert.match(text, /\/payroll\/51\/print/);
+  assert.match(text, /\/payroll\/export\.csv\?q=Driver/);
+});
+
+test("payroll CSV export includes Django-compatible headers and raw numeric values", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/payroll/export.csv", "viewer"), envWithRows({
+    payroll: [payrollEntry()],
+  }));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.match(text, /Payroll ID,Pay Date,Period From,Period To,Employee Code,Employee Name,Employee Type,Gross Pay,Additional Pay,Deductions,Net Pay,Remarks/);
+  assert.match(text, /"51","2026-07-31","2026-07-01","2026-07-31","PAY-D","Payroll Driver","Driver","3000","150","1525","1625","Payroll test"/);
+});
+
+test("payroll preview calculates driver and helper trip earnings with remaining advances", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/payroll/new?employee=3&period_from=2026-07-01&period_to=2026-07-31", "admin"), envWithRows({
+    employees: [payrollEmployee()],
+    trips: [payrollTrip()],
+    payItems: [{ id: 1, trip_id: 1, employee_type: "Driver", label: "Night Shift", amount: 150 }],
+    vale: [{ id: 7, employee_id: 3, balance: 500, installment_amount: 500, status: "Open" }],
+    cashAdvances: [{ id: 8, employee_id: 3, balance: 1000, status: "Open" }],
+  }));
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Preview Gross/);
+  assert.match(text, /TT-PAY-001/);
+  assert.match(text, /Payroll delivery service/);
+  assert.match(text, /Night Shift/);
+  assert.match(text, /Remaining Vale/);
+  assert.match(text, /Remaining Cash Advance/);
+  assert.match(text, /value="\[1\]"/);
+
+  response = await handleRequest(await authedRequest("https://example.test/payroll/new?employee=4&period_from=2026-07-01&period_to=2026-07-31", "admin"), envWithRows({
+    employees: [payrollEmployee({ id: 4, employee_code: "PAY-H", full_name: "Payroll Helper", employee_type: "Helper" })],
+    trips: [payrollTrip()],
+    tripHelpers: [{ id: 1, trip_id: 1, employee_id: 4, helper_order: 1 }],
+    payItems: [{ id: 2, trip_id: 1, employee_type: "Helper", label: "Loading", amount: 200 }],
+  }));
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Payroll Helper/);
+  assert.match(text, /Loading/);
+  assert.match(text, /300\.00/);
+});
+
+test("payroll save creates entry, claims trips, adds lines, and applies advance balances", async () => {
+  const runs = [];
+  const response = await handleRequest(await authedRequest("https://example.test/payroll/new", "accounting", { method: "POST", body: payrollBody() }), envWithRows({
+    employees: [payrollEmployee()],
+    trips: [payrollTrip()],
+    payItems: [{ id: 1, trip_id: 1, employee_type: "Driver", label: "Night Shift", amount: 150 }],
+    vale: [{ id: 7, employee_id: 3, balance: 500, installment_amount: 500, status: "Open" }],
+    cashAdvances: [{ id: 8, employee_id: 3, balance: 1000, status: "Open" }],
+    createdPayrollId: 51,
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/payroll\/51/);
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO payroll_entries")));
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO payroll_trips")));
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO payroll_additional_lines")));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE vale_records SET balance=?, status=?") && run.params[0] === "0" && run.params[1] === "Paid"));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE cash_advances SET balance=?, status=?, applied=?") && run.params[0] === "0" && run.params[1] === "Paid" && Number(run.params[2]) === 1));
+});
+
+test("payroll save rejects stale eligibility and deduction values above available balances", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/payroll/new", "admin", { method: "POST", body: payrollBody({ expected_trip_ids: "[99]" }) }), envWithRows({
+    employees: [payrollEmployee()],
+    trips: [payrollTrip()],
+    vale: [{ id: 7, employee_id: 3, balance: 500, installment_amount: 500, status: "Open" }],
+    cashAdvances: [{ id: 8, employee_id: 3, balance: 1000, status: "Open" }],
+  }));
+  assert.equal(response.status, 400);
+  let text = await response.text();
+  assert.match(text, /eligibility changed/i);
+
+  response = await handleRequest(await authedRequest("https://example.test/payroll/new", "admin", { method: "POST", body: payrollBody({ vale_deduction: "900" }) }), envWithRows({
+    employees: [payrollEmployee()],
+    trips: [payrollTrip()],
+    vale: [{ id: 7, employee_id: 3, balance: 500, installment_amount: 500, status: "Open" }],
+    cashAdvances: [{ id: 8, employee_id: 3, balance: 1000, status: "Open" }],
+  }));
+  assert.equal(response.status, 400);
+  text = await response.text();
+  assert.match(text, /Deduction cannot exceed the remaining Vale total/i);
+});
+
+test("payroll detail and print show payslip trip rows, remarks, balances, deductions, net pay, and signature", async () => {
+  const env = envWithRows({
+    payroll: [payrollEntry()],
+    payrollTrips: [{
+      payroll_id: 51,
+      trip_id: 1,
+      trip_ticket_no: "TT-PAY-001",
+      trip_date: "2026-07-04",
+      origin: "Warehouse",
+      destination: "Site",
+      job_description: "Payroll delivery service",
+      driver_pay_rate: 3000,
+      helper_pay_rate: 600,
+      helper_count: 2,
+    }],
+    payrollLines: [{ payroll_id: 51, label: "Night Shift", amount: 150 }],
+    vale: [{ id: 7, employee_id: 3, balance: 250 }],
+    cashAdvances: [{ id: 8, employee_id: 3, balance: 1000 }],
+  });
+
+  let response = await handleRequest(await authedRequest("https://example.test/payroll/51", "viewer"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Trip Ticket \/ Waybill/);
+  assert.match(text, /Item \/ Job/);
+  assert.match(text, /Payroll delivery service/);
+  assert.match(text, /Night Shift/);
+  assert.match(text, /Net Pay/);
+
+  response = await handleRequest(await authedRequest("https://example.test/payroll/51/print", "viewer"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Remarks/);
+  assert.match(text, /Remaining Vale/);
+  assert.match(text, /Remaining Cash Advance/);
+  assert.match(text, /Deductions/);
+  assert.match(text, /Received by: \/ Employee Signature/);
+});
+
+test("payroll delete is POST-only, reverses advances, and releases claimed trips", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/payroll/51/delete", "admin"), envWithRows());
+  assert.equal(response.status, 405);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/payroll/51/delete", "admin", { method: "POST" }), envWithRows({
+    payroll: [payrollEntry()],
+    vale: [{ id: 7, employee_id: 3, amount: 1000, balance: 500, status: "Paid" }],
+    cashAdvances: [{ id: 8, employee_id: 3, amount: 1500, balance: 500, status: "Paid", applied: 1 }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/payroll\?ok=Payroll%20deleted/);
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE vale_records SET balance=?, status='Open'") && run.params[0] === "1000"));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE cash_advances SET balance=?, status='Open', applied=0") && run.params[0] === "1500"));
+  assert.ok(runs.some((run) => run.sql.includes("DELETE FROM payroll_entries WHERE id=?")));
+});
+
+test("payroll permissions allow admin accounting reads while blocking encoder and viewer mutation", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/payroll", "encoder"), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/payroll/new", "viewer", { method: "POST", body: payrollBody() }), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/payroll", "accounting"), envWithRows());
+  assert.equal(response.status, 200);
 });
