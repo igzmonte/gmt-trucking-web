@@ -1824,7 +1824,7 @@ async function billingListPage(request, env, user, path) {
     const status = billingStatus(row.grand_total, paid);
     return `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.billing_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.period_from || "")} – ${esc(row.period_to || "")}</td>${moneyCell(row.grand_total)}${moneyCell(paid)}${moneyCell(balance)}<td><span class="status">${esc(status)}</span></td><td><a href="/billing/${row.id}">View</a> <a href="/billing/${row.id}/print" target="_blank">Print</a></td></tr>`;
   });
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search billing"><button>Search</button></form><div>${canEdit(user, "Billing") ? `<a class="button" href="/billing/new">New Billing</a>` : ""} <a class="button secondary" href="${esc(`/billing/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search billing"><button>Search</button></form><div><a class="button secondary" href="/billing/soa">Statement of Account</a> ${canEdit(user, "Billing") ? `<a class="button" href="/billing/new">New Billing</a>` : ""} <a class="button secondary" href="${esc(`/billing/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
   const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Billing No.", "Date", "Client", "Period", "Grand Total", "Paid", "Balance", "Status", "Actions"], body, { empty: "No billing statements found." })}${paginationWithParams("/billing", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "Billing", user, path, content }));
 }
@@ -1879,6 +1879,102 @@ async function billingExportPage(request, env, user, path) {
     lines.push(quotedCsvRow([row.billing_no, row.billing_date, row.client_name || "", row.period_from, row.period_to, row.gross_total, row.vat_amount, row.additions_total, row.deductions_total, row.grand_total, paid, outstandingBalance(row.grand_total, paid), billingStatus(row.grand_total, paid), row.notes || ""]));
   }
   return csv(lines.join("\n"), "billing.csv");
+}
+
+function soaFilters(url) {
+  return {
+    client_id: url.searchParams.get("client") || "",
+    mode: url.searchParams.get("mode") === "all" ? "all" : "outstanding",
+    as_of: url.searchParams.get("as_of") || todayISO(),
+    date_from: url.searchParams.get("date_from") || "",
+    date_to: url.searchParams.get("date_to") || "",
+  };
+}
+
+function soaParams(filters) {
+  const params = new URLSearchParams();
+  if (filters.client_id) params.set("client", filters.client_id);
+  params.set("mode", filters.mode);
+  params.set("as_of", filters.as_of);
+  if (filters.date_from) params.set("date_from", filters.date_from);
+  if (filters.date_to) params.set("date_to", filters.date_to);
+  return params;
+}
+
+async function soaClient(env, id) {
+  if (!id) return null;
+  return await first(env, "SELECT * FROM clients WHERE id=?", [id]);
+}
+
+async function soaRows(env, filters) {
+  if (!filters.client_id) return [];
+  const clauses = ["b.client_id=?"];
+  const params = [filters.client_id];
+  if (filters.date_from) {
+    clauses.push("b.billing_date>=?");
+    params.push(filters.date_from);
+  }
+  if (filters.date_to) {
+    clauses.push("b.billing_date<=?");
+    params.push(filters.date_to);
+  }
+  const rows = await all(env, `SELECT b.*, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id AND co.collection_date<=?),0) AS paid_as_of FROM billing_statements b WHERE ${clauses.join(" AND ")} ORDER BY b.billing_date, b.billing_no, b.id`, [filters.as_of, ...params]);
+  const mapped = rows.map((row) => {
+    const paid = numeric(row.paid_as_of);
+    const balance = outstandingBalance(row.grand_total, paid);
+    return { ...row, paid_as_of: paid, balance_as_of: balance, status_as_of: billingStatus(row.grand_total, paid) };
+  });
+  return filters.mode === "outstanding" ? mapped.filter((row) => numeric(row.balance_as_of) !== 0) : mapped;
+}
+
+function soaTotals(rows) {
+  return rows.reduce((totals, row) => ({
+    billed: totals.billed + numeric(row.grand_total),
+    paid: totals.paid + numeric(row.paid_as_of),
+    balance: totals.balance + numeric(row.balance_as_of),
+  }), { billed: 0, paid: 0, balance: 0 });
+}
+
+function soaFilterForm(clients, filters) {
+  return `<section class="panel"><h3>Statement of Account</h3><form class="selector-row" method="get" action="/billing/soa">${selectInput("client", "Client", clients, filters.client_id, (client) => choiceLabel("client", client), "Select client")}<label>Mode<select name="mode"><option value="outstanding"${filters.mode === "outstanding" ? " selected" : ""}>Outstanding Only</option><option value="all"${filters.mode === "all" ? " selected" : ""}>All Activity</option></select></label><label>As-of date<input type="date" name="as_of" value="${esc(filters.as_of)}" required></label><label>Date from<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date to<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Generate SOA</button></form></section>`;
+}
+
+function soaRowsTable(rows, { links = true } = {}) {
+  const body = rows.map((row) => `<tr><td>${links ? `<a href="/billing/${row.id}">${esc(row.billing_no)}</a>` : esc(row.billing_no)}</td><td>${esc(row.billing_date)}</td><td>${esc(row.period_from || "")} – ${esc(row.period_to || "")}</td>${moneyCell(row.grand_total)}${moneyCell(row.paid_as_of)}${moneyCell(row.balance_as_of)}<td>${esc(row.status_as_of)}</td></tr>`);
+  return table(["Billing No.", "Billing Date", "Billing Period", "Grand Total", "Payments", "Balance", "Status"], body, { empty: "No SOA rows found for the selected filters." });
+}
+
+function soaContent(clients, client, filters, rows) {
+  const params = soaParams(filters);
+  const totals = soaTotals(rows);
+  const period = `${filters.date_from || "Beginning"} to ${filters.date_to || "Current"}`;
+  const actions = filters.client_id ? `<section class="panel"><div class="toolbar"><div><a class="button secondary" href="/billing">← Billing List</a></div><div><a class="button secondary" href="/billing/soa/print?${esc(params.toString())}" target="_blank">Printable SOA</a> <a class="button secondary" href="/billing/soa/export.csv?${esc(params.toString())}">Export CSV</a></div></div></section>` : "";
+  const summary = client ? `<section class="panel detail-hero"><div><span class="dialog-kicker">Statement of Account</span><h3>${esc(client.client_name || "")}</h3><p>${esc(client.client_code || "")} · ${esc(client.billing_address || "")}</p><p>As of ${esc(filters.as_of)} · Period: ${esc(period)} · ${filters.mode === "all" ? "All Activity" : "Outstanding Only"}</p></div><strong>${esc(peso(totals.balance))}</strong></section><section class="panel">${cards([["Total Billed", peso(totals.billed)], ["Total Payments", peso(totals.paid)], ["Total Balance", peso(totals.balance)]])}</section>` : "";
+  return `${soaFilterForm(clients, filters)}${actions}${summary}${client ? soaRowsTable(rows) : ""}`;
+}
+
+function soaPrintable(client, filters, rows) {
+  const totals = soaTotals(rows);
+  const period = `${filters.date_from || "Beginning"} to ${filters.date_to || "Current"}`;
+  const body = rows.map((row) => `<tr><td>${esc(row.billing_no)}</td><td>${esc(row.billing_date)}</td><td>${esc(row.period_from || "")} to ${esc(row.period_to || "")}</td><td class="num">${esc(peso(row.grand_total))}</td><td class="num">${esc(peso(row.paid_as_of))}</td><td class="num">${esc(peso(row.balance_as_of))}</td><td>${esc(row.status_as_of)}</td></tr>`).join("") || `<tr><td colspan="7">No SOA rows found for the selected filters.</td></tr>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Statement of Account · GMT</title><style>@page{size:A4 portrait;margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111}.top{display:flex;justify-content:space-between;gap:24px}h1,h2{margin:0 0 6px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.totals{margin-left:auto;width:330px}.signatures{display:grid;grid-template-columns:1fr 1fr 1fr;gap:32px;margin-top:56px}.sig{border-top:1px solid #111;text-align:center;padding-top:6px}.print-button{margin-bottom:10px}@media print{.print-button{display:none}}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><h1>GMT Trucking</h1><h2>Statement of Account</h2><p><strong>Client:</strong> ${esc(client?.client_name || "")}<br><strong>Code:</strong> ${esc(client?.client_code || "")}<br><strong>Address:</strong> ${esc(client?.billing_address || "")}</p></div><div><p><strong>As-of date:</strong> ${esc(filters.as_of)}<br><strong>Period:</strong> ${esc(period)}<br><strong>Mode:</strong> ${filters.mode === "all" ? "All Activity" : "Outstanding Only"}</p></div></div><table><thead><tr><th>Billing No.</th><th>Billing Date</th><th>Billing Period</th><th>Grand Total</th><th>Payments</th><th>Balance</th><th>Status</th></tr></thead><tbody>${body}</tbody></table><table class="totals"><tr><td>Total Billed</td><td class="num">${esc(peso(totals.billed))}</td></tr><tr><td>Total Payments</td><td class="num">${esc(peso(totals.paid))}</td></tr><tr><th>Total Balance</th><th class="num">${esc(peso(totals.balance))}</th></tr></table><div class="signatures"><div class="sig">Prepared by</div><div class="sig">Checked by</div><div class="sig">Received/Conforme</div></div></body></html>`;
+}
+
+async function soaPage(request, env, user, path, { print = false, exportCsv = false } = {}) {
+  const access = requireView(user, "Billing");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const filters = soaFilters(url);
+  const clients = await billingClients(env);
+  const client = await soaClient(env, filters.client_id);
+  const rows = client ? await soaRows(env, filters) : [];
+  if (exportCsv) {
+    const lines = ["Billing No.,Billing Date,Billing Period,Grand Total,Payments,Balance,Status"];
+    for (const row of rows) lines.push(quotedCsvRow([row.billing_no, row.billing_date, `${row.period_from || ""} to ${row.period_to || ""}`, row.grand_total, row.paid_as_of, row.balance_as_of, row.status_as_of]));
+    return csv(lines.join("\n"), "statement-of-account.csv");
+  }
+  if (print) return html(soaPrintable(client, filters, rows));
+  return html(layout({ title: "Statement of Account", user, path, content: soaContent(clients, client, filters, rows) }));
 }
 
 async function recalcBillingStatus(env, billingId) {
@@ -2087,6 +2183,9 @@ export async function handleRequest(request, env) {
   if (path === "/billing") return billingListPage(request, env, user, path);
   if (path === "/billing/new") return billingNewPage(request, env, user, path);
   if (path === "/billing/export.csv") return billingExportPage(request, env, user, path);
+  if (path === "/billing/soa") return soaPage(request, env, user, path);
+  if (path === "/billing/soa/print") return soaPage(request, env, user, path, { print: true });
+  if (path === "/billing/soa/export.csv") return soaPage(request, env, user, path, { exportCsv: true });
   match = path.match(/^\/billing\/(\d+)\/print$/);
   if (match) return billingDetailPage(request, env, user, path, Number(match[1]), true);
   match = path.match(/^\/billing\/(\d+)\/delete$/);

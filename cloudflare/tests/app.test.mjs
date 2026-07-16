@@ -29,6 +29,24 @@ function envWithRows(rows = {}) {
             return this;
           },
           async all() {
+            if (state.sql.trim().startsWith("SELECT b.") && state.sql.includes("paid_as_of") && state.sql.includes("FROM billing_statements b WHERE")) {
+              const asOf = state.params[0];
+              const clientId = state.params[1];
+              const dateFrom = state.sql.includes("b.billing_date>=?") ? state.params[2] : "";
+              const dateTo = state.sql.includes("b.billing_date<=?") ? state.params[state.params.length - 1] : "";
+              const rowsForSoa = (rows.billing || []).filter((row) => {
+                const clientMatches = Number(row.client_id) === Number(clientId);
+                const fromMatches = !dateFrom || row.billing_date >= dateFrom;
+                const toMatches = !dateTo || row.billing_date <= dateTo;
+                return clientMatches && fromMatches && toMatches;
+              }).map((row) => {
+                const paid = (rows.collections || [])
+                  .filter((collection) => Number(collection.billing_id) === Number(row.id) && collection.collection_date <= asOf)
+                  .reduce((sum, collection) => sum + Number(collection.amount_paid || 0), 0);
+                return { ...row, paid_as_of: paid };
+              });
+              return { results: rowsForSoa };
+            }
             if (state.sql.trim().startsWith("SELECT b.") && state.sql.includes("FROM billing_statements b")) return { results: rows.billing || [] };
             if (state.sql.trim().startsWith("SELECT bl.") && state.sql.includes("FROM billing_lines bl")) return { results: rows.billingLines || [] };
             if (state.sql.includes("FROM billing_adjustments")) return { results: rows.billingAdjustments || [] };
@@ -1367,5 +1385,83 @@ test("billing and collections permissions block encoder and viewer mutations", a
   assert.equal(response.status, 403);
 
   response = await handleRequest(await authedRequest("https://example.test/collections/new", "viewer", { method: "POST", body: collectionBody() }), envWithRows());
+  assert.equal(response.status, 403);
+});
+
+test("SOA outstanding mode uses as-of payments and hides fully paid rows", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/billing/soa?client=1&mode=outstanding&as_of=2026-08-10", "accounting"), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One", billing_address: "Client Address" }],
+    billing: [
+      billingEntry({ id: 61, billing_no: "BILL-OPEN", client_id: 1, grand_total: 1254, billing_date: "2026-07-31" }),
+      billingEntry({ id: 62, billing_no: "BILL-PAID", client_id: 1, grand_total: 500, billing_date: "2026-07-30" }),
+    ],
+    collections: [
+      collectionEntry({ billing_id: 61, amount_paid: 500, collection_date: "2026-08-01" }),
+      collectionEntry({ billing_id: 62, amount_paid: 500, collection_date: "2026-08-01" }),
+      collectionEntry({ billing_id: 61, amount_paid: 754, collection_date: "2026-09-01" }),
+    ],
+  }));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.match(text, /Statement of Account/);
+  assert.match(text, /Client One/);
+  assert.match(text, /BILL-OPEN/);
+  assert.doesNotMatch(text, /BILL-PAID/);
+  assert.match(text, /Partially Paid/);
+  assert.match(text, /\/billing\/61/);
+  assert.match(text, /Total Balance/);
+});
+
+test("SOA all activity includes paid rows and date range filters billing dates", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/billing/soa?client=1&mode=all&as_of=2026-08-10&date_from=2026-07-31&date_to=2026-07-31", "viewer"), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    billing: [
+      billingEntry({ id: 61, billing_no: "BILL-IN-RANGE", client_id: 1, grand_total: 1254, billing_date: "2026-07-31" }),
+      billingEntry({ id: 62, billing_no: "BILL-OUT-RANGE", client_id: 1, grand_total: 500, billing_date: "2026-07-30" }),
+    ],
+    collections: [collectionEntry({ billing_id: 61, amount_paid: 1254, collection_date: "2026-08-01" })],
+  }));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.match(text, /BILL-IN-RANGE/);
+  assert.doesNotMatch(text, /BILL-OUT-RANGE/);
+  assert.match(text, /Paid/);
+  assert.match(text, /All Activity/);
+});
+
+test("SOA printable and CSV preserve filters, totals, and signatures", async () => {
+  const env = envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One", billing_address: "Client Address" }],
+    billing: [billingEntry({ id: 61, billing_no: "BILL-SOA", client_id: 1, grand_total: 1254, billing_date: "2026-07-31" })],
+    collections: [collectionEntry({ billing_id: 61, amount_paid: 500, collection_date: "2026-08-01" })],
+  });
+  let response = await handleRequest(await authedRequest("https://example.test/billing/soa/print?client=1&mode=outstanding&as_of=2026-08-10", "viewer"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Statement of Account/);
+  assert.match(text, /Client Address/);
+  assert.match(text, /BILL-SOA/);
+  assert.match(text, /Prepared by/);
+  assert.match(text, /Checked by/);
+  assert.match(text, /Received\/Conforme/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/soa/export.csv?client=1&mode=outstanding&as_of=2026-08-10", "accounting"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Billing No.,Billing Date,Billing Period,Grand Total,Payments,Balance,Status/);
+  assert.match(text, /"BILL-SOA","2026-07-31","2026-07-01 to 2026-07-31","1254","500","754","Partially Paid"/);
+});
+
+test("SOA permissions allow finance viewers and block encoder", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/billing/soa", "admin"), envWithRows());
+  assert.equal(response.status, 200);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/soa", "viewer"), envWithRows());
+  assert.equal(response.status, 200);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/soa/export.csv", "accounting"), envWithRows());
+  assert.equal(response.status, 200);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/soa", "encoder"), envWithRows());
   assert.equal(response.status, 403);
 });
