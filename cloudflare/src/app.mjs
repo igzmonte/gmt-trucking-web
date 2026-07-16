@@ -1,4 +1,4 @@
-import { canEdit, requireEdit, requireView } from "./access.mjs";
+import { canEdit, canView, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
 import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
@@ -129,12 +129,41 @@ function redirectWithHeaders(location, headers) {
 
 async function dashboardPage(env, user, path) {
   const data = await dashboard(env);
-  const content = `<section class="panel">${cards([
+  const [payroll, repairs, payables, vale, cash, recentTrips, recentBillings, recentCollections, recentPayroll] = await Promise.all([
+    first(env, "SELECT COALESCE(SUM(net_pay),0) AS total FROM payroll_entries"),
+    first(env, "SELECT COUNT(*) AS total FROM repairs WHERE status='Open'"),
+    first(env, "SELECT COALESCE(SUM(amount),0) AS total FROM payables WHERE status IN ('Open','Partial')"),
+    first(env, "SELECT COALESCE(SUM(balance),0) AS total FROM vale_records WHERE status='Open'"),
+    first(env, "SELECT COALESCE(SUM(balance),0) AS total FROM cash_advances WHERE status='Open'"),
+    all(env, "SELECT t.*, c.client_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id ORDER BY t.trip_date DESC, t.id DESC LIMIT 5"),
+    all(env, "SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id ORDER BY b.billing_date DESC, b.id DESC LIMIT 5"),
+    all(env, "SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id ORDER BY co.collection_date DESC, co.id DESC LIMIT 5"),
+    all(env, "SELECT p.*, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id ORDER BY p.pay_date DESC, p.id DESC LIMIT 5"),
+  ]);
+  const cardItems = [
     ["Trips", data.trips],
-    ["Ongoing", data.ongoing],
-    ["Completed", data.completed],
-    ["Employees", data.employees],
-  ])}</section><section class="panel"><h3>Receivables</h3><p><strong>${esc(peso(data.receivables))}</strong></p><p>This is the Cloudflare rewrite foundation. Django remains the parity reference while modules are ported.</p></section>`;
+    ["Ongoing Trips", data.ongoing],
+    ["Completed Trips", data.completed],
+    ["Active Employees", data.employees],
+  ];
+  if (canView(user, "Billing")) cardItems.push(["Receivables", peso(data.receivables)]);
+  if (canView(user, "Payroll")) cardItems.push(["Payroll Totals", peso(payroll?.total || 0)]);
+  if (canView(user, "Repairs")) cardItems.push(["Open Repairs", repairs?.total || 0]);
+  if (canView(user, "Payables")) cardItems.push(["Open Payables", peso(payables?.total || 0)]);
+  if (canView(user, "Vale / Cash Advance")) {
+    cardItems.push(["Open Vale", peso(vale?.total || 0)]);
+    cardItems.push(["Open Cash Advance", peso(cash?.total || 0)]);
+  }
+  const tripsBody = recentTrips.map((row) => `<tr><td><a href="/trips/${row.id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.trip_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.status)}</td></tr>`);
+  const billingBody = recentBillings.map((row) => `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.grand_total)}${moneyCell(outstandingBalance(row.grand_total, row.paid_amount))}</tr>`);
+  const collectionBody = recentCollections.map((row) => `<tr><td>${esc(row.collection_date)}</td><td>${esc(row.billing_no || "")}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.reference_no || "")}</td>${moneyCell(row.amount_paid)}</tr>`);
+  const payrollBody = recentPayroll.map((row) => `<tr><td><a href="/payroll/${row.id}">${esc(row.pay_date)}</a></td><td>${esc(row.full_name || "")}</td><td>${esc(row.employee_type || "")}</td>${moneyCell(row.net_pay)}</tr>`);
+  const financeTables = [
+    canView(user, "Billing") ? `<section class="panel"><h3>Recent Billing</h3></section>${table(["Billing No.", "Client", "Grand Total", "Balance"], billingBody, { empty: "No recent billings." })}` : "",
+    canView(user, "Collections") ? `<section class="panel"><h3>Recent Collections</h3></section>${table(["Date", "Billing No.", "Client", "Ref. No.", "Amount"], collectionBody, { empty: "No recent collections." })}` : "",
+    canView(user, "Payroll") ? `<section class="panel"><h3>Recent Payroll</h3></section>${table(["Pay Date", "Employee", "Type", "Net Pay"], payrollBody, { empty: "No recent payroll entries." })}` : "",
+  ].join("");
+  const content = `<section class="panel">${cards(cardItems)}</section><section class="panel"><h3>Recent Trips</h3></section>${table(["Trip Ticket / Waybill", "Date", "Client", "Status"], tripsBody, { empty: "No recent trips." })}${financeTables}`;
   return html(layout({ title: "Dashboard", user, path, content }));
 }
 
@@ -2095,12 +2124,206 @@ async function collectionExportPage(request, env, user, path) {
   return csv(lines.join("\n"), "collections.csv");
 }
 
-async function reportList(env, user, path) {
+const REPORTS = [
+  ["this_month_trips", "This Month's Trips", "Trips within the current month, or the selected date range."],
+  ["ongoing_trips", "Ongoing Trips", "Trips currently marked Ongoing."],
+  ["completed_trips", "Completed Trips", "Completed trips, including their base rates."],
+  ["unbilled_trips", "Unbilled Trips", "Completed trips that have not been claimed by billing."],
+  ["billing_summary", "Billing Summary", "Saved billing statements and their current statuses."],
+  ["receivables_summary", "Receivables Summary", "Billing totals compared with remaining receivable balances."],
+  ["payables_summary", "Payables Summary", "Supplier obligations, due dates, and payment statuses."],
+  ["vale_balance", "Vale Balance Report", "Vale amounts, payroll installments, and remaining balances."],
+  ["cash_advance_balance", "Cash Advance Balance Report", "Cash advances and their remaining payroll balances."],
+  ["payroll_summary", "Payroll Summary", "Saved employee payroll totals."],
+  ["repair_summary", "Repair / Maintenance Summary", "Repair and maintenance costs by unit."],
+  ["fleet_utilization", "Fleet Utilization", "Trip volume and charges grouped by fleet unit."],
+];
+const REPORT_LABELS = Object.fromEntries(REPORTS.map(([slug, label]) => [slug, label]));
+const REPORT_DESCRIPTIONS = Object.fromEntries(REPORTS.map(([slug, , description]) => [slug, description]));
+const REPORT_STATUSES = ["Planned", "Ongoing", "Completed", "Cancelled", "Billed", "Paid", "Open", "Partially Paid", "Closed", "Settled", "Partial"];
+
+function reportFilters(url) {
+  return {
+    report: REPORT_LABELS[url.searchParams.get("report")] ? url.searchParams.get("report") : REPORTS[0][0],
+    q: (url.searchParams.get("q") || "").trim(),
+    date_from: url.searchParams.get("date_from") || "",
+    date_to: url.searchParams.get("date_to") || "",
+    status: url.searchParams.get("status") || "",
+  };
+}
+
+function reportParams(filters) {
+  const params = new URLSearchParams();
+  params.set("report", filters.report);
+  if (filters.q) params.set("q", filters.q);
+  if (filters.date_from) params.set("date_from", filters.date_from);
+  if (filters.date_to) params.set("date_to", filters.date_to);
+  if (filters.status) params.set("status", filters.status);
+  return params;
+}
+
+function currentMonthBounds() {
+  const today = todayISO();
+  const year = Number(today.slice(0, 4));
+  const month = Number(today.slice(5, 7));
+  const lastDay = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+  return { start: `${today.slice(0, 8)}01`, end: lastDay };
+}
+
+function matchText(row, query, fields) {
+  if (!query) return true;
+  const needle = query.toLowerCase();
+  return fields.some((field) => String(row[field] ?? "").toLowerCase().includes(needle));
+}
+
+function matchDate(row, field, filters) {
+  const value = row[field] || "";
+  if (filters.date_from && value < filters.date_from) return false;
+  if (filters.date_to && value > filters.date_to) return false;
+  return true;
+}
+
+function reportResult(slug, columns, rows) {
+  const totals = columns.map(([label, kind], index) => {
+    if (kind === "money" || kind === "number") return { value: rows.reduce((sum, row) => sum + numeric(row[index]), 0), kind };
+    return { value: index === 0 ? "Totals" : "", kind };
+  });
+  return {
+    slug,
+    label: REPORT_LABELS[slug],
+    description: REPORT_DESCRIPTIONS[slug],
+    columns: columns.map(([label, kind]) => ({ label, kind })),
+    raw_rows: rows,
+    rows: rows.map((row) => row.map((value, index) => ({ value, kind: columns[index][1] }))),
+    totals,
+    row_count: rows.length,
+  };
+}
+
+function formatReportCell(cell) {
+  if (cell.kind === "money") return esc(peso(cell.value));
+  return esc(cell.value);
+}
+
+async function buildReport(env, filters) {
+  const slug = filters.report;
+  if (slug === "this_month_trips") {
+    const bounds = currentMonthBounds();
+    const effective = { ...filters, date_from: filters.date_from || bounds.start, date_to: filters.date_to || bounds.end };
+    const trips = (await all(env, "SELECT t.*, c.client_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id ORDER BY t.trip_date, t.id"))
+      .filter((row) => matchDate(row, "trip_date", effective))
+      .filter((row) => matchText(row, filters.q, ["trip_ticket_no", "reference_no", "client_name", "origin", "destination"]))
+      .filter((row) => !filters.status || row.status === filters.status);
+    return reportResult(slug, [["Trip Ticket / Waybill", "text"], ["Date", "date"], ["Status", "text"], ["Base Rate", "money"]], trips.map((row) => [row.trip_ticket_no, row.trip_date, row.status, row.base_trip_rate]));
+  }
+
+  if (["ongoing_trips", "completed_trips", "unbilled_trips"].includes(slug)) {
+    const fixedStatus = slug === "ongoing_trips" ? "Ongoing" : "Completed";
+    const billedLines = await all(env, "SELECT trip_id FROM billing_lines");
+    const billedIds = new Set(billedLines.map((line) => Number(line.trip_id)));
+    const trips = (await all(env, "SELECT t.*, c.client_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id ORDER BY t.trip_date DESC, t.id"))
+      .filter((row) => matchDate(row, "trip_date", filters))
+      .filter((row) => matchText(row, filters.q, ["trip_ticket_no", "reference_no", "client_name", "origin", "destination"]))
+      .filter((row) => row.status === (filters.status || fixedStatus))
+      .filter((row) => slug !== "unbilled_trips" || !billedIds.has(Number(row.id)));
+    if (slug === "ongoing_trips") return reportResult(slug, [["Trip Ticket / Waybill", "text"], ["Date", "date"], ["Client", "text"], ["Route", "text"]], trips.map((row) => [row.trip_ticket_no, row.trip_date, row.client_name || "", `${row.origin || ""} -> ${row.destination || ""}`]));
+    if (slug === "completed_trips") return reportResult(slug, [["Trip Ticket / Waybill", "text"], ["Date", "date"], ["Status", "text"], ["Base Rate", "money"]], trips.map((row) => [row.trip_ticket_no, row.trip_date, row.status, row.base_trip_rate]));
+    return reportResult(slug, [["Trip Ticket / Waybill", "text"], ["Date", "date"], ["Client", "text"], ["Base Rate", "money"]], trips.map((row) => [row.trip_ticket_no, row.trip_date, row.client_name || "", row.base_trip_rate]));
+  }
+
+  if (["billing_summary", "receivables_summary"].includes(slug)) {
+    const collections = await all(env, "SELECT * FROM collections");
+    const paidByBilling = new Map();
+    for (const row of collections) paidByBilling.set(Number(row.billing_id), numeric(paidByBilling.get(Number(row.billing_id))) + numeric(row.amount_paid));
+    const billings = (await all(env, "SELECT b.*, c.client_name FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id ORDER BY b.billing_date DESC, b.id"))
+      .filter((row) => matchDate(row, "billing_date", filters))
+      .filter((row) => matchText(row, filters.q, ["billing_no", "client_name", "notes"]))
+      .filter((row) => !filters.status || row.status === filters.status);
+    if (slug === "billing_summary") return reportResult(slug, [["Billing No", "text"], ["Date", "date"], ["Client", "text"], ["Grand Total", "money"], ["Status", "text"]], billings.map((row) => [row.billing_no, row.billing_date, row.client_name || "", row.grand_total, row.status]));
+    return reportResult(slug, [["Billing No", "text"], ["Client", "text"], ["Grand Total", "money"], ["Outstanding", "money"], ["Status", "text"]], billings.map((row) => [row.billing_no, row.client_name || "", row.grand_total, outstandingBalance(row.grand_total, paidByBilling.get(Number(row.id))), billingStatus(row.grand_total, paidByBilling.get(Number(row.id)))]));
+  }
+
+  if (slug === "payables_summary") {
+    const rows = (await all(env, "SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.payable_date DESC, p.id"))
+      .filter((row) => matchDate(row, "payable_date", filters))
+      .filter((row) => matchText(row, filters.q, ["description", "reference_no", "supplier_name", "notes"]))
+      .filter((row) => !filters.status || row.status === filters.status);
+    return reportResult(slug, [["Date", "date"], ["Description", "text"], ["Amount", "money"], ["Due Date", "date"], ["Status", "text"]], rows.map((row) => [row.payable_date, row.description, row.amount, row.due_date || "", row.status]));
+  }
+
+  if (["vale_balance", "cash_advance_balance"].includes(slug)) {
+    const isVale = slug === "vale_balance";
+    const rows = (await all(env, isVale ? "SELECT v.*, e.full_name, e.employee_code FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id ORDER BY v.date_granted DESC, v.id" : "SELECT c.*, e.full_name, e.employee_code FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id ORDER BY c.date_granted DESC, c.id"))
+      .filter((row) => matchDate(row, "date_granted", filters))
+      .filter((row) => matchText(row, filters.q, ["full_name", "employee_code", "notes"]))
+      .filter((row) => !filters.status || row.status === filters.status);
+    if (isVale) return reportResult(slug, [["Employee", "text"], ["Date Granted", "date"], ["Amount", "money"], ["Installment", "money"], ["Balance", "money"], ["Status", "text"]], rows.map((row) => [row.full_name || row.employee_name || "", row.date_granted, row.amount, row.installment_amount, row.balance, row.status]));
+    return reportResult(slug, [["Employee", "text"], ["Date Granted", "date"], ["Amount", "money"], ["Balance", "money"], ["Status", "text"]], rows.map((row) => [row.full_name || row.employee_name || "", row.date_granted, row.amount, row.balance, row.status]));
+  }
+
+  if (slug === "payroll_summary") {
+    const rows = (await all(env, "SELECT p.*, e.full_name, e.employee_code FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id ORDER BY p.pay_date DESC, p.id"))
+      .filter((row) => matchDate(row, "pay_date", filters))
+      .filter((row) => matchText(row, filters.q, ["full_name", "employee_code", "employee_type", "remarks"]));
+    return reportResult(slug, [["Pay Date", "date"], ["Employee", "text"], ["Type", "text"], ["Gross Pay", "money"], ["Additional Pay", "money"], ["Net Pay", "money"]], rows.map((row) => [row.pay_date, row.full_name || "", row.employee_type, row.gross_pay, row.additional_pay, row.net_pay]));
+  }
+
+  if (slug === "repair_summary") {
+    const rows = (await all(env, "SELECT r.*, a.asset_code, s.supplier_name FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id ORDER BY r.repair_date DESC, r.id"))
+      .filter((row) => matchDate(row, "repair_date", filters))
+      .filter((row) => matchText(row, filters.q, ["asset_code", "repair_description", "supplier_name", "notes"]))
+      .filter((row) => !filters.status || row.status === filters.status);
+    return reportResult(slug, [["Date", "date"], ["Asset", "text"], ["Description", "text"], ["Total Cost", "money"], ["Status", "text"]], rows.map((row) => [row.repair_date, row.asset_code || "", row.repair_description, row.total_cost, row.status]));
+  }
+
+  const trips = (await all(env, "SELECT * FROM trips")).filter((row) => matchDate(row, "trip_date", filters)).filter((row) => !filters.status || row.status === filters.status);
+  const assets = (await all(env, "SELECT * FROM assets ORDER BY asset_code, id")).filter((row) => matchText(row, filters.q, ["asset_code", "asset_type", "plate_no", "make_model"]));
+  const rows = assets.map((asset) => {
+    const assetTrips = trips.filter((trip) => Number(trip.asset_id) === Number(asset.id));
+    return [asset.asset_code, asset.asset_type, assetTrips.length, assetTrips.reduce((sum, trip) => sum + numeric(trip.base_trip_rate), 0), assetTrips.reduce((sum, trip) => sum + tripExtraTotal(trip), 0)];
+  });
+  return reportResult(slug, [["Asset", "text"], ["Type", "text"], ["Trips", "number"], ["Base Charges", "money"], ["Extra Charges", "money"]], rows);
+}
+
+function reportForm(filters) {
+  const params = reportParams(filters);
+  const options = REPORTS.map(([slug, label]) => `<option value="${esc(slug)}"${filters.report === slug ? " selected" : ""}>${esc(label)}</option>`).join("");
+  const statusOptions = `<option value="">All statuses</option>${REPORT_STATUSES.map((status) => `<option value="${esc(status)}"${filters.status === status ? " selected" : ""}>${esc(status)}</option>`).join("")}`;
+  return `<section class="panel report-filter-panel"><form method="get" class="report-filters"><label>Report<select name="report">${options}</select></label><label>Search<input name="q" value="${esc(filters.q)}"></label><label>Date From<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date To<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><label>Status<select name="status">${statusOptions}</select></label><button>Load Report</button><a class="button secondary" href="/reports/print?${esc(params.toString())}" target="_blank">Printable Report</a><a class="button secondary" href="/reports/export.csv?${esc(params.toString())}">Export CSV</a></form></section>`;
+}
+
+function reportTable(result) {
+  const body = result.rows.map((row) => `<tr>${row.map((cell) => `<td${cell.kind === "money" || cell.kind === "number" ? ' class="num"' : ""}>${formatReportCell(cell)}</td>`).join("")}</tr>`);
+  const totals = result.rows.length ? `<tfoot><tr>${result.totals.map((cell) => `<td${cell.kind === "money" || cell.kind === "number" ? ' class="num"' : ""}>${formatReportCell(cell)}</td>`).join("")}</tr></tfoot>` : "";
+  return `<div class="panel"><table><thead><tr>${result.columns.map((column) => `<th${column.kind === "money" || column.kind === "number" ? ' class="num"' : ""}>${esc(column.label)}</th>`).join("")}</tr></thead><tbody>${body.length ? body.join("") : `<tr><td colspan="${result.columns.length}" class="report-empty">No rows match this report and its filters.</td></tr>`}</tbody>${totals}</table></div>`;
+}
+
+function reportFilterBad(filters) {
+  return filters.date_from && filters.date_to && filters.date_from > filters.date_to;
+}
+
+async function reportWorkspace(request, env, user, path, { print = false, exportCsv = false } = {}) {
   const access = requireView(user, "Reports");
   if (access) return errorResponse(access, user, path);
-  const trips = await all(env, "SELECT trip_ticket_no, trip_date, status, base_trip_rate FROM trips ORDER BY trip_date DESC LIMIT 50");
-  const body = trips.map((t) => `<tr><td>${esc(t.trip_ticket_no)}</td><td>${esc(t.trip_date)}</td><td>${esc(t.status)}</td>${moneyCell(t.base_trip_rate)}</tr>`);
-  return html(layout({ title: "Reports", user, path, content: `<section class="panel"><p>Initial Cloudflare report shell. Full 12-report parity ports in later phases.</p></section>${table(["Trip Ticket / Waybill", "Date", "Status", "Base Rate"], body)}` }));
+  const url = new URL(request.url);
+  const filters = reportFilters(url);
+  if (reportFilterBad(filters)) {
+    const content = `${reportForm(filters)}<section class="panel"><p class="error">End date must be on or after start date.</p></section>`;
+    return html(layout({ title: "Reports", user, path, content }), 400);
+  }
+  const result = await buildReport(env, filters);
+  if (exportCsv) {
+    const lines = [result.columns.map((column) => column.label).join(",")];
+    for (const row of result.raw_rows) lines.push(quotedCsvRow(row));
+    return csv(lines.join("\n"), `${result.slug}.csv`);
+  }
+  if (print) {
+    const activeFilters = [["Report", result.label], ["Search", filters.q], ["Date From", filters.date_from], ["Date To", filters.date_to], ["Status", filters.status]].filter(([, value]) => value);
+    const filterTags = activeFilters.length ? activeFilters.map(([label, value]) => `<span class="filter"><strong>${esc(label)}:</strong> ${esc(value)}</span>`).join("") : `<span class="filter">No filters applied</span>`;
+    return html(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(result.label)}</title><style>@page{size:A4 landscape;margin:11mm}body{font:10pt Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm}.print-button{margin-bottom:10px}.header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:10px}h1{font-size:18pt;margin:0 0 3px}h2{font-size:14pt;margin:0 0 4px}.muted{color:#555}.meta{font-size:9pt;text-align:right;line-height:1.45}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px}.filter{border:1px solid #bbb;border-radius:12px;padding:3px 8px;font-size:9pt}table{width:100%;border-collapse:collapse}th,td{border:1px solid #444;padding:4px 5px;vertical-align:top}th{background:#eee;text-align:left}tfoot td{font-weight:bold;background:#f7f7f7}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.report-empty{text-align:center;padding:18px}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="header"><div><h1>GMT Trucking</h1><h2>${esc(result.label)}</h2><div class="muted">${esc(result.description)}</div></div><div class="meta"><div><strong>Generated:</strong> ${esc(new Date().toISOString())}</div><div><strong>Rows:</strong> ${esc(result.row_count)}</div></div></div><div class="filters">${filterTags}</div>${reportTable(result)}</div></body></html>`);
+  }
+  const heading = `<section class="report-heading"><div><span class="dialog-kicker">Operational and Financial Report</span><h3>${esc(result.label)}</h3><p>${esc(result.description)}</p></div><div class="report-count"><strong>${esc(result.row_count)}</strong><span>row${result.row_count === 1 ? "" : "s"}</span></div></section>`;
+  return html(layout({ title: "Reports", user, path, content: `${reportForm(filters)}${heading}${reportTable(result)}` }));
 }
 
 async function placeholder(title, user, path, page) {
@@ -2199,7 +2422,9 @@ export async function handleRequest(request, env) {
   if (match) return collectionFormPage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/collections\/(\d+)\/delete$/);
   if (match) return collectionDeletePage(request, env, user, path, Number(match[1]));
-  if (path === "/reports") return reportList(env, user, path);
+  if (path === "/reports") return reportWorkspace(request, env, user, path);
+  if (path === "/reports/print") return reportWorkspace(request, env, user, path, { print: true });
+  if (path === "/reports/export.csv") return reportWorkspace(request, env, user, path, { exportCsv: true });
   if (path === "/users") return placeholder("User Management", user, path, "User Management");
   return html(layout({ title: "Not Found", user, path, content: `<section class="panel"><p>Route not found.</p></section>` }), 404);
 }

@@ -19,6 +19,9 @@ function envWithRows(rows = {}) {
           const needle = String(state.params[0] || "").replaceAll("%", "").toLowerCase();
           return data.filter((row) => Object.values(row).some((value) => String(value ?? "").toLowerCase().includes(needle)));
         };
+        const sum = (table, field, predicate = () => true) => source(table)
+          .filter(predicate)
+          .reduce((total, row) => total + Number(row[field] || 0), 0);
         const tableFrom = () => {
           const match = state.sql.match(/FROM\s+([a-z_]+)/i) || state.sql.match(/DELETE FROM\s+([a-z_]+)/i) || state.sql.match(/INSERT INTO\s+([a-z_]+)/i) || state.sql.match(/UPDATE\s+([a-z_]+)/i);
           return match?.[1];
@@ -54,6 +57,7 @@ function envWithRows(rows = {}) {
               const billingId = state.params[0];
               return { results: (rows.collections || []).filter((row) => Number(row.billing_id) === Number(billingId)) };
             }
+            if (state.sql.trim() === "SELECT * FROM collections") return { results: rows.collections || [] };
             if (state.sql.trim().startsWith("SELECT co.") && state.sql.includes("FROM collections co")) return { results: rows.collections || [] };
             if (state.sql.includes("SELECT trip_id FROM billing_lines")) return { results: rows.billingLines || [] };
             if (state.sql.trim().startsWith("SELECT p.") && state.sql.includes("FROM payroll_entries p")) return { results: rows.payroll || [] };
@@ -65,6 +69,7 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("FROM payables p")) return { results: rows.payables || [] };
             if (state.sql.includes("FROM vale_records v")) return { results: rows.vale || [] };
             if (state.sql.includes("FROM cash_advances c")) return { results: rows.cashAdvances || [] };
+            if (state.sql.trim() === "SELECT * FROM trips") return { results: rows.trips || [] };
             if (state.sql.includes("FROM trips t")) return { results: rows.trips || [] };
             if (state.sql.includes("FROM trip_helpers th")) return { results: rows.tripHelpers || [] };
             if (state.sql.includes("FROM trip_employee_pay_items")) {
@@ -111,8 +116,11 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("COUNT(*) AS total FROM payables p")) return { total: rows.payablesCount ?? filtered("payables").length };
             if (state.sql.includes("COUNT(*) AS total FROM vale_records v")) return { total: rows.valeCount ?? filtered("vale").length };
             if (state.sql.includes("COUNT(*) AS total FROM cash_advances c")) return { total: rows.cashCount ?? filtered("cashAdvances").length };
+            if (state.sql.includes("COUNT(*) AS total FROM trips WHERE status='Ongoing'")) return { total: source("trips").filter((row) => row.status === "Ongoing").length };
+            if (state.sql.includes("COUNT(*) AS total FROM trips WHERE status='Completed'")) return { total: source("trips").filter((row) => row.status === "Completed").length };
             if (state.sql.includes("COUNT(*) AS total FROM trips WHERE")) return { total: (rows.refs || {}).trips || 0 };
             if (state.sql.includes("COUNT(*) AS total FROM trips")) return { total: rows.tripsCount ?? filtered("trips").length };
+            if (state.sql.includes("COUNT(*) AS total FROM employees WHERE active=1")) return { total: source("employees").filter((row) => row.active !== 0).length };
             if (state.sql.includes("COUNT(*) AS total FROM recurring_trip_masters") && state.sql.includes("LIKE")) return { total: rows.recurringCount ?? filtered("recurring").length };
             if (state.sql.includes("COUNT(*) AS total FROM employees") && state.sql.includes("LIKE")) return { total: rows.employeesCount ?? filtered("employees").length };
             if (state.sql.includes("COUNT(*) AS total FROM assets") && state.sql.includes("LIKE")) return { total: rows.assetsCount ?? filtered("assets").length };
@@ -160,8 +168,13 @@ function envWithRows(rows = {}) {
               if (rows.duplicate) return { id: rows.duplicate };
               return null;
             }
-            if (state.sql.includes("SUM(grand_total)")) return { total: 0 };
-            if (state.sql.includes("SUM(amount_paid)")) return { total: 0 };
+            if (state.sql.includes("SUM(grand_total)") && state.sql.includes("FROM billing_statements")) return { total: sum("billing", "grand_total") };
+            if (state.sql.includes("SUM(amount_paid)") && state.sql.includes("FROM collections")) return { total: sum("collections", "amount_paid") };
+            if (state.sql.includes("SUM(net_pay)") && state.sql.includes("FROM payroll_entries")) return { total: sum("payroll", "net_pay") };
+            if (state.sql.includes("COUNT(*) AS total FROM repairs WHERE status='Open'")) return { total: source("repairs").filter((row) => row.status === "Open").length };
+            if (state.sql.includes("SUM(amount)") && state.sql.includes("FROM payables")) return { total: sum("payables", "amount", (row) => ["Open", "Partial"].includes(row.status)) };
+            if (state.sql.includes("SUM(balance)") && state.sql.includes("FROM vale_records")) return { total: sum("vale", "balance", (row) => row.status === "Open") };
+            if (state.sql.includes("SUM(balance)") && state.sql.includes("FROM cash_advances")) return { total: sum("cashAdvances", "balance", (row) => row.status === "Open") };
             return null;
           },
           async run() {
@@ -1464,4 +1477,135 @@ test("SOA permissions allow finance viewers and block encoder", async () => {
 
   response = await handleRequest(await authedRequest("https://example.test/billing/soa", "encoder"), envWithRows());
   assert.equal(response.status, 403);
+});
+
+test("dashboard shows operational metrics and hides finance-heavy sections by role", async () => {
+  const env = envWithRows({
+    employees: [{ id: 3, employee_code: "EMP-003", full_name: "Driver One", active: 1 }],
+    trips: [
+      sampleTrip({ id: 1, status: "Ongoing", trip_ticket_no: "TT-ONGOING" }),
+      sampleTrip({ id: 2, status: "Completed", trip_ticket_no: "TT-COMPLETE" }),
+    ],
+    billing: [billingEntry({ id: 61, billing_no: "BILL-DASH", grand_total: 1254 })],
+    collections: [collectionEntry({ id: 71, reference_no: "RCPT-DASH", amount_paid: 500 })],
+    payroll: [payrollEntry({ id: 51, full_name: "Payroll Driver", net_pay: 1625 })],
+    repairs: [{ id: 41, status: "Open", repair_date: "2026-07-15", repair_description: "Oil change", total_cost: 800 }],
+    payables: [{ id: 31, status: "Open", payable_date: "2026-07-15", description: "Supplier invoice", amount: 2000 }],
+    vale: [{ id: 21, status: "Open", balance: 250 }],
+    cashAdvances: [{ id: 22, status: "Open", balance: 400 }],
+  });
+
+  let response = await handleRequest(await authedRequest("https://example.test/", "admin"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Ongoing Trips/);
+  assert.match(text, /Completed Trips/);
+  assert.match(text, /Receivables/);
+  assert.match(text, /Payroll Totals/);
+  assert.match(text, /Open Repairs/);
+  assert.match(text, /Open Payables/);
+  assert.match(text, /Recent Trips/);
+  assert.match(text, /Recent Billing/);
+  assert.match(text, /Recent Collections/);
+  assert.match(text, /Recent Payroll/);
+  assert.match(text, /TT-ONGOING/);
+  assert.match(text, /BILL-DASH/);
+  assert.match(text, /RCPT-DASH/);
+
+  response = await handleRequest(await authedRequest("https://example.test/", "encoder"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.doesNotMatch(text, /Receivables/);
+  assert.doesNotMatch(text, /Recent Billing/);
+  assert.doesNotMatch(text, /Recent Payroll/);
+  assert.match(text, /Open Repairs/);
+});
+
+test("reports permissions, selector, invalid date validation, and all report slugs render", async () => {
+  const slugs = [
+    "this_month_trips",
+    "ongoing_trips",
+    "completed_trips",
+    "unbilled_trips",
+    "billing_summary",
+    "receivables_summary",
+    "payables_summary",
+    "vale_balance",
+    "cash_advance_balance",
+    "payroll_summary",
+    "repair_summary",
+    "fleet_utilization",
+  ];
+
+  let response = await handleRequest(await authedRequest("https://example.test/reports", "encoder"), envWithRows());
+  assert.equal(response.status, 403);
+
+  for (const slug of slugs) {
+    response = await handleRequest(await authedRequest(`https://example.test/reports?report=${slug}`, "viewer"), envWithRows());
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /Printable Report/);
+    assert.match(text, /Export CSV/);
+    assert.match(text, /No rows match this report and its filters/);
+  }
+
+  response = await handleRequest(await authedRequest("https://example.test/reports?report=this_month_trips&date_from=2026-07-31&date_to=2026-07-01", "accounting"), envWithRows());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /End date must be on or after start date/);
+});
+
+test("reports filter trips, receivables, and fleet utilization with correct core calculations", async () => {
+  const env = envWithRows({
+    trips: [
+      sampleTrip({ id: 1, status: "Completed", trip_ticket_no: "TT-UNBILLED", reference_no: "REF-A", trip_date: "2026-07-15", base_trip_rate: 1000, fuel_surcharge: 50, loading_fee: 25, asset_id: 2 }),
+      sampleTrip({ id: 2, status: "Completed", trip_ticket_no: "TT-BILLED", reference_no: "REF-B", trip_date: "2026-07-16", base_trip_rate: 700, fuel_surcharge: 10, loading_fee: 0, asset_id: 2 }),
+    ],
+    billingLines: [{ billing_id: 61, trip_id: 2 }],
+    billing: [billingEntry({ id: 61, billing_no: "BILL-REPORT", grand_total: 1254, status: "Partially Paid" })],
+    collections: [collectionEntry({ billing_id: 61, amount_paid: 500 })],
+    assets: [{ id: 2, asset_code: "UNIT-001", asset_type: "Truck", plate_no: "ABC-123" }],
+  });
+
+  let response = await handleRequest(await authedRequest("https://example.test/reports?report=unbilled_trips&date_from=2026-07-01&date_to=2026-07-31", "viewer"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /TT-UNBILLED/);
+  assert.doesNotMatch(text, /TT-BILLED/);
+
+  response = await handleRequest(await authedRequest("https://example.test/reports?report=receivables_summary", "accounting"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /BILL-REPORT/);
+  assert.match(text, /754\.00/);
+  assert.match(text, /Partially Paid/);
+
+  response = await handleRequest(await authedRequest("https://example.test/reports?report=fleet_utilization", "admin"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /UNIT-001/);
+  assert.match(text, /Truck/);
+  assert.match(text, /1,700\.00/);
+  assert.match(text, /85\.00/);
+});
+
+test("printable reports and CSV export preserve filters and raw numeric values", async () => {
+  const env = envWithRows({
+    trips: [sampleTrip({ id: 1, status: "Completed", trip_ticket_no: "TT-CSV", reference_no: "REF-CSV", trip_date: "2026-07-15", client_name: "Client CSV", base_trip_rate: 1000 })],
+  });
+
+  let response = await handleRequest(await authedRequest("https://example.test/reports/print?report=unbilled_trips&q=CSV&date_from=2026-07-01&date_to=2026-07-31", "viewer"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /GMT Trucking/);
+  assert.match(text, /Unbilled Trips/);
+  assert.match(text, /Generated:/);
+  assert.match(text, /Rows:/);
+  assert.match(text, /Print/);
+  assert.match(text, /TT-CSV/);
+
+  response = await handleRequest(await authedRequest("https://example.test/reports/export.csv?report=unbilled_trips&q=CSV&date_from=2026-07-01&date_to=2026-07-31", "accounting"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Trip Ticket \/ Waybill,Date,Client,Base Rate/);
+  assert.match(text, /"TT-CSV","2026-07-15","Client CSV","1000"/);
 });
