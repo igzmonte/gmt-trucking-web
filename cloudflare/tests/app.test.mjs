@@ -29,6 +29,15 @@ function envWithRows(rows = {}) {
             return this;
           },
           async all() {
+            if (state.sql.trim().startsWith("SELECT b.") && state.sql.includes("FROM billing_statements b")) return { results: rows.billing || [] };
+            if (state.sql.trim().startsWith("SELECT bl.") && state.sql.includes("FROM billing_lines bl")) return { results: rows.billingLines || [] };
+            if (state.sql.includes("FROM billing_adjustments")) return { results: rows.billingAdjustments || [] };
+            if (state.sql.includes("SELECT * FROM collections WHERE billing_id=?")) {
+              const billingId = state.params[0];
+              return { results: (rows.collections || []).filter((row) => Number(row.billing_id) === Number(billingId)) };
+            }
+            if (state.sql.trim().startsWith("SELECT co.") && state.sql.includes("FROM collections co")) return { results: rows.collections || [] };
+            if (state.sql.includes("SELECT trip_id FROM billing_lines")) return { results: rows.billingLines || [] };
             if (state.sql.trim().startsWith("SELECT p.") && state.sql.includes("FROM payroll_entries p")) return { results: rows.payroll || [] };
             if (state.sql.trim().startsWith("SELECT pt.") && state.sql.includes("FROM payroll_trips pt")) return { results: rows.payrollTrips || [] };
             if (state.sql.includes("FROM payroll_additional_lines")) return { results: rows.payrollLines || [] };
@@ -61,6 +70,18 @@ function envWithRows(rows = {}) {
           },
           async first() {
             if (state.sql.includes("FROM users")) return rows.user || null;
+            if (state.sql.includes("COUNT(*) AS total FROM billing_statements b")) return { total: rows.billingCount ?? filtered("billing").length };
+            if (state.sql.includes("COUNT(*) AS total FROM collections co")) return { total: rows.collectionsCount ?? filtered("collections").length };
+            if (state.sql.includes("SELECT b.*,") && state.sql.includes("FROM billing_statements b") && state.sql.includes("WHERE b.id=?")) return byId("billing") || null;
+            if (state.sql.includes("SELECT id FROM billing_statements WHERE billing_no=?")) {
+              if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO billing_statements"))) return { id: rows.createdBillingId || 61 };
+              return null;
+            }
+            if (state.sql.includes("SELECT billing_no FROM billing_statements WHERE billing_no LIKE")) return rows.lastBilling || null;
+            if (state.sql.includes("COUNT(*) AS total FROM collections WHERE billing_id=?")) return { total: rows.collectionCount ?? (rows.collections || []).filter((row) => Number(row.billing_id) === Number(state.params[0])).length };
+            if (state.sql.includes("SELECT grand_total, COALESCE") && state.sql.includes("FROM billing_statements WHERE id=?")) return byId("billing") || rows.billingRecalc || null;
+            if (state.sql.includes("SELECT b.*, COALESCE") && state.sql.includes("FROM billing_statements b WHERE b.id=?")) return byId("billing") || null;
+            if (state.sql.includes("SELECT * FROM collections WHERE id=?")) return byId("collections") || null;
             if (state.sql.includes("COUNT(*) AS total FROM payroll_entries p")) return { total: rows.payrollCount ?? filtered("payroll").length };
             if (state.sql.includes("SELECT p.*,") && state.sql.includes("FROM payroll_entries p")) return byId("payroll") || null;
             if (state.sql.includes("SELECT id FROM payroll_entries WHERE employee_id=?")) {
@@ -348,6 +369,96 @@ function payrollEntry(overrides = {}) {
     other_deduction: 25,
     net_pay: 1625,
     remarks: "Payroll test",
+    ...overrides,
+  };
+}
+
+function billingBody(overrides = {}) {
+  return new URLSearchParams({
+    client: "1",
+    period_from: "2026-07-01",
+    period_to: "2026-07-31",
+    expected_trip_ids: "[1]",
+    billing_date: "2026-07-31",
+    vat_enabled: "1",
+    addition_label: "Fuel adjustment",
+    addition_amount: "100",
+    deduction_label: "Discount",
+    deduction_amount: "50",
+    notes: "Billing test",
+    ...overrides,
+  });
+}
+
+function billingEntry(overrides = {}) {
+  return {
+    id: 61,
+    billing_no: "BILL-2026-000061",
+    client_id: 1,
+    client_code: "CLI-001",
+    client_name: "Client One",
+    billing_address: "Client Address",
+    billing_date: "2026-07-31",
+    period_from: "2026-07-01",
+    period_to: "2026-07-31",
+    base_charges_total: 1000,
+    extra_charges_total: 75,
+    gross_total: 1075,
+    vat_enabled: 1,
+    vat_amount: 129,
+    additions_total: 100,
+    deductions_total: 50,
+    grand_total: 1254,
+    paid_amount: 500,
+    status: "Partially Paid",
+    notes: "Billing test",
+    ...overrides,
+  };
+}
+
+function billingLine(overrides = {}) {
+  return {
+    id: 1,
+    billing_id: 61,
+    trip_id: 1,
+    trip_date: "2026-07-15",
+    trip_ticket_no: "TT-BILL-001",
+    reference_no: "OR-CLIENT-1",
+    job_description: "Billing delivery service",
+    origin: "Warehouse",
+    destination: "Site",
+    asset_code: "UNIT-001",
+    amount_base: 1000,
+    amount_extra: 75,
+    amount_total: 1075,
+    ...overrides,
+  };
+}
+
+function collectionBody(overrides = {}) {
+  return new URLSearchParams({
+    collection_date: "2026-08-01",
+    billing_id: "61",
+    amount_paid: "500",
+    reference_no: "RCPT-001",
+    payment_method: "Bank Transfer",
+    notes: "Collection test",
+    ...overrides,
+  });
+}
+
+function collectionEntry(overrides = {}) {
+  return {
+    id: 71,
+    collection_date: "2026-08-01",
+    client_id: 1,
+    client_name: "Client One",
+    billing_id: 61,
+    billing_no: "BILL-2026-000061",
+    amount_paid: 500,
+    reference_no: "RCPT-001",
+    payment_method: "Bank Transfer",
+    notes: "Collection test",
     ...overrides,
   };
 }
@@ -1073,4 +1184,188 @@ test("payroll permissions allow admin accounting reads while blocking encoder an
 
   response = await handleRequest(await authedRequest("https://example.test/payroll", "accounting"), envWithRows());
   assert.equal(response.status, 200);
+});
+
+test("billing list and CSV export show balances, status, and filtered links", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/billing?q=Client&page=2", "accounting"), envWithRows({
+    billingCount: 30,
+    billing: [billingEntry()],
+  }));
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Billing/);
+  assert.match(text, /BILL-2026-000061/);
+  assert.match(text, /Client One/);
+  assert.match(text, /Partially Paid/);
+  assert.match(text, /Page 2 of 2/);
+  assert.match(text, /\/billing\/61\/print/);
+  assert.match(text, /\/billing\/export\.csv\?q=Client/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/export.csv", "viewer"), envWithRows({
+    billing: [billingEntry()],
+  }));
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Billing No.,Billing Date,Client,Period From,Period To,Gross,VAT,Additions,Deductions,Grand Total,Paid,Balance,Status,Notes/);
+  assert.match(text, /"BILL-2026-000061","2026-07-31","Client One"/);
+  assert.match(text, /"1254","500","754","Partially Paid"/);
+});
+
+test("billing preview includes eligible unbilled trips and trip labels", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/billing/new?client=1&period_from=2026-07-01&period_to=2026-07-31", "admin"), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    trips: [sampleTrip({ id: 1, trip_ticket_no: "TT-BILL-001", status: "Completed", client_id: 1, job_description: "Billing delivery service" })],
+  }));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.match(text, /Eligible Trips/);
+  assert.match(text, /TT-BILL-001/);
+  assert.match(text, /Ref\. No\.: OR-123/);
+  assert.match(text, /Billing delivery service/);
+  assert.match(text, /value="\[1\]"/);
+});
+
+test("billing save creates statement, lines, adjustments, and marks trips billed", async () => {
+  const runs = [];
+  const response = await handleRequest(await authedRequest("https://example.test/billing/new", "accounting", { method: "POST", body: billingBody() }), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    trips: [sampleTrip({ id: 1, trip_ticket_no: "TT-BILL-001", status: "Completed", client_id: 1 })],
+    lastBilling: { billing_no: "BILL-2026-000060" },
+    createdBillingId: 61,
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/billing\/61/);
+  const statement = runs.find((run) => run.sql.includes("INSERT INTO billing_statements"));
+  assert.ok(statement);
+  assert.equal(statement.params[0], "BILL-2026-000061");
+  assert.equal(statement.params[6], "75");
+  assert.equal(statement.params[9], "129");
+  assert.equal(statement.params[12], "1254");
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO billing_lines")));
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO billing_adjustments") && run.params[1] === "Addition"));
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO billing_adjustments") && run.params[1] === "Deduction"));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE trips SET status='Billed' WHERE id=?") && run.params[0] === 1));
+});
+
+test("billing validation, detail, print, and delete protection work", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/billing/new", "admin", { method: "POST", body: billingBody({ deduction_amount: "2000" }) }), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    trips: [sampleTrip({ id: 1, status: "Completed", client_id: 1 })],
+  }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Grand total cannot be negative/);
+
+  const env = envWithRows({
+    billing: [billingEntry()],
+    billingLines: [billingLine()],
+    billingAdjustments: [{ billing_id: 61, line_type: "Addition", label: "Fuel adjustment", amount: 100 }],
+    collections: [collectionEntry()],
+  });
+  response = await handleRequest(await authedRequest("https://example.test/billing/61", "viewer"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Trip Ticket \/ Waybill/);
+  assert.match(text, /Ref\. No\.: OR-CLIENT-1/);
+  assert.match(text, /Item \/ Job/);
+  assert.match(text, /Billing delivery service/);
+  assert.match(text, /Collections/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/61/print", "viewer"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Billing Statement/);
+  assert.match(text, /Received by \/ Conforme/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/61/delete", "admin"), envWithRows());
+  assert.equal(response.status, 405);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/61/delete", "admin", { method: "POST" }), envWithRows({ collectionCount: 1 }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /cannot%20be%20deleted/);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/billing/61/delete", "admin", { method: "POST" }), envWithRows({
+    billingLines: [{ trip_id: 1 }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE trips SET status='Completed' WHERE id=?")));
+  assert.ok(runs.some((run) => run.sql.includes("DELETE FROM billing_statements WHERE id=?")));
+});
+
+test("collections list and CSV export show billing client payment data", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/collections?q=RCPT&page=2", "accounting"), envWithRows({
+    collectionsCount: 30,
+    collections: [collectionEntry()],
+  }));
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Collections/);
+  assert.match(text, /RCPT-001/);
+  assert.match(text, /Bank Transfer/);
+  assert.match(text, /Page 2 of 2/);
+  assert.match(text, /\/collections\/71\/edit/);
+
+  response = await handleRequest(await authedRequest("https://example.test/collections/export.csv", "viewer"), envWithRows({
+    collections: [collectionEntry()],
+  }));
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /Collection ID,Collection Date,Billing No.,Client,Amount Paid,Reference No.,Payment Method,Notes/);
+  assert.match(text, /"71","2026-08-01","BILL-2026-000061","Client One","500","RCPT-001","Bank Transfer","Collection test"/);
+});
+
+test("collection create edit and delete recalculate billing status", async () => {
+  let runs = [];
+  let response = await handleRequest(await authedRequest("https://example.test/collections/new", "accounting", { method: "POST", body: collectionBody() }), envWithRows({
+    billing: [billingEntry()],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO collections")));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE billing_statements SET status=?") && run.params[0] === "Partially Paid"));
+
+  response = await handleRequest(await authedRequest("https://example.test/collections/new", "accounting", { method: "POST", body: collectionBody({ amount_paid: "5000" }) }), envWithRows({
+    billing: [billingEntry({ paid_amount: 0 })],
+  }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Payment cannot exceed outstanding balance/);
+
+  runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/collections/71/edit", "admin", { method: "POST", body: collectionBody({ amount_paid: "754" }) }), envWithRows({
+    billing: [billingEntry()],
+    collections: [collectionEntry()],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE collections SET")));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE billing_statements SET status=?")));
+
+  response = await handleRequest(await authedRequest("https://example.test/collections/71/delete", "admin"), envWithRows());
+  assert.equal(response.status, 405);
+
+  runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/collections/71/delete", "admin", { method: "POST" }), envWithRows({
+    billing: [billingEntry()],
+    collections: [collectionEntry()],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((run) => run.sql.includes("DELETE FROM collections WHERE id=?")));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE billing_statements SET status=?")));
+});
+
+test("billing and collections permissions block encoder and viewer mutations", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/billing", "encoder"), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/collections", "encoder"), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/new", "viewer", { method: "POST", body: billingBody() }), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/collections/new", "viewer", { method: "POST", body: collectionBody() }), envWithRows());
+  assert.equal(response.status, 403);
 });

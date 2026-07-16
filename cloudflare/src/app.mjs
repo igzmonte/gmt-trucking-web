@@ -2,7 +2,7 @@ import { canEdit, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
 import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
-import { EXTRA_FIELDS, HELPER_LIMITS, calculateNet, choiceLabel, nextTripTicketNo, tripBillableTotal, tripExtraTotal } from "./services.mjs";
+import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
 
 const MASTER = {
@@ -1643,6 +1643,362 @@ async function payrollExportPage(request, env, user, path) {
   return csv(lines.join("\n"), "payroll.csv");
 }
 
+function billingWhere(query) {
+  if (!query) return { sql: "", params: [] };
+  return {
+    sql: " WHERE b.billing_no LIKE ? OR c.client_name LIKE ? OR b.status LIKE ? OR b.notes LIKE ?",
+    params: Array(4).fill(`%${query}%`),
+  };
+}
+
+function collectionWhere(query) {
+  if (!query) return { sql: "", params: [] };
+  return {
+    sql: " WHERE co.reference_no LIKE ? OR co.payment_method LIKE ? OR co.notes LIKE ? OR c.client_name LIKE ? OR b.billing_no LIKE ?",
+    params: Array(5).fill(`%${query}%`),
+  };
+}
+
+function nextBillingNoFrom(last, dateValue) {
+  const year = String(dateValue || todayISO()).slice(0, 4);
+  const lastNo = String(last?.billing_no || "");
+  const match = lastNo.match(/(\d+)$/);
+  return `BILL-${year}-${String((match ? Number(match[1]) : 0) + 1).padStart(6, "0")}`;
+}
+
+async function billingClients(env) {
+  return await all(env, "SELECT * FROM clients ORDER BY client_name, id");
+}
+
+async function billingChoices(env) {
+  return await all(env, "SELECT b.*, c.client_name, c.client_code, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id ORDER BY b.billing_date DESC, b.id DESC");
+}
+
+async function billingEligibleTrips(env, clientId, periodFrom, periodTo) {
+  if (!clientId || !periodFrom || !periodTo) return [];
+  return await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id WHERE t.client_id=? AND t.trip_date BETWEEN ? AND ? AND t.status IN ('Completed','Billed','Paid') AND NOT EXISTS (SELECT 1 FROM billing_lines bl WHERE bl.trip_id=t.id) ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [clientId, periodFrom, periodTo]);
+}
+
+function billingTotals(trips, values) {
+  const base = trips.reduce((sum, trip) => sum + numeric(trip.base_trip_rate), 0);
+  const extra = trips.reduce((sum, trip) => sum + tripExtraTotal(trip), 0);
+  const gross = base + extra;
+  const vat = applyVat(gross, values.vat_enabled);
+  const additions = numeric(values.addition_amount);
+  const deductions = numeric(values.deduction_amount);
+  const grand = gross + vat + additions - deductions;
+  return {
+    base_charges_total: base,
+    extra_charges_total: extra,
+    gross_total: gross,
+    vat_amount: vat,
+    additions_total: additions,
+    deductions_total: deductions,
+    grand_total: grand,
+  };
+}
+
+function billingCleaned(data) {
+  return {
+    client_id: data.client || data.client_id || "",
+    billing_date: data.billing_date || todayISO(),
+    period_from: data.period_from || "",
+    period_to: data.period_to || "",
+    vat_enabled: data.vat_enabled === "1" || data.vat_enabled === "on" ? 1 : 0,
+    addition_label: (data.addition_label || "").trim(),
+    addition_amount: numericText(data.addition_amount),
+    deduction_label: (data.deduction_label || "").trim(),
+    deduction_amount: numericText(data.deduction_amount),
+    notes: (data.notes || "").trim(),
+    expected_trip_ids: parseExpectedIds(data.expected_trip_ids),
+  };
+}
+
+function validateBilling(cleaned, trips, totals) {
+  const errors = [];
+  if (!cleaned.client_id) errors.push("Client is required.");
+  if (!cleaned.billing_date) errors.push("Billing date is required.");
+  if (!cleaned.period_from || !cleaned.period_to) errors.push("Billing period is required.");
+  if (cleaned.period_from && cleaned.period_to && cleaned.period_from > cleaned.period_to) errors.push("Period end must be on or after period start.");
+  if (numeric(cleaned.addition_amount) < 0) errors.push("addition amount cannot be negative.");
+  if (numeric(cleaned.deduction_amount) < 0) errors.push("deduction amount cannot be negative.");
+  if (totals && totals.grand_total < 0) errors.push("Grand total cannot be negative.");
+  if (!trips?.length) errors.push("At least one eligible trip is required.");
+  const freshIds = (trips || []).map((trip) => Number(trip.id));
+  if (JSON.stringify(freshIds) !== JSON.stringify(cleaned.expected_trip_ids)) errors.push("Billing eligibility changed. Preview the period again before saving.");
+  return errors;
+}
+
+function billingTripRows(trips) {
+  const rows = trips.map((trip) => `<tr><td>${esc(trip.trip_date)}</td><td><a href="/trips/${trip.id}">${esc(trip.trip_ticket_no)}</a><small class="cell-detail">Ref. No.: ${esc(trip.reference_no || "—")}</small></td><td>${esc(trip.job_description || "")}</td><td>${esc(trip.origin || "")} → ${esc(trip.destination || "")}</td><td>${esc(trip.asset_code || "")}</td>${moneyCell(trip.base_trip_rate)}${moneyCell(tripExtraTotal(trip))}${moneyCell(tripBillableTotal(trip))}</tr>`);
+  return table(["Date", "Trip Ticket / Waybill", "Item / Job", "Route", "Unit", "Base", "Extras", "Total"], rows, { empty: "No eligible unbilled trips for this client and period." });
+}
+
+function billingFormContent(clients, selection, trips, values = {}, errors = []) {
+  const clientId = selection.client || values.client || values.client_id || "";
+  const periodFrom = selection.period_from || values.period_from || `${todayISO().slice(0, 8)}01`;
+  const periodTo = selection.period_to || values.period_to || todayISO();
+  const cleaned = billingCleaned({ client: clientId, period_from: periodFrom, period_to: periodTo, ...values });
+  const totals = billingTotals(trips || [], cleaned);
+  const selector = `<section class="panel"><h3>1. Select Client & Period</h3><form method="get" class="selector-row">${selectInput("client", "Client", clients, clientId, (client) => choiceLabel("client", client), "Select client")}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Billing</button></form></section>`;
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  if (!clientId) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select a client and billing period to preview eligible trips.</p></section>`;
+  const hidden = `<input type="hidden" name="client" value="${esc(clientId)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify((trips || []).map((trip) => trip.id)))}">`;
+  const fields = [
+    textInput("billing_date", "Billing date", values.billing_date || todayISO(), 'type="date" required'),
+    `<label>VAT<input type="checkbox" name="vat_enabled" value="1"${cleaned.vat_enabled ? " checked" : ""}> Add 12% VAT</label>`,
+    textInput("addition_label", "Addition label", values.addition_label || ""),
+    numberInput("addition_amount", "Addition amount", values.addition_amount ?? 0),
+    textInput("deduction_label", "Deduction label", values.deduction_label || ""),
+    numberInput("deduction_amount", "Deduction amount", values.deduction_amount ?? 0),
+    textareaInput("notes", "Notes", values.notes || "", 'rows="3"'),
+  ];
+  const summary = `<section class="panel">${cards([["Eligible Trips", String((trips || []).length)], ["Gross", peso(totals.gross_total)], ["VAT", peso(totals.vat_amount)], ["Grand Total", peso(totals.grand_total)]])}</section>`;
+  return `${errorBox}${selector}${summary}<form method="post" action="/billing/new" class="panel">${hidden}<div class="grid">${fields.join("")}</div><p><button>Save Billing</button> <a class="button secondary" href="/billing">Cancel</a></p></form><section class="panel"><h3>Eligible Trips</h3></section>${billingTripRows(trips || [])}`;
+}
+
+async function createdBillingId(env, billingNo) {
+  const row = await first(env, "SELECT id FROM billing_statements WHERE billing_no=? LIMIT 1", [billingNo]);
+  return row?.id;
+}
+
+async function saveBilling(env, cleaned, trips) {
+  const totals = billingTotals(trips, cleaned);
+  const last = await first(env, "SELECT billing_no FROM billing_statements WHERE billing_no LIKE ? ORDER BY billing_no DESC LIMIT 1", [`BILL-${String(cleaned.billing_date).slice(0, 4)}-%`]);
+  const billingNo = nextBillingNoFrom(last, cleaned.billing_date);
+  await run(env, "INSERT INTO billing_statements (billing_no, client_id, billing_date, period_from, period_to, base_charges_total, extra_charges_total, gross_total, vat_enabled, vat_amount, additions_total, deductions_total, grand_total, status, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+    billingNo, cleaned.client_id, cleaned.billing_date, cleaned.period_from, cleaned.period_to,
+    String(totals.base_charges_total), String(totals.extra_charges_total), String(totals.gross_total), cleaned.vat_enabled,
+    String(totals.vat_amount), String(totals.additions_total), String(totals.deductions_total), String(totals.grand_total), "Open", cleaned.notes,
+  ]);
+  const billingId = await createdBillingId(env, billingNo);
+  for (const trip of trips) {
+    await run(env, "INSERT INTO billing_lines (billing_id, trip_id, amount_base, amount_extra, amount_total) VALUES (?,?,?,?,?)", [billingId, trip.id, String(numeric(trip.base_trip_rate)), String(tripExtraTotal(trip)), String(tripBillableTotal(trip))]);
+    await run(env, "UPDATE trips SET status='Billed' WHERE id=?", [trip.id]);
+  }
+  if (numeric(cleaned.addition_amount)) await run(env, "INSERT INTO billing_adjustments (billing_id, line_type, label, amount, sort_order) VALUES (?,?,?,?,?)", [billingId, "Addition", cleaned.addition_label || "Addition", cleaned.addition_amount, 1]);
+  if (numeric(cleaned.deduction_amount)) await run(env, "INSERT INTO billing_adjustments (billing_id, line_type, label, amount, sort_order) VALUES (?,?,?,?,?)", [billingId, "Deduction", cleaned.deduction_label || "Deduction", cleaned.deduction_amount, 2]);
+  return billingId;
+}
+
+async function loadBillingEntry(env, id) {
+  const entry = await first(env, "SELECT b.*, c.client_name, c.client_code, c.billing_address, c.contact_person FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id WHERE b.id=?", [id]);
+  if (!entry) return null;
+  entry.lines = await all(env, `SELECT bl.*, t.trip_date, t.trip_ticket_no, t.reference_no, t.job_description, t.origin, t.destination, a.asset_code FROM billing_lines bl JOIN trips t ON t.id=bl.trip_id LEFT JOIN assets a ON a.id=t.asset_id WHERE bl.billing_id=? ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [id]);
+  entry.adjustments = await all(env, "SELECT * FROM billing_adjustments WHERE billing_id=? ORDER BY sort_order, id", [id]);
+  entry.collections = await all(env, "SELECT * FROM collections WHERE billing_id=? ORDER BY collection_date, id", [id]);
+  entry.paid_amount = entry.collections.reduce((sum, row) => sum + numeric(row.amount_paid), 0);
+  entry.balance = outstandingBalance(entry.grand_total, entry.paid_amount);
+  entry.current_status = billingStatus(entry.grand_total, entry.paid_amount);
+  return entry;
+}
+
+function billingDetailContent(entry, user, print = false) {
+  const lineRows = (entry.lines || []).map((line) => `<tr><td>${esc(line.trip_date)}</td><td>${esc(line.trip_ticket_no)}<small class="cell-detail">Ref. No.: ${esc(line.reference_no || "—")}</small></td><td>${esc(line.job_description || "")}</td><td>${esc(line.origin || "")} → ${esc(line.destination || "")}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`);
+  const adjustmentRows = (entry.adjustments || []).map((row) => `<tr><td>${esc(row.line_type)}</td><td>${esc(row.label)}</td><td class="num">${esc(peso(row.amount))}</td></tr>`);
+  const collectionRows = (entry.collections || []).map((row) => `<tr><td>${esc(row.collection_date)}</td><td>${esc(row.reference_no || "")}</td><td>${esc(row.payment_method || "")}</td><td class="num">${esc(peso(row.amount_paid))}</td></tr>`);
+  if (print) {
+    return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(entry.billing_no)} · Billing</title><style>@page{size:A4 portrait;margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111}.top{display:flex;justify-content:space-between;gap:24px}h1,h2{margin:0 0 6px}.muted{color:#555}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:320px}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:60px;margin-top:48px}.sig{border-top:1px solid #111;text-align:center;padding-top:6px}.print-button{margin-bottom:10px}@media print{.print-button{display:none}}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><h1>GMT Trucking</h1><h2>Billing Statement</h2><p><strong>Client:</strong> ${esc(entry.client_name || "")}<br><strong>Address:</strong> ${esc(entry.billing_address || "")}<br><strong>Period:</strong> ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><div><h2>${esc(entry.billing_no)}</h2><p><strong>Date:</strong> ${esc(entry.billing_date)}<br><strong>Status:</strong> ${esc(entry.current_status)}</p></div></div><table><thead><tr><th>Date</th><th>Trip Ticket / Waybill</th><th>Item / Job</th><th>Route</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${lineRows.join("")}</tbody></table>${adjustmentRows.length ? `<table><thead><tr><th>Type</th><th>Adjustment</th><th>Amount</th></tr></thead><tbody>${adjustmentRows.join("")}</tbody></table>` : ""}<table class="totals"><tr><td>Gross</td><td class="num">${esc(peso(entry.gross_total))}</td></tr><tr><td>VAT</td><td class="num">${esc(peso(entry.vat_amount))}</td></tr><tr><td>Additions</td><td class="num">${esc(peso(entry.additions_total))}</td></tr><tr><td>Deductions</td><td class="num">${esc(peso(entry.deductions_total))}</td></tr><tr><th>Grand Total</th><th class="num">${esc(peso(entry.grand_total))}</th></tr><tr><td>Payments</td><td class="num">${esc(peso(entry.paid_amount))}</td></tr><tr><th>Balance</th><th class="num">${esc(peso(entry.balance))}</th></tr></table><div class="signatures"><div class="sig">Prepared by</div><div class="sig">Received by / Conforme</div></div></body></html>`;
+  }
+  const actions = `<div class="detail-toolbar"><a class="button secondary" href="/billing">← Billing List</a><div><a class="button secondary" href="/billing/${entry.id}/print" target="_blank">Print Billing</a></div></div>`;
+  const hero = `<section class="panel detail-hero"><div><span class="dialog-kicker">Billing Statement</span><h3>${esc(entry.billing_no)}</h3><p>${esc(entry.client_name || "")} · ${esc(entry.billing_date)} · ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><strong>${esc(peso(entry.balance))}</strong></section>`;
+  const summary = `<section class="panel">${cards([["Gross", peso(entry.gross_total)], ["VAT", peso(entry.vat_amount)], ["Grand Total", peso(entry.grand_total)], ["Paid", peso(entry.paid_amount)], ["Balance", peso(entry.balance)], ["Status", entry.current_status]])}</section>`;
+  const deleteForm = canEdit(user, "Billing") ? `<section class="detail-danger"><form method="post" action="/billing/${entry.id}/delete" onsubmit="return confirm('Delete this billing statement? This is blocked when collections exist.');"><button class="danger-button">Delete Billing</button></form></section>` : "";
+  return `${actions}${hero}${summary}<section class="panel"><h3>Trips</h3></section>${table(["Date", "Trip Ticket / Waybill", "Item / Job", "Route", "Unit", "Base", "Extras", "Total"], lineRows, { empty: "No billing lines." })}<section class="panel"><h3>Adjustments</h3></section>${table(["Type", "Label", "Amount"], adjustmentRows, { empty: "No adjustments." })}<section class="panel"><h3>Collections</h3></section>${table(["Date", "Reference", "Method", "Amount"], collectionRows, { empty: "No collections recorded." })}${entry.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(entry.notes)}</p></section>` : ""}${deleteForm}`;
+}
+
+async function billingListPage(request, env, user, path) {
+  const access = requireView(user, "Billing");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  const where = billingWhere(query);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql} ORDER BY b.billing_date DESC, b.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((row) => {
+    const paid = numeric(row.paid_amount);
+    const balance = outstandingBalance(row.grand_total, paid);
+    const status = billingStatus(row.grand_total, paid);
+    return `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.billing_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.period_from || "")} – ${esc(row.period_to || "")}</td>${moneyCell(row.grand_total)}${moneyCell(paid)}${moneyCell(balance)}<td><span class="status">${esc(status)}</span></td><td><a href="/billing/${row.id}">View</a> <a href="/billing/${row.id}/print" target="_blank">Print</a></td></tr>`;
+  });
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search billing"><button>Search</button></form><div>${canEdit(user, "Billing") ? `<a class="button" href="/billing/new">New Billing</a>` : ""} <a class="button secondary" href="${esc(`/billing/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Billing No.", "Date", "Client", "Period", "Grand Total", "Paid", "Balance", "Status", "Actions"], body, { empty: "No billing statements found." })}${paginationWithParams("/billing", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Billing", user, path, content }));
+}
+
+async function billingNewPage(request, env, user, path) {
+  const access = requireEdit(user, "Billing");
+  if (access) return errorResponse(access, user, path);
+  const clients = await billingClients(env);
+  const source = request.method === "POST" ? await parseForm(request) : Object.fromEntries(new URL(request.url).searchParams.entries());
+  const selection = { client: source.client || "", period_from: source.period_from || `${todayISO().slice(0, 8)}01`, period_to: source.period_to || todayISO() };
+  const trips = selection.client ? await billingEligibleTrips(env, selection.client, selection.period_from, selection.period_to) : [];
+  if (request.method === "POST") {
+    const cleaned = billingCleaned(source);
+    const totals = billingTotals(trips, cleaned);
+    const errors = validateBilling(cleaned, trips, totals);
+    if (errors.length) return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips, source, errors) }), 400);
+    const id = await saveBilling(env, cleaned, trips);
+    return redirect(`/billing/${id}?ok=${encodeURIComponent("Billing statement saved and trips marked as billed.")}`);
+  }
+  return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips) }));
+}
+
+async function billingDetailPage(request, env, user, path, id, print = false) {
+  const access = requireView(user, "Billing");
+  if (access) return errorResponse(access, user, path);
+  const entry = await loadBillingEntry(env, id);
+  if (!entry) return html("Not found", 404);
+  if (print) return html(billingDetailContent(entry, user, true));
+  return html(layout({ title: "Billing Details", user, path, content: `${messagePanel(new URL(request.url))}${billingDetailContent(entry, user)}` }));
+}
+
+async function billingDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Billing");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const collections = await first(env, "SELECT COUNT(*) AS total FROM collections WHERE billing_id=?", [id]);
+  if (Number(collections?.total || 0)) return redirect(`/billing/${id}?error=${encodeURIComponent("Billing has collections and cannot be deleted.")}`);
+  const lines = await all(env, "SELECT trip_id FROM billing_lines WHERE billing_id=?", [id]);
+  for (const line of lines) await run(env, "UPDATE trips SET status='Completed' WHERE id=?", [line.trip_id]);
+  await run(env, "DELETE FROM billing_statements WHERE id=?", [id]);
+  return redirect(`/billing?ok=${encodeURIComponent("Billing deleted and trips restored to Completed.")}`);
+}
+
+async function billingExportPage(request, env, user, path) {
+  const access = requireView(user, "Billing");
+  if (access) return errorResponse(access, user, path);
+  const where = billingWhere((new URL(request.url).searchParams.get("q") || "").trim());
+  const rows = await all(env, `SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql} ORDER BY b.billing_date DESC, b.id DESC`, where.params);
+  const lines = ["Billing No.,Billing Date,Client,Period From,Period To,Gross,VAT,Additions,Deductions,Grand Total,Paid,Balance,Status,Notes"];
+  for (const row of rows) {
+    const paid = numeric(row.paid_amount);
+    lines.push(quotedCsvRow([row.billing_no, row.billing_date, row.client_name || "", row.period_from, row.period_to, row.gross_total, row.vat_amount, row.additions_total, row.deductions_total, row.grand_total, paid, outstandingBalance(row.grand_total, paid), billingStatus(row.grand_total, paid), row.notes || ""]));
+  }
+  return csv(lines.join("\n"), "billing.csv");
+}
+
+async function recalcBillingStatus(env, billingId) {
+  const row = await first(env, "SELECT grand_total, COALESCE((SELECT SUM(amount_paid) FROM collections WHERE billing_id=?),0) AS paid_amount FROM billing_statements WHERE id=?", [billingId, billingId]);
+  if (!row) return null;
+  const status = billingStatus(row.grand_total, row.paid_amount);
+  await run(env, "UPDATE billing_statements SET status=? WHERE id=?", [status, billingId]);
+  return status;
+}
+
+function collectionValues(data) {
+  return {
+    collection_date: data.collection_date || todayISO(),
+    billing_id: data.billing_id || "",
+    client_id: data.client_id || "",
+    amount_paid: numericText(data.amount_paid),
+    reference_no: (data.reference_no || "").trim(),
+    payment_method: (data.payment_method || "").trim(),
+    notes: (data.notes || "").trim(),
+  };
+}
+
+async function collectionFormContent(env, row, errors = [], id = null) {
+  const billings = await billingChoices(env);
+  const selectedBilling = billings.find((billing) => String(billing.id) === String(row.billing_id));
+  const paidExcludingCurrent = selectedBilling ? Math.max(0, numeric(selectedBilling.paid_amount) - numeric(row.original_amount_paid)) : 0;
+  const outstanding = selectedBilling ? outstandingBalance(selectedBilling.grand_total, paidExcludingCurrent) : 0;
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const billingSelect = `<label>Billing Statement<select name="billing_id" required><option value="">Select billing</option>${billings.map((billing) => {
+    const paid = numeric(billing.paid_amount);
+    const label = `${billing.billing_no} — ${billing.client_name || ""} — ${billing.billing_date} — ${peso(outstandingBalance(billing.grand_total, paid))} / ${billingStatus(billing.grand_total, paid)}`;
+    return `<option value="${esc(billing.id)}"${String(row.billing_id) === String(billing.id) ? " selected" : ""}>${esc(label)}</option>`;
+  }).join("")}</select></label>`;
+  const fields = [
+    textInput("collection_date", "Collection date", row.collection_date || todayISO(), 'type="date" required'),
+    billingSelect,
+    numberInput("amount_paid", "Amount paid", row.amount_paid ?? 0),
+    textInput("reference_no", "Reference no.", row.reference_no || ""),
+    textInput("payment_method", "Payment method", row.payment_method || ""),
+    textareaInput("notes", "Notes", row.notes || "", 'rows="3"'),
+  ];
+  const summary = selectedBilling ? `<section class="panel">${cards([["Billing", selectedBilling.billing_no], ["Client", selectedBilling.client_name || ""], ["Available Balance", peso(outstanding)], ["Status", billingStatus(selectedBilling.grand_total, selectedBilling.paid_amount)]])}</section>` : "";
+  const deleteForm = id ? `<section class="detail-danger"><form method="post" action="/collections/${id}/delete" onsubmit="return confirm('Delete this collection and recalculate billing balance?');"><button class="danger-button">Delete Collection</button></form></section>` : "";
+  return `${errorBox}${summary}${formPanel(id ? `/collections/${id}/edit` : "/collections/new", fields, "Save Collection")}${deleteForm}`;
+}
+
+async function validateCollection(env, values, id = null, original = null) {
+  const errors = [];
+  if (!values.billing_id) errors.push("Billing statement is required.");
+  if (!values.collection_date) errors.push("Collection date is required.");
+  if (numeric(values.amount_paid) <= 0) errors.push("amount paid must be positive.");
+  const billing = values.billing_id ? await first(env, "SELECT b.*, COALESCE((SELECT SUM(amount_paid) FROM collections WHERE billing_id=b.id),0) AS paid_amount FROM billing_statements b WHERE b.id=?", [values.billing_id]) : null;
+  if (!billing) errors.push("Billing statement is invalid.");
+  if (billing) {
+    const paidExcludingCurrent = numeric(billing.paid_amount) - numeric(original?.amount_paid);
+    const available = outstandingBalance(billing.grand_total, paidExcludingCurrent);
+    if (numeric(values.amount_paid) > available) errors.push("Payment cannot exceed outstanding balance.");
+  }
+  return { errors, billing };
+}
+
+async function collectionsPage(request, env, user, path) {
+  const access = requireView(user, "Collections");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") || "").trim();
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  const where = collectionWhere(query);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql}`, where.params);
+  const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY co.collection_date DESC, co.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const body = rows.map((row) => `<tr><td>${esc(row.collection_date)}</td><td><a href="/billing/${row.billing_id}">${esc(row.billing_no || "")}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.amount_paid)}<td>${esc(row.reference_no || "")}</td><td>${esc(row.payment_method || "")}</td><td>${canEdit(user, "Collections") ? `<a href="/collections/${row.id}/edit">Edit</a>` : "—"}</td></tr>`);
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search collections"><button>Search</button></form><div>${canEdit(user, "Collections") ? `<a class="button" href="/collections/new">New Collection</a>` : ""} <a class="button secondary" href="${esc(`/collections/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Billing No.", "Client", "Amount", "Reference", "Method", "Actions"], body, { empty: "No collections found." })}${paginationWithParams("/collections", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "Collections", user, path, content }));
+}
+
+async function collectionFormPage(request, env, user, path, id = null) {
+  const access = requireEdit(user, "Collections");
+  if (access) return errorResponse(access, user, path);
+  const original = id ? await first(env, "SELECT * FROM collections WHERE id=?", [id]) : null;
+  if (id && !original) return html("Not found", 404);
+  const source = request.method === "POST" ? await parseForm(request) : { ...(original || {}), original_amount_paid: original?.amount_paid || 0 };
+  const values = collectionValues(source);
+  values.original_amount_paid = original?.amount_paid || 0;
+  if (request.method === "POST") {
+    const { errors, billing } = await validateCollection(env, values, id, original);
+    if (errors.length) return html(layout({ title: id ? "Edit Collection" : "New Collection", user, path, content: await collectionFormContent(env, { ...source, ...values }, errors, id) }), 400);
+    values.client_id = billing.client_id;
+    if (id) await run(env, "UPDATE collections SET collection_date=?, client_id=?, billing_id=?, amount_paid=?, reference_no=?, payment_method=?, notes=? WHERE id=?", [values.collection_date, values.client_id, values.billing_id, values.amount_paid, values.reference_no, values.payment_method, values.notes, id]);
+    else await run(env, "INSERT INTO collections (collection_date, client_id, billing_id, amount_paid, reference_no, payment_method, notes) VALUES (?,?,?,?,?,?,?)", [values.collection_date, values.client_id, values.billing_id, values.amount_paid, values.reference_no, values.payment_method, values.notes]);
+    await recalcBillingStatus(env, values.billing_id);
+    if (id && original.billing_id && String(original.billing_id) !== String(values.billing_id)) await recalcBillingStatus(env, original.billing_id);
+    return redirect(`/collections?ok=${encodeURIComponent("Collection saved and billing balance recalculated.")}`);
+  }
+  return html(layout({ title: id ? "Edit Collection" : "New Collection", user, path, content: await collectionFormContent(env, source, [], id) }));
+}
+
+async function collectionDeletePage(request, env, user, path, id) {
+  const access = requireEdit(user, "Collections");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Delete requires POST.</p></section>` }), 405);
+  const row = await first(env, "SELECT * FROM collections WHERE id=?", [id]);
+  if (!row) return redirect("/collections?error=Collection%20not%20found.");
+  await run(env, "DELETE FROM collections WHERE id=?", [id]);
+  await recalcBillingStatus(env, row.billing_id);
+  return redirect(`/collections?ok=${encodeURIComponent("Collection deleted and billing balance recalculated.")}`);
+}
+
+async function collectionExportPage(request, env, user, path) {
+  const access = requireView(user, "Collections");
+  if (access) return errorResponse(access, user, path);
+  const where = collectionWhere((new URL(request.url).searchParams.get("q") || "").trim());
+  const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY co.collection_date DESC, co.id DESC`, where.params);
+  const lines = ["Collection ID,Collection Date,Billing No.,Client,Amount Paid,Reference No.,Payment Method,Notes"];
+  for (const row of rows) lines.push(quotedCsvRow([row.id, row.collection_date, row.billing_no || "", row.client_name || "", row.amount_paid, row.reference_no || "", row.payment_method || "", row.notes || ""]));
+  return csv(lines.join("\n"), "collections.csv");
+}
+
 async function reportList(env, user, path) {
   const access = requireView(user, "Reports");
   if (access) return errorResponse(access, user, path);
@@ -1728,9 +2084,23 @@ export async function handleRequest(request, env) {
   if (match) return payrollDeletePage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/payroll\/(\d+)$/);
   if (match) return payrollDetailPage(request, env, user, path, Number(match[1]));
+  if (path === "/billing") return billingListPage(request, env, user, path);
+  if (path === "/billing/new") return billingNewPage(request, env, user, path);
+  if (path === "/billing/export.csv") return billingExportPage(request, env, user, path);
+  match = path.match(/^\/billing\/(\d+)\/print$/);
+  if (match) return billingDetailPage(request, env, user, path, Number(match[1]), true);
+  match = path.match(/^\/billing\/(\d+)\/delete$/);
+  if (match) return billingDeletePage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/billing\/(\d+)$/);
+  if (match) return billingDetailPage(request, env, user, path, Number(match[1]));
+  if (path === "/collections") return collectionsPage(request, env, user, path);
+  if (path === "/collections/new") return collectionFormPage(request, env, user, path);
+  if (path === "/collections/export.csv") return collectionExportPage(request, env, user, path);
+  match = path.match(/^\/collections\/(\d+)\/edit$/);
+  if (match) return collectionFormPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/collections\/(\d+)\/delete$/);
+  if (match) return collectionDeletePage(request, env, user, path, Number(match[1]));
   if (path === "/reports") return reportList(env, user, path);
-  if (path === "/billing") return placeholder("Billing", user, path, "Billing");
-  if (path === "/collections") return placeholder("Collections", user, path, "Collections");
   if (path === "/users") return placeholder("User Management", user, path, "User Management");
   return html(layout({ title: "Not Found", user, path, content: `<section class="panel"><p>Route not found.</p></section>` }), 404);
 }
