@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { handleRequest } from "../src/app.mjs";
-import { createSession } from "../src/auth.mjs";
+import { createSession, verifyPassword } from "../src/auth.mjs";
 
 function envWithRows(rows = {}) {
   return {
@@ -13,11 +13,26 @@ function envWithRows(rows = {}) {
         const state = { sql, params: [] };
         const source = (table) => rows[table] || [];
         const byId = (table) => source(table).find((row) => Number(row.id) === Number(state.params.at(-1)));
+        const userRows = () => rows.users || (rows.user ? [rows.user] : []);
         const filtered = (table) => {
           const data = source(table);
           if (!state.sql.includes(" LIKE ?")) return data;
           const needle = String(state.params[0] || "").replaceAll("%", "").toLowerCase();
           return data.filter((row) => Object.values(row).some((value) => String(value ?? "").toLowerCase().includes(needle)));
+        };
+        const filteredUsers = () => {
+          let data = userRows();
+          if (state.sql.includes(" LIKE ?")) {
+            const needle = String(state.params[0] || "").replaceAll("%", "").toLowerCase();
+            data = data.filter((row) => [row.username, row.first_name, row.last_name, row.email].some((value) => String(value ?? "").toLowerCase().includes(needle)));
+          }
+          if (state.sql.includes("role=?")) {
+            const role = state.params.find((param) => ["admin", "encoder", "viewer", "accounting"].includes(param));
+            if (role) data = data.filter((row) => row.role === role);
+          }
+          if (state.sql.includes("active=1")) data = data.filter((row) => Number(row.active) === 1);
+          if (state.sql.includes("active=0")) data = data.filter((row) => Number(row.active) === 0);
+          return data;
         };
         const sum = (table, field, predicate = () => true) => source(table)
           .filter(predicate)
@@ -82,6 +97,7 @@ function envWithRows(rows = {}) {
               return { results: payItems };
             }
             if (state.sql.includes("FROM recurring_trip_masters r")) return { results: filtered("recurring").slice(0, 25) };
+            if (state.sql.includes("FROM users")) return { results: filteredUsers().slice(0, 25) };
             if (state.sql.includes("FROM repairs ORDER BY")) return { results: rows.repairs || [] };
             if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Driver'")) return { results: rows.drivers || filtered("employees").filter((row) => row.employee_type === "Driver").slice(0, 25) };
             if (state.sql.includes("FROM employees WHERE active=1 AND employee_type='Helper'")) return { results: rows.helpers || filtered("employees").filter((row) => row.employee_type === "Helper").slice(0, 25) };
@@ -92,7 +108,19 @@ function envWithRows(rows = {}) {
             return { results: [] };
           },
           async first() {
-            if (state.sql.includes("FROM users")) return rows.user || null;
+            if (state.sql.includes("FROM users WHERE username=? AND active=1")) return userRows().find((row) => row.username === state.params[0] && Number(row.active) === 1) || null;
+            if (state.sql.includes("FROM users WHERE id=?")) return userRows().find((row) => Number(row.id) === Number(state.params[0])) || null;
+            if (state.sql.includes("SELECT id FROM users WHERE username=?")) {
+              const [username, id] = state.params;
+              return userRows().find((row) => row.username === username && (!id || Number(row.id) !== Number(id))) || null;
+            }
+            if (state.sql.includes("COUNT(*) AS total FROM users WHERE role='admin' AND active=1 AND id<>?")) {
+              return { total: userRows().filter((row) => row.role === "admin" && Number(row.active) === 1 && Number(row.id) !== Number(state.params[0])).length };
+            }
+            if (state.sql.includes("COUNT(*) AS total FROM users WHERE role='admin' AND active=1")) {
+              return { total: userRows().filter((row) => row.role === "admin" && Number(row.active) === 1).length };
+            }
+            if (state.sql.includes("COUNT(*) AS total FROM users")) return { total: rows.usersCount ?? filteredUsers().length };
             if (state.sql.includes("COUNT(*) AS total FROM billing_statements b")) return { total: rows.billingCount ?? filtered("billing").length };
             if (state.sql.includes("COUNT(*) AS total FROM collections co")) return { total: rows.collectionsCount ?? filtered("collections").length };
             if (state.sql.includes("SELECT b.*,") && state.sql.includes("FROM billing_statements b") && state.sql.includes("WHERE b.id=?")) return byId("billing") || null;
@@ -1608,4 +1636,132 @@ test("printable reports and CSV export preserve filters and raw numeric values",
   text = await response.text();
   assert.match(text, /Trip Ticket \/ Waybill,Date,Client,Base Rate/);
   assert.match(text, /"TT-CSV","2026-07-15","Client CSV","1000"/);
+});
+
+test("user management lists filters and exports users without password hashes", async () => {
+  const env = envWithRows({
+    users: [
+      { id: 1, username: "admin", first_name: "Aileen", last_name: "Admin", email: "admin@example.test", role: "admin", active: 1, password_hash: "secret" },
+      { id: 2, username: "viewer_one", first_name: "View", last_name: "Only", email: "viewer@example.test", role: "viewer", active: 0, password_hash: "hidden" },
+    ],
+  });
+  let response = await handleRequest(await authedRequest("https://example.test/users?q=view&role=viewer&active=inactive", "admin"), env);
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /User Management/);
+  assert.match(text, /viewer_one/);
+  assert.doesNotMatch(text, /admin@example\.test/);
+  assert.match(text, /New User/);
+  assert.match(text, /Export CSV/);
+
+  response = await handleRequest(await authedRequest("https://example.test/users/export.csv?q=view&role=viewer&active=inactive", "admin"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /"Username","First Name","Last Name","Email","Role","Active"/);
+  assert.match(text, /"viewer_one","View","Only","viewer@example.test","Viewer","Inactive"/);
+  assert.doesNotMatch(text, /password_hash|hidden|secret/);
+});
+
+test("user management create validates unique usernames and stores a verifiable password hash", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/users/new", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ username: "", first_name: "New", last_name: "User", email: "", role: "viewer", active: "1", password: "" }),
+  }), envWithRows());
+  assert.equal(response.status, 400);
+  let text = await response.text();
+  assert.match(text, /Username is required/);
+  assert.match(text, /Password is required/);
+
+  response = await handleRequest(await authedRequest("https://example.test/users/new", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ username: "admin", first_name: "New", last_name: "User", email: "", role: "viewer", active: "1", password: "new-password" }),
+  }), envWithRows({ users: [{ id: 1, username: "admin", role: "admin", active: 1 }] }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Username must be unique/);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/users/new", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ username: "new_viewer", first_name: "New", last_name: "Viewer", email: "new@example.test", role: "viewer", active: "1", password: "new-password" }),
+  }), envWithRows({ users: [{ id: 1, username: "admin", role: "admin", active: 1 }], runs }));
+  assert.equal(response.status, 303);
+  const insert = runs.find((run) => run.sql.includes("INSERT INTO users"));
+  assert.ok(insert);
+  assert.equal(insert.params[0], "new_viewer");
+  assert.equal(insert.params[5], "viewer");
+  assert.equal(await verifyPassword("new-password", insert.params[1]), true);
+});
+
+test("user management edit password reset and deactivate enforce admin safety", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/users/1/edit", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ username: "admin", first_name: "Only", last_name: "Admin", email: "", role: "viewer", active: "1" }),
+  }), envWithRows({ users: [{ id: 1, username: "admin", role: "admin", active: 1 }] }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /At least one active admin account is required/);
+
+  const editRuns = [];
+  response = await handleRequest(await authedRequest("https://example.test/users/2/edit", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ username: "encoder_one", first_name: "Encode", last_name: "One", email: "encode@example.test", role: "encoder", active: "1" }),
+  }), envWithRows({
+    users: [
+      { id: 1, username: "admin", role: "admin", active: 1 },
+      { id: 2, username: "viewer_one", first_name: "View", last_name: "One", email: "", role: "viewer", active: 1 },
+    ],
+    runs: editRuns,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(editRuns.some((run) => run.sql.includes("UPDATE users SET username=?") && run.params[4] === "encoder"));
+
+  const passwordRuns = [];
+  response = await handleRequest(await authedRequest("https://example.test/users/2/password", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ password: "changed-password", confirm_password: "different" }),
+  }), envWithRows({ users: [{ id: 1, username: "admin", role: "admin", active: 1 }, { id: 2, username: "viewer_one", role: "viewer", active: 1 }] }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Password confirmation does not match/);
+
+  response = await handleRequest(await authedRequest("https://example.test/users/2/password", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ password: "changed-password", confirm_password: "changed-password" }),
+  }), envWithRows({ users: [{ id: 1, username: "admin", role: "admin", active: 1 }, { id: 2, username: "viewer_one", role: "viewer", active: 1 }], runs: passwordRuns }));
+  assert.equal(response.status, 303);
+  const update = passwordRuns.find((run) => run.sql.includes("UPDATE users SET password_hash=?"));
+  assert.ok(update);
+  assert.equal(await verifyPassword("changed-password", update.params[0]), true);
+
+  response = await handleRequest(await authedRequest("https://example.test/users/1/deactivate", "admin", { method: "POST" }), envWithRows({
+    users: [{ id: 1, username: "admin", role: "admin", active: 1 }, { id: 2, username: "other_admin", role: "admin", active: 1 }],
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /cannot%20deactivate%20your%20own%20account/i);
+
+  response = await handleRequest(await authedRequest("https://example.test/users/2/deactivate", "admin", { method: "POST" }), envWithRows({
+    users: [{ id: 1, username: "admin", role: "admin", active: 1 }, { id: 2, username: "other_admin", role: "admin", active: 1 }],
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /User%20deactivated/);
+});
+
+test("user management permissions and live role refresh are enforced", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/users", "encoder"), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/users", "viewer"), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/users", "accounting"), envWithRows());
+  assert.equal(response.status, 403);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing", "encoder"), envWithRows({
+    users: [{ id: 1, username: "changed_role", role: "accounting", active: 1 }],
+  }));
+  assert.equal(response.status, 200);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing", "admin"), envWithRows({
+    users: [{ id: 1, username: "inactive_admin", role: "admin", active: 0 }],
+  }));
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("location"), "/login");
 });

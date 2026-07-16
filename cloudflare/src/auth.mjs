@@ -31,6 +31,19 @@ export async function verifyPassword(password, encoded) {
   return b64(bits) === expected;
 }
 
+export async function hashPassword(password) {
+  const salt = new Uint8Array(16);
+  crypto.getRandomValues(salt);
+  const iterations = 100000;
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    key,
+    256,
+  );
+  return `pbkdf2_sha256$${iterations}$${b64(salt)}$${b64(bits)}`;
+}
+
 export async function createSession(user, secret) {
   const payload = b64(encoder.encode(JSON.stringify({
     id: user.id,
@@ -54,7 +67,13 @@ export async function readSession(request, env) {
   try {
     const user = JSON.parse(new TextDecoder().decode(unb64(payload)));
     if (user.exp < Math.floor(Date.now() / 1000)) return null;
-    return user;
+    try {
+      const current = await env.DB?.prepare("SELECT id, username, role, active FROM users WHERE id=?").bind(user.id).first();
+      if (current) return Number(current.active) ? current : null;
+    } catch {
+      // During first-run setup or unit tests, fall back to the signed session payload.
+    }
+    return Number(user.active) ? user : null;
   } catch {
     return null;
   }

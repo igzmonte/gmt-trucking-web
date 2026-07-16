@@ -1,5 +1,5 @@
 import { canEdit, canView, requireEdit, requireView } from "./access.mjs";
-import { createSession, clearSessionHeaders, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
+import { createSession, clearSessionHeaders, hashPassword, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
 import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
 import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, tripBillableTotal, tripExtraTotal } from "./services.mjs";
@@ -2326,6 +2326,190 @@ async function reportWorkspace(request, env, user, path, { print = false, export
   return html(layout({ title: "Reports", user, path, content: `${reportForm(filters)}${heading}${reportTable(result)}` }));
 }
 
+const USER_ROLES = [
+  ["admin", "Admin"],
+  ["encoder", "Encoder"],
+  ["viewer", "Viewer"],
+  ["accounting", "Accounting"],
+];
+const USER_ROLE_LABELS = Object.fromEntries(USER_ROLES);
+
+function userFilters(url) {
+  return {
+    q: (url.searchParams.get("q") || "").trim(),
+    role: USER_ROLE_LABELS[url.searchParams.get("role")] ? url.searchParams.get("role") : "",
+    active: ["active", "inactive"].includes(url.searchParams.get("active")) ? url.searchParams.get("active") : "",
+  };
+}
+
+function userWhere(filters) {
+  const clauses = [];
+  const params = [];
+  if (filters.q) {
+    clauses.push("(username LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR email LIKE ?)");
+    params.push(...Array(4).fill(`%${filters.q}%`));
+  }
+  if (filters.role) {
+    clauses.push("role=?");
+    params.push(filters.role);
+  }
+  if (filters.active === "active") clauses.push("active=1");
+  if (filters.active === "inactive") clauses.push("active=0");
+  return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+function userParams(filters) {
+  const params = new URLSearchParams();
+  if (filters.q) params.set("q", filters.q);
+  if (filters.role) params.set("role", filters.role);
+  if (filters.active) params.set("active", filters.active);
+  return params;
+}
+
+function userFormValues(data, row = {}) {
+  const role = USER_ROLE_LABELS[data.role] ? data.role : (row.role || "viewer");
+  return {
+    username: (data.username ?? row.username ?? "").trim(),
+    first_name: (data.first_name ?? row.first_name ?? "").trim(),
+    last_name: (data.last_name ?? row.last_name ?? "").trim(),
+    email: (data.email ?? row.email ?? "").trim(),
+    role,
+    active: String(data.active ?? row.active ?? 1) === "0" ? 0 : 1,
+  };
+}
+
+async function activeAdminCount(env, excludeId = null) {
+  const row = excludeId
+    ? await first(env, "SELECT COUNT(*) AS total FROM users WHERE role='admin' AND active=1 AND id<>?", [excludeId])
+    : await first(env, "SELECT COUNT(*) AS total FROM users WHERE role='admin' AND active=1");
+  return Number(row?.total || 0);
+}
+
+async function validateUserForm(env, values, id = null, password = "") {
+  const errors = [];
+  if (!values.username) errors.push("Username is required.");
+  if (!USER_ROLE_LABELS[values.role]) errors.push("Choose a valid role.");
+  const duplicate = values.username
+    ? await first(env, `SELECT id FROM users WHERE username=?${id ? " AND id<>?" : ""} LIMIT 1`, id ? [values.username, id] : [values.username])
+    : null;
+  if (duplicate) errors.push("Username must be unique.");
+  if (!id && !password) errors.push("Password is required.");
+  if (id) {
+    const existing = await first(env, "SELECT * FROM users WHERE id=?", [id]);
+    if (existing && existing.role === "admin" && Number(existing.active) === 1 && (values.role !== "admin" || Number(values.active) !== 1)) {
+      if (await activeAdminCount(env, id) <= 0) errors.push("At least one active admin account is required.");
+    }
+  }
+  return errors;
+}
+
+function userFormContent(row, id = null, errors = []) {
+  const roleOptions = USER_ROLES.map(([value, label]) => `<option value="${esc(value)}"${row.role === value ? " selected" : ""}>${esc(label)}</option>`).join("");
+  const activeOptions = `<option value="1"${Number(row.active ?? 1) === 1 ? " selected" : ""}>Active</option><option value="0"${Number(row.active ?? 1) === 0 ? " selected" : ""}>Inactive</option>`;
+  const fields = [
+    textInput("username", "Username", row.username || "", "required autocomplete=\"username\""),
+    textInput("first_name", "First name", row.first_name || ""),
+    textInput("last_name", "Last name", row.last_name || ""),
+    textInput("email", "Email", row.email || "", "type=\"email\""),
+    `<label>Role<select name="role">${roleOptions}</select></label>`,
+    `<label>Active status<select name="active">${activeOptions}</select></label>`,
+  ];
+  if (!id) fields.push(`<label>Password<input name="password" type="password" autocomplete="new-password" required></label>`);
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const passwordLink = id ? `<a class="button secondary" href="/users/${id}/password">Reset Password</a>` : "";
+  const deactivateForm = id ? `<form method="post" action="/users/${id}/deactivate" class="delete-form" onsubmit="return confirm('Deactivate this user? They will no longer be able to sign in.');"><button class="danger">Deactivate</button><span class="muted">Users are deactivated for safety and audit continuity, not deleted.</span></form>` : "";
+  return `${errorBox}<form method="post" action="${id ? `/users/${id}/edit` : "/users/new"}" class="panel"><div class="grid">${fields.join("")}</div><p><button>Save User</button> <a class="button secondary" href="/users">Cancel</a> ${passwordLink}</p></form>${deactivateForm}`;
+}
+
+async function usersPage(request, env, user, path) {
+  const access = requireView(user, "User Management");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const filters = userFilters(url);
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+  const where = userWhere(filters);
+  const countRow = await first(env, `SELECT COUNT(*) AS total FROM users${where.sql}`, where.params);
+  const rows = await all(env, `SELECT id, username, first_name, last_name, email, role, active, created_at FROM users${where.sql} ORDER BY username, id LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const params = userParams(filters);
+  const roleOptions = `<option value="">All roles</option>${USER_ROLES.map(([value, label]) => `<option value="${esc(value)}"${filters.role === value ? " selected" : ""}>${esc(label)}</option>`).join("")}`;
+  const activeOptions = `<option value="">All users</option><option value="active"${filters.active === "active" ? " selected" : ""}>Active</option><option value="inactive"${filters.active === "inactive" ? " selected" : ""}>Inactive</option>`;
+  const body = rows.map((row) => `<tr><td><a href="/users/${row.id}/edit">${esc(row.username)}</a></td><td>${esc(`${row.first_name || ""} ${row.last_name || ""}`.trim())}</td><td>${esc(row.email || "")}</td><td>${esc(USER_ROLE_LABELS[row.role] || row.role)}</td><td>${Number(row.active) ? "Active" : "Inactive"}</td><td><a href="/users/${row.id}/edit">Edit</a> <a href="/users/${row.id}/password">Password</a></td></tr>`);
+  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(filters.q)}" placeholder="Search users"><select name="role">${roleOptions}</select><select name="active">${activeOptions}</select><button>Search</button></form><div><a class="button" href="/users/new">New User</a> <a class="button secondary" href="/users/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a></div></div>`;
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Username", "Name", "Email", "Role", "Status", "Actions"], body, { empty: "No users found." })}${paginationWithParams("/users", params, page, Number(countRow?.total || 0))}`;
+  return html(layout({ title: "User Management", user, path, content }));
+}
+
+async function userFormPage(request, env, user, path, id = null) {
+  const access = requireEdit(user, "User Management");
+  if (access) return errorResponse(access, user, path);
+  const existing = id ? await first(env, "SELECT * FROM users WHERE id=?", [id]) : null;
+  if (id && !existing) return html(layout({ title: "User Not Found", user, path, content: `<section class="panel"><p class="error">User not found.</p></section>` }), 404);
+  if (request.method === "POST") {
+    const data = await parseForm(request);
+    const values = userFormValues(data, existing || {});
+    const password = (data.password || "").trim();
+    const errors = await validateUserForm(env, values, id, password);
+    if (errors.length) return html(layout({ title: id ? "Edit User" : "New User", user, path, content: userFormContent(values, id, errors) }), 400);
+    if (id) {
+      await run(env, "UPDATE users SET username=?, first_name=?, last_name=?, email=?, role=?, active=? WHERE id=?", [values.username, values.first_name, values.last_name, values.email, values.role, values.active, id]);
+      return redirect(`/users?ok=${encodeURIComponent("User updated.")}`);
+    }
+    const passwordHash = await hashPassword(password);
+    await run(env, "INSERT INTO users (username, password_hash, first_name, last_name, email, role, active) VALUES (?, ?, ?, ?, ?, ?, ?)", [values.username, passwordHash, values.first_name, values.last_name, values.email, values.role, values.active]);
+    return redirect(`/users?ok=${encodeURIComponent("User created.")}`);
+  }
+  return html(layout({ title: id ? "Edit User" : "New User", user, path, content: userFormContent(userFormValues({}, existing || { role: "viewer", active: 1 }), id) }));
+}
+
+function passwordFormContent(target, errors = []) {
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  return `${errorBox}<form method="post" action="/users/${target.id}/password" class="panel"><p class="muted">Reset password for <strong>${esc(target.username)}</strong>. Password hashes are never shown or exported.</p><div class="grid"><label>New password<input name="password" type="password" autocomplete="new-password" required></label><label>Confirm password<input name="confirm_password" type="password" autocomplete="new-password" required></label></div><p><button>Reset Password</button> <a class="button secondary" href="/users/${target.id}/edit">Cancel</a></p></form>`;
+}
+
+async function userPasswordPage(request, env, user, path, id) {
+  const access = requireEdit(user, "User Management");
+  if (access) return errorResponse(access, user, path);
+  const target = await first(env, "SELECT id, username FROM users WHERE id=?", [id]);
+  if (!target) return html(layout({ title: "User Not Found", user, path, content: `<section class="panel"><p class="error">User not found.</p></section>` }), 404);
+  if (request.method === "POST") {
+    const data = await parseForm(request);
+    const password = (data.password || "").trim();
+    const confirm = (data.confirm_password || "").trim();
+    const errors = [];
+    if (!password) errors.push("Password is required.");
+    if (password !== confirm) errors.push("Password confirmation does not match.");
+    if (errors.length) return html(layout({ title: "Reset Password", user, path, content: passwordFormContent(target, errors) }), 400);
+    await run(env, "UPDATE users SET password_hash=? WHERE id=?", [await hashPassword(password), id]);
+    return redirect(`/users?ok=${encodeURIComponent("Password reset.")}`);
+  }
+  return html(layout({ title: "Reset Password", user, path, content: passwordFormContent(target) }));
+}
+
+async function userDeactivatePage(request, env, user, path, id) {
+  const access = requireEdit(user, "User Management");
+  if (access) return errorResponse(access, user, path);
+  if (request.method !== "POST") return html(layout({ title: "Method Not Allowed", user, path, content: `<section class="panel"><p class="error">Deactivate requires POST.</p></section>` }), 405);
+  const target = await first(env, "SELECT * FROM users WHERE id=?", [id]);
+  if (!target) return redirect(`/users?error=${encodeURIComponent("User not found.")}`);
+  if (Number(user.id) === Number(id)) return redirect(`/users?error=${encodeURIComponent("You cannot deactivate your own account.")}`);
+  if (target.role === "admin" && Number(target.active) === 1 && await activeAdminCount(env, id) <= 0) {
+    return redirect(`/users?error=${encodeURIComponent("At least one active admin account is required.")}`);
+  }
+  await run(env, "UPDATE users SET active=0 WHERE id=?", [id]);
+  return redirect(`/users?ok=${encodeURIComponent("User deactivated.")}`);
+}
+
+async function usersExportPage(request, env, user, path) {
+  const access = requireView(user, "User Management");
+  if (access) return errorResponse(access, user, path);
+  const filters = userFilters(new URL(request.url));
+  const where = userWhere(filters);
+  const rows = await all(env, `SELECT username, first_name, last_name, email, role, active FROM users${where.sql} ORDER BY username, id`, where.params);
+  const lines = [quotedCsvRow(["Username", "First Name", "Last Name", "Email", "Role", "Active"])];
+  for (const row of rows) lines.push(quotedCsvRow([row.username, row.first_name, row.last_name, row.email, USER_ROLE_LABELS[row.role] || row.role, Number(row.active) ? "Active" : "Inactive"]));
+  return csv(lines.join("\n"), "users.csv");
+}
+
 async function placeholder(title, user, path, page) {
   const access = requireView(user, page);
   if (access) return errorResponse(access, user, path);
@@ -2425,6 +2609,14 @@ export async function handleRequest(request, env) {
   if (path === "/reports") return reportWorkspace(request, env, user, path);
   if (path === "/reports/print") return reportWorkspace(request, env, user, path, { print: true });
   if (path === "/reports/export.csv") return reportWorkspace(request, env, user, path, { exportCsv: true });
-  if (path === "/users") return placeholder("User Management", user, path, "User Management");
+  if (path === "/users") return usersPage(request, env, user, path);
+  if (path === "/users/new") return userFormPage(request, env, user, path);
+  if (path === "/users/export.csv") return usersExportPage(request, env, user, path);
+  match = path.match(/^\/users\/(\d+)\/edit$/);
+  if (match) return userFormPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/users\/(\d+)\/password$/);
+  if (match) return userPasswordPage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/users\/(\d+)\/deactivate$/);
+  if (match) return userDeactivatePage(request, env, user, path, Number(match[1]));
   return html(layout({ title: "Not Found", user, path, content: `<section class="panel"><p>Route not found.</p></section>` }), 404);
 }
