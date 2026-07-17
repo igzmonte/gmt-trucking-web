@@ -89,6 +89,31 @@ against `import-manifest.json`. For production cutover, use a fresh D1 database
 or manually confirm a safe cleanup before importing; this project intentionally
 does not run destructive replace/wipe SQL from the browser.
 
+## Staged live-use checklist
+
+This Cloudflare app is ready for controlled, real-user testing with sanitized or
+test data after the deployment checklist has been completed. An Admin can open
+`/data-tools/checklist` to see configuration blockers, relationship warnings,
+backup reminders, and the required workflow smoke test.
+
+Before inviting staff:
+
+1. Set a unique long `GMT_SESSION_SECRET` in Cloudflare's encrypted environment
+   settings; do not rely on the placeholder value in `wrangler.toml`.
+2. Sign in as Admin, complete Settings, download `/data-tools/export.json`, and
+   review `/data-tools/checklist`.
+3. Create separate role accounts and complete the staged workflow test in
+   [`docs/STAGED_LIVE_USE.md`](docs/STAGED_LIVE_USE.md).
+
+The readiness checklist does not import or clear data. Production data cutover
+is a separate, manually approved operation: export Django/SQLite SQL and its
+manifest, apply it to a fresh or explicitly prepared D1 database, then compare
+Data Tools counts/control totals with the manifest before allowing live entry.
+
 ## Current implementation status
 
-This is Phase 1 of the rewrite: foundation, schema, auth, layout, dashboard, master data shell, trip shell, report shell, and parity service tests. Django remains the source of truth until every workflow is ported and verified.
+The Cloudflare app now includes authentication/RBAC, master data, recurring
+trips, trips, maintenance, advances, payroll, billing, collections, SOA,
+reports, user management, settings, Data Tools, and printable documents.
+Django remains the parity reference until a dedicated production-cutover
+rehearsal proves the imported data and outputs match.

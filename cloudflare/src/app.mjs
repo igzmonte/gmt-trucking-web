@@ -2703,7 +2703,64 @@ function dataToolsContent(snapshot) {
     "npx wrangler d1 execute gmt-trucking --remote --file=./import.sql",
     "Open /data-tools and compare counts/control totals with import-manifest.json.",
   ].join("\n");
-  return `<section class="panel"><div class="toolbar"><div><h3>Data Tools</h3><p class="muted">Backup and verify the Cloudflare D1 database. Browser import is intentionally disabled; use Wrangler for large imports.</p></div><a class="button" href="/data-tools/export.json">Download JSON Backup</a></div></section>${cards([["Tables tracked", String(DATA_EXPORT_TABLES.length)], ["Total rows", String(Object.values(snapshot.counts).reduce((sum, value) => sum + Number(value || 0), 0))], ["Warnings", String(snapshot.warnings.length)], ["Password hashes", "Excluded"]])}<section class="panel"><h3>Guided Import</h3><p>Back up D1 first, then generate both SQL and a manifest from the approved Django SQLite file. Use a fresh D1 database or manually confirmed cleanup before importing production data. Real Cloudflare users should be managed in User Management, not imported from Django.</p><pre>${esc(commands)}</pre></section><section class="panel"><h3>Financial Control Totals</h3></section>${table(["Control", "Amount"], totalRows, { empty: "No totals found." })}<section class="panel"><h3>Table Counts</h3></section>${table(["Area", "Table", "Rows"], countRows, { empty: "No tables found." })}<section class="panel"><h3>Verification Warnings</h3></section>${table(["Severity", "Warning", "Count"], warningRows, { empty: "No relationship or setup warnings found." })}`;
+  return `<section class="panel"><div class="toolbar"><div><h3>Data Tools</h3><p class="muted">Backup and verify the Cloudflare D1 database. Browser import is intentionally disabled; use Wrangler for large imports.</p></div><div class="toolbar-actions"><a class="button secondary" href="/data-tools/checklist">Staged Live-Use Checklist</a><a class="button secondary" href="/users">User Management</a><a class="button" href="/data-tools/export.json">Download JSON Backup</a></div></div></section>${cards([["Tables tracked", String(DATA_EXPORT_TABLES.length)], ["Total rows", String(Object.values(snapshot.counts).reduce((sum, value) => sum + Number(value || 0), 0))], ["Warnings", String(snapshot.warnings.length)], ["Password hashes", "Excluded"]])}<section class="panel"><h3>Guided Import</h3><p>Back up D1 first, then generate both SQL and a manifest from the approved Django SQLite file. Use a fresh D1 database or manually confirmed cleanup before importing production data. Real Cloudflare users should be managed in User Management, not imported from Django.</p><pre>${esc(commands)}</pre></section><section class="panel"><h3>Financial Control Totals</h3></section>${table(["Control", "Amount"], totalRows, { empty: "No totals found." })}<section class="panel"><h3>Table Counts</h3></section>${table(["Area", "Table", "Rows"], countRows, { empty: "No tables found." })}<section class="panel"><h3>Verification Warnings</h3></section>${table(["Severity", "Warning", "Count"], warningRows, { empty: "No relationship or setup warnings found." })}`;
+}
+
+function isDeploymentSecretSafe(env) {
+  const secret = String(env.GMT_SESSION_SECRET || "").trim();
+  return secret.length >= 32 && secret !== "development-secret" && !secret.startsWith("replace-this");
+}
+
+function stagedReadiness(snapshot, settings, env, previewAdminActive) {
+  const blockers = [];
+  const attention = [];
+  const reminders = ["Download a fresh JSON backup before the staged test and again after it is complete."];
+  const relationshipKeys = new Set(RELATIONSHIP_CHECKS.map(([key]) => key));
+
+  if (snapshot.warnings.some((warning) => warning.key === "missing_active_admin")) {
+    blockers.push("Create or reactivate at least one Admin account in User Management.");
+  }
+  if (!isDeploymentSecretSafe(env)) {
+    blockers.push("Set a unique, long GMT_SESSION_SECRET in Cloudflare before sharing this app with real users.");
+  }
+  for (const warning of snapshot.warnings.filter((item) => relationshipKeys.has(item.key) && Number(item.total) > 0)) {
+    blockers.push(`${warning.message}: ${warning.total}. Repair these relationship records before staged use.`);
+  }
+
+  const hasCompanyContact = Boolean(settings.company_address || settings.company_contact_no || settings.company_email);
+  if (!settings.company_name || !hasCompanyContact) {
+    attention.push("Complete the company profile in Settings so customer-facing printables have a usable company header.");
+  }
+  if (previewAdminActive) {
+    attention.push("The preview account test_admin is active. Reset its password or deactivate it before inviting users outside the test team.");
+  }
+  for (const warning of snapshot.warnings.filter((item) => item.key.startsWith("missing_") && item.key !== "missing_active_admin")) {
+    attention.push(warning.message);
+  }
+
+  const status = blockers.length ? "Blocked" : attention.length ? "Attention Needed" : "Ready";
+  return { status, blockers, attention, reminders };
+}
+
+function readinessItems(items, kind, emptyMessage) {
+  if (!items.length) return `<p class="${kind === "blocked" ? "success" : "muted"}">${esc(emptyMessage)}</p>`;
+  return `<ul class="readiness-list ${esc(kind)}">${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
+}
+
+function dataToolsChecklistContent(readiness) {
+  const statusClass = readiness.status === "Ready" ? "ready" : readiness.status === "Blocked" ? "blocked" : "attention";
+  const stagedSteps = [
+    "Download a D1 JSON backup from Data Tools and save it outside the repository.",
+    "Review Company Profile, company logo, footer text, VAT default, and signature names in Settings.",
+    "Confirm an Admin account exists, then create separate Encoder, Viewer, and Accounting test accounts in User Management.",
+    "Create, edit, export, and guarded-delete one test Employee, Unit, Client, and Supplier.",
+    "Create and print a test Trip Ticket / Waybill, including a recurring-template selection and helper validation.",
+    "Create, print, and reverse one test Payroll entry; verify remaining Vale and Cash Advance balances.",
+    "Create a Billing Statement, record a Collection, print Billing and SOA, then confirm balances and status.",
+    "Load, print, and export a report; ensure customer printables use the saved company header and payslips remain logo-free.",
+    "Sign in as Viewer and Accounting to confirm read-only/finance permissions, then download a final JSON backup.",
+  ];
+  return `<section class="panel readiness-summary ${statusClass}"><span class="dialog-kicker">Staged Live-Use Readiness</span><h3>${esc(readiness.status)}</h3><p>${readiness.status === "Ready" ? "No deployment blockers were found. Complete the staged test below before handling production data." : "Resolve blockers and review attention items before inviting staff to test this deployment."}</p><p><a class="button secondary" href="/data-tools">Back to Data Tools</a> <a class="button" href="/data-tools/export.json">Download JSON Backup</a></p></section><section class="panel"><h3>Blocking Checks</h3>${readinessItems(readiness.blockers, "blocked", "No blocking readiness issues found.")}</section><section class="panel"><h3>Attention Items</h3>${readinessItems(readiness.attention, "attention", "No attention items found.")}</section><section class="panel"><h3>Backup Reminder</h3>${readinessItems(readiness.reminders, "reminder", "No reminders.")}</section><section class="panel"><h3>Required Staged-Test Sequence</h3><ol class="checklist-steps">${stagedSteps.map((step) => `<li>${esc(step)}</li>`).join("")}</ol><p class="muted">This checklist is for sanitized or test data. Production import remains a separate, manually confirmed cutover using the SQL exporter and manifest comparison.</p></section>`;
 }
 
 async function dataToolsPage(request, env, user, path) {
@@ -2711,6 +2768,18 @@ async function dataToolsPage(request, env, user, path) {
   if (access) return errorResponse(access, user, path);
   const snapshot = await dataSnapshot(env);
   return html(layout({ title: "Data Tools", user, path, content: dataToolsContent(snapshot) }));
+}
+
+async function dataToolsChecklistPage(request, env, user, path) {
+  const access = requireView(user, "Data Tools");
+  if (access) return errorResponse(access, user, path);
+  const [snapshot, settings, previewAdmin] = await Promise.all([
+    dataSnapshot(env),
+    loadSettings(env),
+    first(env, "SELECT id FROM users WHERE username=? AND active=1", ["test_admin"]),
+  ]);
+  const readiness = stagedReadiness(snapshot, settings, env, Boolean(previewAdmin));
+  return html(layout({ title: "Staged Live-Use Checklist", user, path, content: dataToolsChecklistContent(readiness) }));
 }
 
 async function dataToolsExportPage(request, env, user, path) {
@@ -2915,7 +2984,20 @@ async function placeholder(title, user, path, page) {
   return html(layout({ title, user, path, content: `<section class="panel"><p>${esc(title)} route is wired for the Cloudflare rewrite. Full workflow parity will be ported from Django in the matching migration phase.</p></section>` }));
 }
 
+function unavailablePage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GMT Trucking temporarily unavailable</title><link rel="stylesheet" href="/app.css"></head><body class="login"><section class="login-card"><h1>GMT Trucking</h1><h2>Application setup required</h2><p>The application could not reach its required setup data. No data was changed.</p><p class="muted">An administrator should verify the Cloudflare D1 database binding and setup, then sign in and open Data Tools for the staged live-use checklist.</p><p><a class="button" href="/login">Return to sign in</a></p></section></body></html>`;
+}
+
 export async function handleRequest(request, env) {
+  try {
+    return await handleApplicationRequest(request, env);
+  } catch (error) {
+    console.error("GMT Cloudflare request failed", { path: new URL(request.url).pathname, error: String(error?.stack || error) });
+    return html(unavailablePage(), 503);
+  }
+}
+
+async function handleApplicationRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/$/, "") || "/";
   if (path === "/health") return json({ ok: true, runtime: "cloudflare", database: Boolean(env.DB) });
@@ -3010,6 +3092,7 @@ export async function handleRequest(request, env) {
   if (path === "/reports/export.csv") return reportWorkspace(request, env, user, path, { exportCsv: true });
   if (path === "/settings") return settingsPage(request, env, user, path);
   if (path === "/data-tools") return dataToolsPage(request, env, user, path);
+  if (path === "/data-tools/checklist") return dataToolsChecklistPage(request, env, user, path);
   if (path === "/data-tools/export.json") return dataToolsExportPage(request, env, user, path);
   if (path === "/users") return usersPage(request, env, user, path);
   if (path === "/users/new") return userFormPage(request, env, user, path);

@@ -287,8 +287,8 @@ function envWithRows(rows = {}) {
   };
 }
 
-async function authedRequest(url, role = "admin", init = {}) {
-  const token = await createSession({ id: 1, username: role, role, active: 1 }, "test-secret");
+async function authedRequest(url, role = "admin", init = {}, secret = "test-secret") {
+  const token = await createSession({ id: 1, username: role, role, active: 1 }, secret);
   const headers = new Headers(init.headers || {});
   headers.set("cookie", `gmt_session=${token}`);
   return new Request(url, { ...init, headers });
@@ -1981,7 +1981,7 @@ test("data tools page and JSON backup are admin-only and exclude password hashes
     payables: [{ id: 8, payable_date: "2026-07-31", amount: 300, status: "Open", supplier_id: 7 }],
     vale: [{ id: 9, employee_id: 3, date_granted: "2026-07-01", amount: 1000, balance: 250, status: "Open" }],
     cashAdvances: [{ id: 10, employee_id: 3, date_granted: "2026-07-01", amount: 500, balance: 125, status: "Open" }],
-    settings: companySettings(),
+    settings: companySettings({ company_logo_data_url: "data:image/png;base64,TE9HTw==" }),
   });
 
   let response = await handleRequest(await authedRequest("https://example.test/data-tools", "admin"), env);
@@ -1992,6 +1992,8 @@ test("data tools page and JSON backup are admin-only and exclude password hashes
   assert.match(text, /Financial Control Totals/);
   assert.match(text, /Trips billable total/);
   assert.match(text, /Password hashes/);
+  assert.match(text, /Staged Live-Use Checklist/);
+  assert.match(text, /User Management/);
 
   response = await handleRequest(await authedRequest("https://example.test/data-tools/export.json", "admin"), env);
   text = await response.text();
@@ -2008,6 +2010,7 @@ test("data tools page and JSON backup are admin-only and exclude password hashes
   assert.equal(backup.controls.payables.open_total, 300);
   assert.equal(backup.tables.users[0].username, "admin");
   assert.equal("password_hash" in backup.tables.users[0], false);
+  assert.equal(backup.tables.system_settings.find((row) => row.key === "company_logo_data_url")?.value, "data:image/png;base64,TE9HTw==");
 
   for (const role of ["encoder", "viewer", "accounting"]) {
     response = await handleRequest(await authedRequest("https://example.test/data-tools", role), envWithRows());
@@ -2029,6 +2032,76 @@ test("data tools verification reports relationship warnings", async () => {
   assert.match(text, /Trip helpers with missing employees/);
   assert.match(text, />2<\/td>/);
   assert.match(text, />1<\/td>/);
+});
+
+test("staged live-use checklist reports ready, attention, and blocking conditions", async () => {
+  const safeSecret = "stage-ready-session-secret-that-is-long-enough";
+  const readyEnv = envWithRows({
+    users: [{ id: 1, username: "admin", role: "admin", active: 1 }],
+    employees: [payrollEmployee()],
+    assets: [{ id: 2, asset_code: "UNIT-001", asset_type: "Truck" }],
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    suppliers: [{ id: 7, supplier_name: "Parts Supplier" }],
+    settings: companySettings(),
+  });
+  readyEnv.GMT_SESSION_SECRET = safeSecret;
+
+  let response = await handleRequest(await authedRequest("https://example.test/data-tools/checklist", "admin", {}, safeSecret), readyEnv);
+  let text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Staged Live-Use Readiness/);
+  assert.match(text, /<h3>Ready<\/h3>/);
+  assert.match(text, /Required Staged-Test Sequence/);
+  assert.match(text, /Trip Ticket \/ Waybill/);
+  assert.match(text, /Download a fresh JSON backup/);
+
+  const attentionEnv = envWithRows({
+    users: [{ id: 1, username: "test_admin", role: "admin", active: 1 }],
+    settings: companySettings({ company_address: "", company_contact_no: "", company_email: "" }),
+  });
+  attentionEnv.GMT_SESSION_SECRET = safeSecret;
+  response = await handleRequest(await authedRequest("https://example.test/data-tools/checklist", "admin", {}, safeSecret), attentionEnv);
+  text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /<h3>Attention Needed<\/h3>/);
+  assert.match(text, /preview account test_admin is active/);
+  assert.match(text, /Complete the company profile/);
+  assert.match(text, /No employees records found yet/);
+
+  response = await handleRequest(await authedRequest("https://example.test/data-tools/checklist", "admin"), envWithRows({
+    users: [],
+    orphanCounts: { billing_lines_missing_trips: 2 },
+  }));
+  text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /<h3>Blocked<\/h3>/);
+  assert.match(text, /Create or reactivate at least one Admin account/);
+  assert.match(text, /Set a unique, long GMT_SESSION_SECRET/);
+  assert.match(text, /Billing lines with missing trips: 2/);
+
+  for (const role of ["encoder", "viewer", "accounting"]) {
+    response = await handleRequest(await authedRequest("https://example.test/data-tools/checklist", role), envWithRows());
+    assert.equal(response.status, 403);
+  }
+});
+
+test("database setup failures return a safe 503 page instead of a Worker exception", async () => {
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let response;
+  try {
+    response = await handleRequest(new Request("https://example.test/login", {
+      method: "POST",
+      body: new URLSearchParams({ username: "admin", password: "not-used" }),
+    }), { GMT_SESSION_SECRET: "safe-session-secret-for-error-boundary" });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  const text = await response.text();
+  assert.equal(response.status, 503);
+  assert.match(text, /Application setup required/);
+  assert.match(text, /Cloudflare D1 database binding and setup/);
+  assert.doesNotMatch(text, /TypeError|prepare|stack|undefined/);
 });
 
 test("user management lists filters and exports users without password hashes", async () => {
