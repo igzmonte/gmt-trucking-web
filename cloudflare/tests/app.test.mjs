@@ -11,7 +11,21 @@ function envWithRows(rows = {}) {
     DB: {
       prepare(sql) {
         const state = { sql, params: [] };
-        const source = (table) => rows[table] || [];
+        const rowKey = (table) => ({
+          billing_statements: "billing",
+          billing_lines: "billingLines",
+          billing_adjustments: "billingAdjustments",
+          cash_advances: "cashAdvances",
+          payroll_entries: "payroll",
+          payroll_trips: "payrollTrips",
+          payroll_additional_lines: "payrollLines",
+          recurring_trip_masters: "recurring",
+          system_settings: "settings",
+          trip_employee_pay_items: "payItems",
+          trip_helpers: "tripHelpers",
+          vale_records: "vale",
+        })[table] || table;
+        const source = (table) => rows[rowKey(table)] || [];
         const byId = (table) => source(table).find((row) => Number(row.id) === Number(state.params.at(-1)));
         const userRows = () => rows.users || (rows.user ? [rows.user] : []);
         const filtered = (table) => {
@@ -106,6 +120,10 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("FROM clients")) return { results: filtered("clients").slice(0, 25) };
             if (state.sql.includes("FROM suppliers")) return { results: filtered("suppliers").slice(0, 25) };
             if (state.sql.includes("FROM system_settings")) return { results: rows.settings || [] };
+            if (state.sql.trim().startsWith("SELECT ")) {
+              const table = tableFrom();
+              if (table) return { results: source(table) };
+            }
             return { results: [] };
           },
           async first() {
@@ -165,6 +183,10 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("COUNT(*) AS total FROM assets")) return { total: rows.assetsCount ?? source("assets").length };
             if (state.sql.includes("COUNT(*) AS total FROM clients")) return { total: rows.clientsCount ?? source("clients").length };
             if (state.sql.includes("COUNT(*) AS total FROM suppliers")) return { total: rows.suppliersCount ?? source("suppliers").length };
+            if (state.sql.includes("COUNT(*) AS total FROM") && !state.sql.includes("LEFT JOIN")) {
+              const table = tableFrom();
+              if (table) return { total: source(table).length };
+            }
             if (state.sql.includes("SELECT t.*,") && state.sql.includes("FROM trips t")) return byId("trips") || null;
             if (state.sql.includes("SELECT trip_ticket_no FROM trips WHERE trip_ticket_no LIKE")) return rows.lastTicket || null;
             if (state.sql.includes("SELECT id FROM trips WHERE trip_ticket_no=?")) {
@@ -197,6 +219,54 @@ function envWithRows(rows = {}) {
               if (rows.duplicate) return { id: rows.duplicate };
               return null;
             }
+            const orphanSql = [
+              ["trip_helpers_missing_trips", "FROM trip_helpers th LEFT JOIN trips"],
+              ["trip_helpers_missing_employees", "FROM trip_helpers th LEFT JOIN employees"],
+              ["trip_pay_items_missing_trips", "FROM trip_employee_pay_items pi LEFT JOIN trips"],
+              ["trips_missing_clients", "FROM trips t LEFT JOIN clients"],
+              ["trips_missing_assets", "FROM trips t LEFT JOIN assets"],
+              ["trips_missing_drivers", "FROM trips t LEFT JOIN employees"],
+              ["recurring_missing_clients", "FROM recurring_trip_masters r LEFT JOIN clients"],
+              ["repairs_missing_assets", "FROM repairs r LEFT JOIN assets"],
+              ["repairs_missing_suppliers", "FROM repairs r LEFT JOIN suppliers"],
+              ["payables_missing_suppliers", "FROM payables p LEFT JOIN suppliers"],
+              ["vale_missing_employees", "FROM vale_records v LEFT JOIN employees"],
+              ["cash_missing_employees", "FROM cash_advances c LEFT JOIN employees"],
+              ["payroll_trips_missing_entries", "FROM payroll_trips pt LEFT JOIN payroll_entries"],
+              ["payroll_trips_missing_trips", "FROM payroll_trips pt LEFT JOIN trips"],
+              ["payroll_lines_missing_entries", "FROM payroll_additional_lines pl LEFT JOIN payroll_entries"],
+              ["billing_lines_missing_statements", "FROM billing_lines bl LEFT JOIN billing_statements"],
+              ["billing_lines_missing_trips", "FROM billing_lines bl LEFT JOIN trips"],
+              ["billing_adjustments_missing_statements", "FROM billing_adjustments ba LEFT JOIN billing_statements"],
+              ["collections_missing_billing", "FROM collections co LEFT JOIN billing_statements"],
+              ["collections_missing_clients", "FROM collections co LEFT JOIN clients"],
+            ].find(([, marker]) => state.sql.includes(marker));
+            if (orphanSql) return { total: rows.orphanCounts?.[orphanSql[0]] || 0 };
+            if (state.sql.includes("SUM(base_trip_rate)") && state.sql.includes("FROM trips")) {
+              const trips = source("trips");
+              const extra = (trip) => ["fuel_surcharge", "loading_fee", "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges"].reduce((total, field) => total + Number(trip[field] || 0), 0);
+              return {
+                count: trips.length,
+                base_total: trips.reduce((total, trip) => total + Number(trip.base_trip_rate || 0), 0),
+                extra_total: trips.reduce((total, trip) => total + extra(trip), 0),
+                billable_total: trips.reduce((total, trip) => total + Number(trip.base_trip_rate || 0) + extra(trip), 0),
+              };
+            }
+            if (state.sql.includes("SUM(gross_pay)") && state.sql.includes("FROM payroll_entries")) {
+              const payroll = source("payroll_entries");
+              const deductions = (row) => ["vale_deduction", "cash_advance_deduction", "sss", "philhealth", "pagibig", "withholding_tax", "change_deduction", "other_deduction"].reduce((total, field) => total + Number(row[field] || 0), 0);
+              return {
+                gross_total: payroll.reduce((total, row) => total + Number(row.gross_pay || 0), 0),
+                additional_total: payroll.reduce((total, row) => total + Number(row.additional_pay || 0), 0),
+                deduction_total: payroll.reduce((total, row) => total + deductions(row), 0),
+                net_total: payroll.reduce((total, row) => total + Number(row.net_pay || 0), 0),
+              };
+            }
+            if (state.sql.includes("SUM(grand_total)") && state.sql.includes("FROM billing_statements")) return { grand_total: sum("billing_statements", "grand_total") };
+            if (state.sql.includes("SUM(amount_paid)") && state.sql.includes("FROM collections")) return { paid_total: sum("collections", "amount_paid") };
+            if (state.sql.includes("SUM(amount)") && state.sql.includes("FROM payables") && state.sql.includes("status IN")) return { open_total: sum("payables", "amount", (row) => ["Open", "Partial"].includes(row.status)) };
+            if (state.sql.includes("SUM(balance)") && state.sql.includes("FROM vale_records") && state.sql.includes("status='Open'")) return { open_balance: sum("vale_records", "balance", (row) => row.status === "Open") };
+            if (state.sql.includes("SUM(balance)") && state.sql.includes("FROM cash_advances") && state.sql.includes("status='Open'")) return { open_balance: sum("cash_advances", "balance", (row) => row.status === "Open") };
             if (state.sql.includes("SUM(grand_total)") && state.sql.includes("FROM billing_statements")) return { total: sum("billing", "grand_total") };
             if (state.sql.includes("SUM(amount_paid)") && state.sql.includes("FROM collections")) return { total: sum("collections", "amount_paid") };
             if (state.sql.includes("SUM(net_pay)") && state.sql.includes("FROM payroll_entries")) return { total: sum("payroll", "net_pay") };
@@ -1736,6 +1806,71 @@ test("company settings flow into printables and billing VAT defaults", async () 
   assert.equal(response.status, 200);
   assert.match(text, /name="vat_enabled" value="1" checked/);
   assert.match(text, /₱ 129\.00/);
+});
+
+test("data tools page and JSON backup are admin-only and exclude password hashes", async () => {
+  const env = envWithRows({
+    users: [{ id: 1, username: "admin", password_hash: "should-not-export", first_name: "A", last_name: "Admin", email: "a@example.test", role: "admin", active: 1, created_at: "2026-07-17" }],
+    employees: [payrollEmployee()],
+    assets: [{ id: 2, asset_code: "UNIT-001", asset_type: "Truck", plate_no: "ABC-123" }],
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One", billing_address: "Client Address" }],
+    suppliers: [{ id: 7, supplier_name: "Parts Supplier" }],
+    trips: [sampleTrip({ status: "Completed" })],
+    payroll: [payrollEntry()],
+    billing: [billingEntry()],
+    billingLines: [billingLine()],
+    collections: [collectionEntry()],
+    payables: [{ id: 8, payable_date: "2026-07-31", amount: 300, status: "Open", supplier_id: 7 }],
+    vale: [{ id: 9, employee_id: 3, date_granted: "2026-07-01", amount: 1000, balance: 250, status: "Open" }],
+    cashAdvances: [{ id: 10, employee_id: 3, date_granted: "2026-07-01", amount: 500, balance: 125, status: "Open" }],
+    settings: companySettings(),
+  });
+
+  let response = await handleRequest(await authedRequest("https://example.test/data-tools", "admin"), env);
+  let text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Data Tools/);
+  assert.match(text, /Download JSON Backup/);
+  assert.match(text, /Financial Control Totals/);
+  assert.match(text, /Trips billable total/);
+  assert.match(text, /Password hashes/);
+
+  response = await handleRequest(await authedRequest("https://example.test/data-tools/export.json", "admin"), env);
+  text = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
+  assert.match(response.headers.get("content-disposition"), /gmt-d1-backup-/);
+  assert.doesNotMatch(text, /password_hash/);
+  assert.doesNotMatch(text, /should-not-export/);
+  const backup = JSON.parse(text);
+  assert.equal(backup.metadata.credentials_excluded, true);
+  assert.equal(backup.metadata.browser_import_supported, false);
+  assert.equal(backup.counts.trips, 1);
+  assert.equal(backup.controls.billing.receivable_balance, 754);
+  assert.equal(backup.controls.payables.open_total, 300);
+  assert.equal(backup.tables.users[0].username, "admin");
+  assert.equal("password_hash" in backup.tables.users[0], false);
+
+  for (const role of ["encoder", "viewer", "accounting"]) {
+    response = await handleRequest(await authedRequest("https://example.test/data-tools", role), envWithRows());
+    assert.equal(response.status, 403);
+  }
+});
+
+test("data tools verification reports relationship warnings", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/data-tools", "admin"), envWithRows({
+    users: [{ id: 1, username: "admin", role: "admin", active: 1 }],
+    orphanCounts: {
+      billing_lines_missing_trips: 2,
+      trip_helpers_missing_employees: 1,
+    },
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Billing lines with missing trips/);
+  assert.match(text, /Trip helpers with missing employees/);
+  assert.match(text, />2<\/td>/);
+  assert.match(text, />1<\/td>/);
 });
 
 test("user management lists filters and exports users without password hashes", async () => {

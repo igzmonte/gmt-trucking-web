@@ -37,8 +37,10 @@ test("running number and dropdown labels stay readable", () => {
 
 test("role permissions match current Django matrix", () => {
   assert.equal(canEdit({ role: "admin", active: 1 }, "User Management"), true);
+  assert.equal(canView({ role: "admin", active: 1 }, "Data Tools"), true);
   assert.equal(canEdit({ role: "encoder", active: 1 }, "Trips"), true);
   assert.equal(canView({ role: "viewer", active: 1 }, "Reports"), true);
+  assert.equal(canView({ role: "viewer", active: 1 }, "Data Tools"), false);
   assert.equal(canEdit({ role: "viewer", active: 1 }, "Reports"), false);
   assert.equal(canView({ role: "accounting", active: 1 }, "Employees"), false);
   assert.equal(canEdit({ role: "accounting", active: 1 }, "Billing"), true);

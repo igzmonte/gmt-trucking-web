@@ -7,7 +7,7 @@ const nav = [
   ["Maintenance", [["Repairs", "/repairs"]]],
   ["Master Data", [["Employees", "/employees"], ["Fleet / Equipment", "/fleet"], ["Clients", "/clients"], ["Suppliers", "/suppliers"]]],
   ["Finance", [["Payroll", "/payroll"], ["Billing", "/billing"], ["Collections", "/collections"], ["Payables", "/payables"], ["Reports", "/reports"]]],
-  ["System", [["User Management", "/users"], ["Settings", "/settings"]]],
+  ["System", [["User Management", "/users"], ["Settings", "/settings"], ["Data Tools", "/data-tools"]]],
 ];
 
 export function layout({ title, user, path = "/", content }) {

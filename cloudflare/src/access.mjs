@@ -1,5 +1,5 @@
 export const ROLE_PAGE_ACCESS = {
-  admin: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports", "Settings", "User Management"]),
+  admin: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports", "Settings", "User Management", "Data Tools"]),
   encoder: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance"]),
   viewer: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports"]),
   accounting: new Set(["Dashboard", "Payroll", "Billing", "Collections", "Payables", "Reports"]),

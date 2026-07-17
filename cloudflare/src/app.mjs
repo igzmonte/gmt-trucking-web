@@ -2445,6 +2445,195 @@ async function settingsPage(request, env, user, path) {
   return html(layout({ title: "Settings", user, path, content: settingsFormContent(await loadSettings(env), url) }));
 }
 
+const DATA_EXPORT_TABLES = [
+  { table: "users", label: "Users", order: "id", columns: ["id", "username", "first_name", "last_name", "email", "role", "active", "created_at"] },
+  { table: "employees", label: "Employees", order: "id", columns: ["id", "employee_code", "full_name", "employee_type", "contact_no", "address", "date_hired", "employment_status", "payroll_basis", "daily_rate", "trip_rate", "notes", "active"] },
+  { table: "assets", label: "Fleet / Equipment", order: "id", columns: ["id", "asset_code", "asset_type", "plate_no", "make_model", "capacity_desc", "status", "assigned_employee_id", "notes"] },
+  { table: "clients", label: "Clients", order: "id", columns: ["id", "client_code", "client_name", "billing_address", "contact_person", "contact_no", "terms_days", "notes", "active"] },
+  { table: "suppliers", label: "Suppliers", order: "id", columns: ["id", "supplier_name", "contact_person", "contact_no", "address", "notes"] },
+  { table: "recurring_trip_masters", label: "Recurring Trips", order: "id", columns: ["id", "master_code", "client_id", "job_description", "origin", "destination", "default_asset_id", "default_driver_id", "default_helper_count", "standard_base_rate", "driver_pay_rate", "helper_pay_rate", "default_extra_note", "remarks", "active"] },
+  { table: "trips", label: "Trips", order: "id", columns: ["id", "trip_ticket_no", "reference_no", "trip_type", "recurring_master_id", "trip_date", "client_id", "job_description", "origin", "destination", "asset_id", "driver_id", "dispatch_time", "arrival_time", "status", "base_trip_rate", "driver_pay_rate", "helper_pay_rate", "driver_additional_pay", "helper_additional_pay", "fuel_surcharge", "loading_fee", "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges", "notes"] },
+  { table: "trip_helpers", label: "Trip Helpers", order: "id", columns: ["id", "trip_id", "employee_id", "helper_order"] },
+  { table: "trip_employee_pay_items", label: "Trip Pay Items", order: "id", columns: ["id", "trip_id", "employee_type", "label", "amount", "sort_order"] },
+  { table: "repairs", label: "Repairs", order: "id", columns: ["id", "repair_date", "asset_id", "repair_description", "meter_value", "supplier_id", "parts_cost", "labor_cost", "other_cost", "total_cost", "status", "notes", "auto_generate_payable"] },
+  { table: "payables", label: "Payables", order: "id", columns: ["id", "payable_date", "supplier_id", "source_type", "reference_no", "description", "amount", "due_date", "status", "notes", "linked_repair_id"] },
+  { table: "vale_records", label: "Vale", order: "id", columns: ["id", "employee_id", "date_granted", "amount", "installment_amount", "balance", "status", "notes"] },
+  { table: "cash_advances", label: "Cash Advances", order: "id", columns: ["id", "employee_id", "date_granted", "amount", "balance", "applied", "status", "notes"] },
+  { table: "payroll_entries", label: "Payroll Entries", order: "id", columns: ["id", "pay_date", "period_from", "period_to", "employee_id", "employee_type", "payroll_basis", "unit_description", "trips_count", "days_count", "gross_pay", "additional_pay", "driver_trip_additional_pay", "helper_trip_additional_pay", "vale_deduction", "cash_advance_deduction", "sss", "philhealth", "pagibig", "withholding_tax", "change_deduction", "other_deduction", "net_pay", "remarks"] },
+  { table: "payroll_trips", label: "Payroll Trips", order: "id", columns: ["id", "payroll_id", "trip_id", "employee_id"] },
+  { table: "payroll_additional_lines", label: "Payroll Additional Lines", order: "id", columns: ["id", "payroll_id", "employee_type", "label", "amount", "sort_order"] },
+  { table: "billing_statements", label: "Billing Statements", order: "id", columns: ["id", "billing_no", "client_id", "billing_date", "period_from", "period_to", "base_charges_total", "extra_charges_total", "gross_total", "vat_enabled", "vat_amount", "additions_total", "deductions_total", "grand_total", "status", "notes"] },
+  { table: "billing_lines", label: "Billing Lines", order: "id", columns: ["id", "billing_id", "trip_id", "amount_base", "amount_extra", "amount_total"] },
+  { table: "billing_adjustments", label: "Billing Adjustments", order: "id", columns: ["id", "billing_id", "line_type", "label", "amount", "sort_order"] },
+  { table: "collections", label: "Collections", order: "id", columns: ["id", "collection_date", "client_id", "billing_id", "amount_paid", "reference_no", "payment_method", "notes"] },
+  { table: "system_settings", label: "System Settings", order: "key", columns: ["key", "value"] },
+];
+
+const RELATIONSHIP_CHECKS = [
+  ["trip_helpers_missing_trips", "Trip helpers with missing trips", "SELECT COUNT(*) AS total FROM trip_helpers th LEFT JOIN trips t ON t.id=th.trip_id WHERE t.id IS NULL"],
+  ["trip_helpers_missing_employees", "Trip helpers with missing employees", "SELECT COUNT(*) AS total FROM trip_helpers th LEFT JOIN employees e ON e.id=th.employee_id WHERE e.id IS NULL"],
+  ["trip_pay_items_missing_trips", "Trip pay items with missing trips", "SELECT COUNT(*) AS total FROM trip_employee_pay_items pi LEFT JOIN trips t ON t.id=pi.trip_id WHERE t.id IS NULL"],
+  ["trips_missing_clients", "Trips with missing clients", "SELECT COUNT(*) AS total FROM trips t LEFT JOIN clients c ON c.id=t.client_id WHERE t.client_id IS NOT NULL AND c.id IS NULL"],
+  ["trips_missing_assets", "Trips with missing assets", "SELECT COUNT(*) AS total FROM trips t LEFT JOIN assets a ON a.id=t.asset_id WHERE t.asset_id IS NOT NULL AND a.id IS NULL"],
+  ["trips_missing_drivers", "Trips with missing drivers", "SELECT COUNT(*) AS total FROM trips t LEFT JOIN employees e ON e.id=t.driver_id WHERE t.driver_id IS NOT NULL AND e.id IS NULL"],
+  ["recurring_missing_clients", "Recurring trips with missing clients", "SELECT COUNT(*) AS total FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id WHERE r.client_id IS NOT NULL AND c.id IS NULL"],
+  ["repairs_missing_assets", "Repairs with missing assets", "SELECT COUNT(*) AS total FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id WHERE r.asset_id IS NOT NULL AND a.id IS NULL"],
+  ["repairs_missing_suppliers", "Repairs with missing suppliers", "SELECT COUNT(*) AS total FROM repairs r LEFT JOIN suppliers s ON s.id=r.supplier_id WHERE r.supplier_id IS NOT NULL AND s.id IS NULL"],
+  ["payables_missing_suppliers", "Payables with missing suppliers", "SELECT COUNT(*) AS total FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id WHERE p.supplier_id IS NOT NULL AND s.id IS NULL"],
+  ["vale_missing_employees", "Vale records with missing employees", "SELECT COUNT(*) AS total FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id WHERE e.id IS NULL"],
+  ["cash_missing_employees", "Cash advances with missing employees", "SELECT COUNT(*) AS total FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id WHERE e.id IS NULL"],
+  ["payroll_trips_missing_entries", "Payroll trip links with missing payroll entries", "SELECT COUNT(*) AS total FROM payroll_trips pt LEFT JOIN payroll_entries p ON p.id=pt.payroll_id WHERE p.id IS NULL"],
+  ["payroll_trips_missing_trips", "Payroll trip links with missing trips", "SELECT COUNT(*) AS total FROM payroll_trips pt LEFT JOIN trips t ON t.id=pt.trip_id WHERE t.id IS NULL"],
+  ["payroll_lines_missing_entries", "Payroll additional lines with missing payroll entries", "SELECT COUNT(*) AS total FROM payroll_additional_lines pl LEFT JOIN payroll_entries p ON p.id=pl.payroll_id WHERE p.id IS NULL"],
+  ["billing_lines_missing_statements", "Billing lines with missing billing statements", "SELECT COUNT(*) AS total FROM billing_lines bl LEFT JOIN billing_statements b ON b.id=bl.billing_id WHERE b.id IS NULL"],
+  ["billing_lines_missing_trips", "Billing lines with missing trips", "SELECT COUNT(*) AS total FROM billing_lines bl LEFT JOIN trips t ON t.id=bl.trip_id WHERE t.id IS NULL"],
+  ["billing_adjustments_missing_statements", "Billing adjustments with missing billing statements", "SELECT COUNT(*) AS total FROM billing_adjustments ba LEFT JOIN billing_statements b ON b.id=ba.billing_id WHERE b.id IS NULL"],
+  ["collections_missing_billing", "Collections with missing billing statements", "SELECT COUNT(*) AS total FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id WHERE co.billing_id IS NOT NULL AND b.id IS NULL"],
+  ["collections_missing_clients", "Collections with missing clients", "SELECT COUNT(*) AS total FROM collections co LEFT JOIN clients c ON c.id=co.client_id WHERE co.client_id IS NOT NULL AND c.id IS NULL"],
+];
+
+async function dataCounts(env) {
+  const pairs = await Promise.all(DATA_EXPORT_TABLES.map(async (spec) => {
+    const row = await first(env, `SELECT COUNT(*) AS total FROM ${spec.table}`);
+    return [spec.table, Number(row?.total || 0)];
+  }));
+  return Object.fromEntries(pairs);
+}
+
+async function dataControlTotals(env) {
+  const [trips, payroll, billing, collections, payables, vale, cash] = await Promise.all([
+    first(env, "SELECT COUNT(*) AS count, COALESCE(SUM(base_trip_rate),0) AS base_total, COALESCE(SUM(fuel_surcharge + loading_fee + unloading_fee + waiting_fee + tolls + additional_stop_charge + special_handling_fee + other_charges),0) AS extra_total, COALESCE(SUM(base_trip_rate + fuel_surcharge + loading_fee + unloading_fee + waiting_fee + tolls + additional_stop_charge + special_handling_fee + other_charges),0) AS billable_total FROM trips"),
+    first(env, "SELECT COALESCE(SUM(gross_pay),0) AS gross_total, COALESCE(SUM(additional_pay),0) AS additional_total, COALESCE(SUM(vale_deduction + cash_advance_deduction + sss + philhealth + pagibig + withholding_tax + change_deduction + other_deduction),0) AS deduction_total, COALESCE(SUM(net_pay),0) AS net_total FROM payroll_entries"),
+    first(env, "SELECT COALESCE(SUM(grand_total),0) AS grand_total FROM billing_statements"),
+    first(env, "SELECT COALESCE(SUM(amount_paid),0) AS paid_total FROM collections"),
+    first(env, "SELECT COALESCE(SUM(amount),0) AS open_total FROM payables WHERE status IN ('Open','Partial')"),
+    first(env, "SELECT COALESCE(SUM(balance),0) AS open_balance FROM vale_records WHERE status='Open'"),
+    first(env, "SELECT COALESCE(SUM(balance),0) AS open_balance FROM cash_advances WHERE status='Open'"),
+  ]);
+  const billingGrand = numeric(billing?.grand_total);
+  const collectionPaid = numeric(collections?.paid_total);
+  return {
+    trips: {
+      count: Number(trips?.count || 0),
+      base_total: numeric(trips?.base_total),
+      extra_total: numeric(trips?.extra_total),
+      billable_total: numeric(trips?.billable_total),
+    },
+    payroll: {
+      gross_total: numeric(payroll?.gross_total),
+      additional_total: numeric(payroll?.additional_total),
+      deduction_total: numeric(payroll?.deduction_total),
+      net_total: numeric(payroll?.net_total),
+    },
+    billing: {
+      grand_total: billingGrand,
+      collections_total: collectionPaid,
+      receivable_balance: billingGrand - collectionPaid,
+    },
+    payables: { open_total: numeric(payables?.open_total) },
+    advances: {
+      open_vale_balance: numeric(vale?.open_balance),
+      open_cash_advance_balance: numeric(cash?.open_balance),
+    },
+  };
+}
+
+async function dataWarnings(env, counts) {
+  const relationshipWarnings = [];
+  for (const [key, label, sql] of RELATIONSHIP_CHECKS) {
+    const row = await first(env, sql);
+    const total = Number(row?.total || 0);
+    if (total) relationshipWarnings.push({ key, severity: "warning", message: label, total });
+  }
+  const setupWarnings = [];
+  const activeAdmins = await first(env, "SELECT COUNT(*) AS total FROM users WHERE role='admin' AND active=1");
+  if (!Number(activeAdmins?.total || 0)) setupWarnings.push({ key: "missing_active_admin", severity: "critical", message: "No active admin user exists.", total: 0 });
+  for (const [tableName, label] of [["employees", "employees"], ["clients", "clients"], ["assets", "fleet/equipment"], ["suppliers", "suppliers"]]) {
+    if (!Number(counts[tableName] || 0)) setupWarnings.push({ key: `missing_${tableName}`, severity: "info", message: `No ${label} records found yet.`, total: 0 });
+  }
+  return [...setupWarnings, ...relationshipWarnings];
+}
+
+async function dataTableRows(env) {
+  const entries = await Promise.all(DATA_EXPORT_TABLES.map(async (spec) => {
+    const rows = await all(env, `SELECT ${spec.columns.join(", ")} FROM ${spec.table} ORDER BY ${spec.order}`);
+    const safeRows = spec.table === "users" ? rows.map(({ password_hash, ...row }) => row) : rows;
+    return [spec.table, safeRows];
+  }));
+  return Object.fromEntries(entries);
+}
+
+async function dataSnapshot(env, { includeRows = false } = {}) {
+  const counts = await dataCounts(env);
+  const [controls, warnings, tables] = await Promise.all([
+    dataControlTotals(env),
+    dataWarnings(env, counts),
+    includeRows ? dataTableRows(env) : Promise.resolve(undefined),
+  ]);
+  return {
+    metadata: {
+      app: "GMT Trucking Cloudflare",
+      generated_at: new Date().toISOString(),
+      schema: "cloudflare-d1-v1",
+      credentials_excluded: true,
+      browser_import_supported: false,
+    },
+    counts,
+    controls,
+    warnings,
+    ...(includeRows ? { tables } : {}),
+  };
+}
+
+function moneySummaryRows(controls) {
+  return [
+    ["Trips base total", controls.trips.base_total],
+    ["Trips extra total", controls.trips.extra_total],
+    ["Trips billable total", controls.trips.billable_total],
+    ["Payroll gross", controls.payroll.gross_total],
+    ["Payroll deductions", controls.payroll.deduction_total],
+    ["Payroll net", controls.payroll.net_total],
+    ["Billing grand total", controls.billing.grand_total],
+    ["Collections total", controls.billing.collections_total],
+    ["Receivable balance", controls.billing.receivable_balance],
+    ["Open payables", controls.payables.open_total],
+    ["Open vale balance", controls.advances.open_vale_balance],
+    ["Open cash advance balance", controls.advances.open_cash_advance_balance],
+  ];
+}
+
+function dataToolsContent(snapshot) {
+  const countRows = DATA_EXPORT_TABLES.map((spec) => `<tr><td>${esc(spec.label)}</td><td>${esc(spec.table)}</td><td class="num">${esc(snapshot.counts[spec.table] || 0)}</td></tr>`);
+  const totalRows = moneySummaryRows(snapshot.controls).map(([label, value]) => `<tr><td>${esc(label)}</td><td class="num">${esc(peso(value))}</td></tr>`);
+  const warningRows = snapshot.warnings.map((warning) => `<tr><td>${esc(warning.severity)}</td><td>${esc(warning.message)}</td><td class="num">${esc(warning.total)}</td></tr>`);
+  const commands = [
+    "cd cloudflare",
+    "python tools/export_django_sqlite_to_d1.py ../webapp/dev.sqlite3 > import.sql",
+    "npx wrangler d1 execute gmt-trucking --remote --file=./import.sql",
+    "Open /data-tools and confirm row counts, control totals, and warnings.",
+  ].join("\n");
+  return `<section class="panel"><div class="toolbar"><div><h3>Data Tools</h3><p class="muted">Backup and verify the Cloudflare D1 database. Browser import is intentionally disabled; use Wrangler for large imports.</p></div><a class="button" href="/data-tools/export.json">Download JSON Backup</a></div></section>${cards([["Tables tracked", String(DATA_EXPORT_TABLES.length)], ["Total rows", String(Object.values(snapshot.counts).reduce((sum, value) => sum + Number(value || 0), 0))], ["Warnings", String(snapshot.warnings.length)], ["Password hashes", "Excluded"]])}<section class="panel"><h3>Guided Import</h3><p>Use these commands after producing or approving the Django SQLite source file. This app does not run destructive imports from the browser.</p><pre>${esc(commands)}</pre></section><section class="panel"><h3>Financial Control Totals</h3></section>${table(["Control", "Amount"], totalRows, { empty: "No totals found." })}<section class="panel"><h3>Table Counts</h3></section>${table(["Area", "Table", "Rows"], countRows, { empty: "No tables found." })}<section class="panel"><h3>Verification Warnings</h3></section>${table(["Severity", "Warning", "Count"], warningRows, { empty: "No relationship or setup warnings found." })}`;
+}
+
+async function dataToolsPage(request, env, user, path) {
+  const access = requireView(user, "Data Tools");
+  if (access) return errorResponse(access, user, path);
+  const snapshot = await dataSnapshot(env);
+  return html(layout({ title: "Data Tools", user, path, content: dataToolsContent(snapshot) }));
+}
+
+async function dataToolsExportPage(request, env, user, path) {
+  const access = requireView(user, "Data Tools");
+  if (access) return errorResponse(access, user, path);
+  const snapshot = await dataSnapshot(env, { includeRows: true });
+  return new Response(JSON.stringify(snapshot, null, 2), {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "content-disposition": `attachment; filename="gmt-d1-backup-${todayISO()}.json"`,
+    },
+  });
+}
+
 const USER_ROLES = [
   ["admin", "Admin"],
   ["encoder", "Encoder"],
@@ -2729,6 +2918,8 @@ export async function handleRequest(request, env) {
   if (path === "/reports/print") return reportWorkspace(request, env, user, path, { print: true });
   if (path === "/reports/export.csv") return reportWorkspace(request, env, user, path, { exportCsv: true });
   if (path === "/settings") return settingsPage(request, env, user, path);
+  if (path === "/data-tools") return dataToolsPage(request, env, user, path);
+  if (path === "/data-tools/export.json") return dataToolsExportPage(request, env, user, path);
   if (path === "/users") return usersPage(request, env, user, path);
   if (path === "/users/new") return userFormPage(request, env, user, path);
   if (path === "/users/export.csv") return usersExportPage(request, env, user, path);
