@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 import { handleRequest } from "../src/app.mjs";
 import { createSession, verifyPassword } from "../src/auth.mjs";
@@ -1734,6 +1735,8 @@ test("settings page is admin-only and persists company defaults", async () => {
   assert.equal(response.status, 200);
   assert.match(text, /Existing Company/);
   assert.match(text, /Default VAT enabled/);
+  assert.match(text, /Company logo/);
+  assert.match(text, /Generate Statement of Account/);
 
   const body = new URLSearchParams({
     company_name: "Updated Logistics",
@@ -1750,9 +1753,10 @@ test("settings page is admin-only and persists company defaults", async () => {
   response = await handleRequest(await authedRequest("https://example.test/settings", "admin", { method: "POST", body }), envWithRows({ runs }));
   assert.equal(response.status, 303);
   assert.equal(response.headers.get("location"), "/settings?ok=Settings%20updated.");
-  assert.equal(runs.filter((run) => run.sql.includes("INSERT INTO system_settings")).length, 10);
+  assert.equal(runs.filter((run) => run.sql.includes("INSERT INTO system_settings")).length, 11);
   assert.deepEqual(runs.find((run) => run.params[0] === "company_name").params, ["company_name", "Updated Logistics"]);
   assert.deepEqual(runs.find((run) => run.params[0] === "default_vat_enabled").params, ["default_vat_enabled", "1"]);
+  assert.deepEqual(runs.find((run) => run.params[0] === "company_logo_data_url").params, ["company_logo_data_url", ""]);
 
   response = await handleRequest(await authedRequest("https://example.test/settings", "viewer"), envWithRows());
   assert.equal(response.status, 403);
@@ -1760,6 +1764,54 @@ test("settings page is admin-only and persists company defaults", async () => {
   assert.equal(response.status, 403);
   response = await handleRequest(await authedRequest("https://example.test/settings", "accounting"), envWithRows());
   assert.equal(response.status, 403);
+});
+
+test("settings logo upload preview validation and removal are supported", async () => {
+  const logo = new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" });
+  const body = new FormData();
+  body.set("company_name", "Logo Logistics");
+  body.set("company_email", "logo@example.test");
+  body.set("company_logo", logo, "logo.png");
+  const runs = [];
+  let response = await handleRequest(await authedRequest("https://example.test/settings", "admin", { method: "POST", body }), envWithRows({ runs }));
+  assert.equal(response.status, 303);
+  const savedLogo = runs.find((run) => run.params[0] === "company_logo_data_url")?.params[1];
+  assert.match(savedLogo, /^data:image\/png;base64,/);
+
+  response = await handleRequest(await authedRequest("https://example.test/settings", "admin"), envWithRows({
+    settings: companySettings({ company_logo_data_url: savedLogo }),
+  }));
+  let text = await response.text();
+  assert.match(text, /Company logo preview/);
+  assert.match(text, /Remove current logo/);
+
+  const removeBody = new URLSearchParams({
+    company_name: "Logo Logistics",
+    remove_company_logo: "1",
+  });
+  const removeRuns = [];
+  response = await handleRequest(await authedRequest("https://example.test/settings", "admin", { method: "POST", body: removeBody }), envWithRows({
+    runs: removeRuns,
+    settings: companySettings({ company_logo_data_url: savedLogo }),
+  }));
+  assert.equal(response.status, 303);
+  assert.deepEqual(removeRuns.find((run) => run.params[0] === "company_logo_data_url").params, ["company_logo_data_url", ""]);
+
+  const invalid = new FormData();
+  invalid.set("company_name", "Logo Logistics");
+  invalid.set("company_logo", new Blob(["bad"], { type: "text/plain" }), "logo.txt");
+  response = await handleRequest(await authedRequest("https://example.test/settings", "admin", { method: "POST", body: invalid }), envWithRows());
+  text = await response.text();
+  assert.equal(response.status, 400);
+  assert.match(text, /PNG, JPEG, WebP, or SVG/);
+
+  const tooLarge = new FormData();
+  tooLarge.set("company_name", "Logo Logistics");
+  tooLarge.set("company_logo", new Blob([new Uint8Array(250 * 1024 + 1)], { type: "image/png" }), "large.png");
+  response = await handleRequest(await authedRequest("https://example.test/settings", "admin", { method: "POST", body: tooLarge }), envWithRows());
+  text = await response.text();
+  assert.equal(response.status, 400);
+  assert.match(text, /250 KB or smaller/);
 });
 
 test("company settings flow into printables and billing VAT defaults", async () => {
@@ -1806,6 +1858,49 @@ test("company settings flow into printables and billing VAT defaults", async () 
   assert.equal(response.status, 200);
   assert.match(text, /name="vat_enabled" value="1" checked/);
   assert.match(text, /₱ 129\.00/);
+});
+
+test("company logo appears on customer printables but not payslips", async () => {
+  const logo = "data:image/png;base64,TE9HTw==";
+  const env = envWithRows({
+    settings: companySettings({ company_logo_data_url: logo }),
+    trips: [sampleTrip()],
+    tripHelpers: [{ id: 1, employee_id: 4, helper_order: 1, full_name: "Helper One", employee_code: "EMP-004" }],
+    payItems: [{ id: 1, employee_type: "Driver", label: "Driver allowance", amount: 100, sort_order: 1 }],
+    payroll: [payrollEntry()],
+    payrollTrips: [payrollTrip()],
+    billing: [billingEntry()],
+    billingLines: [billingLine()],
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One", billing_address: "Client Address" }],
+  });
+
+  for (const url of [
+    "https://example.test/trips/1/print",
+    "https://example.test/billing/61/print",
+    "https://example.test/billing/soa/print?client=1&mode=all&as_of=2026-08-10",
+    "https://example.test/reports/print?report=unbilled_trips&date_from=2026-07-01&date_to=2026-07-31",
+  ]) {
+    const response = await handleRequest(await authedRequest(url, "viewer"), env);
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, /class="company-logo"/);
+    assert.match(text, /data:image\/png;base64,TE9HTw==/);
+  }
+
+  const response = await handleRequest(await authedRequest("https://example.test/payroll/51/print", "viewer"), env);
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(text, /class="company-logo"/);
+  assert.doesNotMatch(text, /data:image\/png;base64,TE9HTw==/);
+});
+
+test("compact layout css reduces screen scale for dense forms", () => {
+  const css = fs.readFileSync(new URL("../public/app.css", import.meta.url), "utf8");
+  assert.match(css, /font:13px\/1\.32/);
+  assert.match(css, /grid-template-columns:248px 1fr/);
+  assert.match(css, /grid-template-columns:repeat\(auto-fit,minmax\(160px,1fr\)\)/);
+  assert.match(css, /padding:6px 8px/);
+  assert.match(css, /settings-logo-block/);
 });
 
 test("data tools page and JSON backup are admin-only and exclude password hashes", async () => {

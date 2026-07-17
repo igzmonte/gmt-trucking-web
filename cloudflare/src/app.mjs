@@ -140,9 +140,13 @@ const SETTINGS_FIELDS = [
   ["soa_footer_note", "SOA footer note", "textarea"],
 ];
 
+const COMPANY_LOGO_KEY = "company_logo_data_url";
+const COMPANY_LOGO_MAX_BYTES = 250 * 1024;
+const COMPANY_LOGO_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/svg+xml"]);
 const DEFAULT_SETTINGS = Object.fromEntries(SETTINGS_FIELDS.map(([key]) => [key, ""]));
 DEFAULT_SETTINGS.company_name = "GMT Trucking";
 DEFAULT_SETTINGS.default_vat_enabled = "0";
+DEFAULT_SETTINGS[COMPANY_LOGO_KEY] = "";
 
 async function loadSettings(env) {
   const settings = { ...DEFAULT_SETTINGS };
@@ -166,6 +170,41 @@ function cleanSettings(data) {
   return values;
 }
 
+function isUploadedFile(value) {
+  return value && typeof value === "object" && typeof value.arrayBuffer === "function" && typeof value.size === "number";
+}
+
+function base64FromBytes(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function logoDataUrl(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return `data:${file.type};base64,${base64FromBytes(bytes)}`;
+}
+
+async function settingsValuesFromRequest(request, currentSettings) {
+  const form = await request.formData();
+  const raw = Object.fromEntries([...form.entries()].filter(([, value]) => !isUploadedFile(value)).map(([key, value]) => [key, String(value)]));
+  const values = cleanSettings(raw);
+  const errors = values.company_email && !values.company_email.includes("@") ? ["Email must contain @ when provided."] : [];
+  let logo = currentSettings.company_logo_data_url || "";
+  if (raw.remove_company_logo) logo = "";
+  const file = form.get("company_logo");
+  if (isUploadedFile(file) && file.size > 0) {
+    if (!COMPANY_LOGO_TYPES.has(file.type)) errors.push("Company logo must be a PNG, JPEG, WebP, or SVG file.");
+    if (file.size > COMPANY_LOGO_MAX_BYTES) errors.push("Company logo must be 250 KB or smaller.");
+    if (!errors.length) logo = await logoDataUrl(file);
+  }
+  values.company_logo_data_url = logo;
+  return { values, errors };
+}
+
 function companyName(settings) {
   return settings?.company_name || DEFAULT_SETTINGS.company_name;
 }
@@ -178,9 +217,10 @@ function companyLines(settings) {
   ].filter(Boolean);
 }
 
-function companyHeader(settings, title = "") {
+function companyHeader(settings, title = "", { logo = true } = {}) {
   const lines = companyLines(settings).map((line) => `<br>${esc(line)}`).join("");
-  return `<h1>${esc(companyName(settings))}</h1>${title ? `<h2>${esc(title)}</h2>` : ""}${lines ? `<p class="company-lines">${lines}</p>` : ""}`;
+  const logoMarkup = logo && settings?.company_logo_data_url ? `<img class="company-logo" src="${esc(settings.company_logo_data_url)}" alt="Company logo" style="max-width:76px;max-height:54px;object-fit:contain;flex:0 0 auto;">` : "";
+  return `<div class="company-header" style="display:flex;gap:10px;align-items:flex-start;">${logoMarkup}<div class="company-text"><h1>${esc(companyName(settings))}</h1>${title ? `<h2>${esc(title)}</h2>` : ""}${lines ? `<p class="company-lines">${lines}</p>` : ""}</div></div>`;
 }
 
 function signatureLabel(value, fallback) {
@@ -839,7 +879,7 @@ async function tripFormPage(request, env, user, path, id = null) {
 function tripPrintable(trip, helperNames, settings) {
   const extraTable = EXTRA_FIELDS.filter((field) => Number(trip[field] || 0)).map((field) => `<tr><td>${esc(field.replaceAll("_", " "))}</td><td class="num">${esc(peso(trip[field]))}</td></tr>`).join("");
   const payTable = (trip.pay_items || []).map((item) => `<tr><td>${esc(item.label)}</td><td>${esc(item.employee_type)}</td><td class="num">${esc(peso(item.amount))}</td></tr>`).join("") || `<tr><td colspan="3">No additional employee pay items.</td></tr>`;
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(trip.trip_ticket_no)}</title><style>@page{size:A4 portrait;margin:12mm}body{font:12px Arial,sans-serif;color:#111}button{margin-bottom:10px}.header{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:14px;padding-bottom:8px}h1{margin:0;font-size:22px}h2{margin:2px 0 0;font-size:15px}.company-lines{margin:4px 0 0;line-height:1.35}table{width:100%;border-collapse:collapse;margin:10px 0}td,th{border:1px solid #333;padding:6px;vertical-align:top}.label{font-weight:bold;width:22%;background:#f3f3f3}.num{text-align:right}.signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:70px}.signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Print</button><div class="header"><div>${companyHeader(settings, "Trip Ticket / Waybill")}</div><div><strong>${esc(trip.trip_ticket_no)}</strong><br>${esc(trip.trip_date)}</div></div><table><tr><td class="label">Trip Ticket / Waybill</td><td>${esc(trip.trip_ticket_no)}</td><td class="label">Ref. No.</td><td>${esc(trip.reference_no || "—")}</td></tr><tr><td class="label">Date</td><td>${esc(trip.trip_date)}</td><td class="label">Type / Status</td><td>${esc(trip.trip_type)} / ${esc(trip.status)}</td></tr><tr><td class="label">Client</td><td colspan="3">${esc(trip.client_name || "")}</td></tr><tr><td class="label">Item / Job</td><td colspan="3">${esc(trip.job_description || "")}</td></tr><tr><td class="label">Origin</td><td>${esc(trip.origin || "")}</td><td class="label">Destination</td><td>${esc(trip.destination || "")}</td></tr><tr><td class="label">Unit</td><td>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · "))}</td><td class="label">Driver</td><td>${esc(trip.driver_name || "")}</td></tr><tr><td class="label">Helpers</td><td colspan="3">${esc(helperNames)}</td></tr><tr><td class="label">Dispatch</td><td>${esc(trip.dispatch_time || "")}</td><td class="label">Arrival</td><td>${esc(trip.arrival_time || "")}</td></tr></table><table><thead><tr><th>Charge</th><th class="num">Amount</th></tr></thead><tbody><tr><td>Base Trip Rate</td><td class="num">${esc(peso(trip.base_trip_rate))}</td></tr>${extraTable}<tr><th>Total</th><th class="num">${esc(peso(tripBillableTotal(trip)))}</th></tr></tbody></table><table><thead><tr><th>Employee Pay Item</th><th>Type</th><th class="num">Amount</th></tr></thead><tbody>${payTable}</tbody></table>${trip.notes ? `<p><strong>Notes:</strong><br>${esc(trip.notes)}</p>` : ""}<div class="signatures"><div>${signatureLabel(settings.prepared_by_default, "Prepared By")}</div><div>Driver</div><div>Client / Receiver</div></div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(trip.trip_ticket_no)}</title><style>@page{size:A4 portrait;margin:12mm}body{font:12px Arial,sans-serif;color:#111}button{margin-bottom:10px}.header{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:14px;padding-bottom:8px}.company-header{display:flex;gap:10px;align-items:flex-start}.company-logo{max-width:76px;max-height:54px;object-fit:contain}.company-text h1,h1{margin:0;font-size:22px}.company-text h2,h2{margin:2px 0 0;font-size:15px}.company-lines{margin:4px 0 0;line-height:1.35}table{width:100%;border-collapse:collapse;margin:10px 0}td,th{border:1px solid #333;padding:6px;vertical-align:top}.label{font-weight:bold;width:22%;background:#f3f3f3}.num{text-align:right}.signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:70px}.signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Print</button><div class="header"><div>${companyHeader(settings, "Trip Ticket / Waybill")}</div><div><strong>${esc(trip.trip_ticket_no)}</strong><br>${esc(trip.trip_date)}</div></div><table><tr><td class="label">Trip Ticket / Waybill</td><td>${esc(trip.trip_ticket_no)}</td><td class="label">Ref. No.</td><td>${esc(trip.reference_no || "—")}</td></tr><tr><td class="label">Date</td><td>${esc(trip.trip_date)}</td><td class="label">Type / Status</td><td>${esc(trip.trip_type)} / ${esc(trip.status)}</td></tr><tr><td class="label">Client</td><td colspan="3">${esc(trip.client_name || "")}</td></tr><tr><td class="label">Item / Job</td><td colspan="3">${esc(trip.job_description || "")}</td></tr><tr><td class="label">Origin</td><td>${esc(trip.origin || "")}</td><td class="label">Destination</td><td>${esc(trip.destination || "")}</td></tr><tr><td class="label">Unit</td><td>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · "))}</td><td class="label">Driver</td><td>${esc(trip.driver_name || "")}</td></tr><tr><td class="label">Helpers</td><td colspan="3">${esc(helperNames)}</td></tr><tr><td class="label">Dispatch</td><td>${esc(trip.dispatch_time || "")}</td><td class="label">Arrival</td><td>${esc(trip.arrival_time || "")}</td></tr></table><table><thead><tr><th>Charge</th><th class="num">Amount</th></tr></thead><tbody><tr><td>Base Trip Rate</td><td class="num">${esc(peso(trip.base_trip_rate))}</td></tr>${extraTable}<tr><th>Total</th><th class="num">${esc(peso(tripBillableTotal(trip)))}</th></tr></tbody></table><table><thead><tr><th>Employee Pay Item</th><th>Type</th><th class="num">Amount</th></tr></thead><tbody>${payTable}</tbody></table>${trip.notes ? `<p><strong>Notes:</strong><br>${esc(trip.notes)}</p>` : ""}<div class="signatures"><div>${signatureLabel(settings.prepared_by_default, "Prepared By")}</div><div>Driver</div><div>Client / Receiver</div></div></body></html>`;
 }
 
 async function tripDetailPage(request, env, user, path, id, print = false) {
@@ -1682,7 +1722,7 @@ function payrollDetailContent(entry, user, print = false, settings = DEFAULT_SET
   const tripRows = (entry.trips || []).map((trip) => ({ ...trip, payroll_amount: payrollTripAmount(entry, trip) }));
   if (print) {
     const rows = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td class="center">1</td><td class="num">${esc(money(row.payroll_amount))}</td><td>${esc(row.trip_ticket_no)}</td><td>${esc(row.origin || "")} to ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td><td class="num">${esc(money(row.payroll_amount))}</td></tr>`).join("") || `<tr><td colspan="7" class="center">No trip-level payroll detail captured for this entry.</td></tr>`;
-    return `<!doctype html><html><head><meta charset="utf-8"><title>Payroll #${esc(entry.id)}</title><style>@page{size:A5 landscape;margin:8mm}body{font:12px Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm 4mm 24mm}.print-button{margin-bottom:8px}.top{display:flex;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0 0 5px}.top h2{font-size:16px;margin:0;text-align:right}.company h1{font-size:18px;margin:0}.company-lines{margin:3px 0 6px;line-height:1.25}.meta{font-size:14px;margin:3px 0}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}th{background:#f0f0f0}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.center{text-align:center}.summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}.net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}.remarks-box{min-height:78px;white-space:pre-wrap}.remaining-balances{margin-top:8px}.signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><div class="company">${companyHeader(settings)}</div><h1>Payroll for ${esc(entry.period_from)} to ${esc(entry.period_to)}</h1><div class="meta"><strong>Payroll ID:</strong> ${esc(entry.id)}</div><div class="meta"><strong>Name of ${esc(entry.employee_type)}:</strong> ${esc(entry.full_name || "")}</div><div class="meta"><strong>Work:</strong> ${esc(entry.unit_description || "")}</div></div><h2>${esc(entry.pay_date)}</h2></div><table><thead><tr><th>Date</th><th>Trips</th><th>Rate</th><th>Trip Ticket / Waybill</th><th>Origin-Destination</th><th>Item / Job</th><th>Amount</th></tr></thead><tbody>${rows}<tr><td></td><td class="center"><strong>${esc(entry.trips_count)}</strong></td><td colspan="4" class="num"><strong>Gross Pay</strong></td><td class="num"><strong>${esc(peso(entry.gross_pay))}</strong></td></tr></tbody></table><div class="summary"><table><tr><th colspan="2">Payroll Summary</th></tr><tr><td>Days Count</td><td>${esc(entry.days_count)}</td></tr><tr><td>Additional Pay</td><td class="num">${esc(peso(entry.additional_pay))}</td></tr></table><div><table><tr><th>Remarks</th></tr><tr><td class="remarks-box">${esc(entry.remarks || "")}</td></tr></table><table class="remaining-balances"><tr><td>Remaining Vale</td><td class="num">${esc(peso(entry.remaining_vale))}</td></tr><tr><td>Remaining Cash Advance</td><td class="num">${esc(peso(entry.remaining_cash))}</td></tr></table></div><div><table><tr><th colspan="2">Deductions</th></tr>${deductions.map(([label, amount]) => `<tr><td>${esc(label)}</td><td class="num">${numeric(amount) ? esc(peso(amount)) : ""}</td></tr>`).join("")}</table><div class="net">Net Pay: ${esc(peso(entry.net_pay))}</div></div></div><div class="signature">Received by: / Employee Signature</div></div></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Payroll #${esc(entry.id)}</title><style>@page{size:A5 landscape;margin:8mm}body{font:12px Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm 4mm 24mm}.print-button{margin-bottom:8px}.top{display:flex;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0 0 5px}.top h2{font-size:16px;margin:0;text-align:right}.company h1{font-size:18px;margin:0}.company-lines{margin:3px 0 6px;line-height:1.25}.meta{font-size:14px;margin:3px 0}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}th{background:#f0f0f0}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.center{text-align:center}.summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}.net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}.remarks-box{min-height:78px;white-space:pre-wrap}.remaining-balances{margin-top:8px}.signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><div class="company">${companyHeader(settings, "", { logo: false })}</div><h1>Payroll for ${esc(entry.period_from)} to ${esc(entry.period_to)}</h1><div class="meta"><strong>Payroll ID:</strong> ${esc(entry.id)}</div><div class="meta"><strong>Name of ${esc(entry.employee_type)}:</strong> ${esc(entry.full_name || "")}</div><div class="meta"><strong>Work:</strong> ${esc(entry.unit_description || "")}</div></div><h2>${esc(entry.pay_date)}</h2></div><table><thead><tr><th>Date</th><th>Trips</th><th>Rate</th><th>Trip Ticket / Waybill</th><th>Origin-Destination</th><th>Item / Job</th><th>Amount</th></tr></thead><tbody>${rows}<tr><td></td><td class="center"><strong>${esc(entry.trips_count)}</strong></td><td colspan="4" class="num"><strong>Gross Pay</strong></td><td class="num"><strong>${esc(peso(entry.gross_pay))}</strong></td></tr></tbody></table><div class="summary"><table><tr><th colspan="2">Payroll Summary</th></tr><tr><td>Days Count</td><td>${esc(entry.days_count)}</td></tr><tr><td>Additional Pay</td><td class="num">${esc(peso(entry.additional_pay))}</td></tr></table><div><table><tr><th>Remarks</th></tr><tr><td class="remarks-box">${esc(entry.remarks || "")}</td></tr></table><table class="remaining-balances"><tr><td>Remaining Vale</td><td class="num">${esc(peso(entry.remaining_vale))}</td></tr><tr><td>Remaining Cash Advance</td><td class="num">${esc(peso(entry.remaining_cash))}</td></tr></table></div><div><table><tr><th colspan="2">Deductions</th></tr>${deductions.map(([label, amount]) => `<tr><td>${esc(label)}</td><td class="num">${numeric(amount) ? esc(peso(amount)) : ""}</td></tr>`).join("")}</table><div class="net">Net Pay: ${esc(peso(entry.net_pay))}</div></div></div><div class="signature">Received by: / Employee Signature</div></div></body></html>`;
   }
   const tripBody = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td><a href="/trips/${row.trip_id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.origin || "")} → ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
   const lines = (entry.lines || []).map((line) => `<div class="detail-pay-row"><span>${esc(line.label)} <small>${esc(line.employee_type)}</small></span><strong>${esc(peso(line.amount))}</strong></div>`).join("") || `<p class="muted">No additional lines.</p>`;
@@ -2425,24 +2465,24 @@ function settingsFormContent(settings, url, errors = []) {
     if (kind === "textarea") return textareaInput(key, label, settings[key] || "", 'rows="3"');
     return textInput(key, label, settings[key] || "");
   });
-  return `${messagePanel(url)}${errorBox}<section class="panel"><h3>Company Profile & Document Defaults</h3><p class="muted">These values appear on printable trip tickets, payroll slips, billing statements, SOA, and printable reports. No calculations or database schema are changed.</p><form method="post" action="/settings"><div class="grid">${fields.join("")}</div><p><button>Save Settings</button></p></form></section>`;
+  const logoPreview = settings.company_logo_data_url ? `<div class="logo-preview"><img src="${esc(settings.company_logo_data_url)}" alt="Company logo preview"><label class="checkbox-row"><input type="checkbox" name="remove_company_logo" value="1"> Remove current logo</label></div>` : `<p class="muted">No company logo uploaded yet.</p>`;
+  return `${messagePanel(url)}${errorBox}<section class="panel"><h3>Company Profile & Document Defaults</h3><p class="muted">These values appear on printable trip tickets, payroll slips, billing statements, SOA, and printable reports. The logo is excluded from payslips.</p><form method="post" action="/settings" enctype="multipart/form-data"><div class="settings-logo-block"><label>Company logo<input type="file" name="company_logo" accept="image/png,image/jpeg,image/webp,image/svg+xml"></label>${logoPreview}<p class="muted">PNG, JPEG, WebP, or SVG only. Maximum 250 KB.</p></div><div class="grid">${fields.join("")}</div><p><button>Save Settings</button></p></form></section><section class="panel"><h3>Document Actions</h3><p class="muted">Generate client-facing documents using the saved company details.</p><a class="button" href="/billing/soa">Generate Statement of Account</a></section>`;
 }
 
 async function settingsPage(request, env, user, path) {
   const access = requireEdit(user, "Settings");
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
+  const currentSettings = await loadSettings(env);
   if (request.method === "POST") {
-    const data = await parseForm(request);
-    const values = cleanSettings(data);
-    const errors = values.company_email && !values.company_email.includes("@") ? ["Email must contain @ when provided."] : [];
+    const { values, errors } = await settingsValuesFromRequest(request, currentSettings);
     if (errors.length) return html(layout({ title: "Settings", user, path, content: settingsFormContent(values, url, errors) }), 400);
-    for (const [key] of SETTINGS_FIELDS) {
+    for (const key of [...SETTINGS_FIELDS.map(([field]) => field), COMPANY_LOGO_KEY]) {
       await run(env, "INSERT INTO system_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, values[key]]);
     }
     return redirect("/settings?ok=Settings%20updated.");
   }
-  return html(layout({ title: "Settings", user, path, content: settingsFormContent(await loadSettings(env), url) }));
+  return html(layout({ title: "Settings", user, path, content: settingsFormContent(currentSettings, url) }));
 }
 
 const DATA_EXPORT_TABLES = [
