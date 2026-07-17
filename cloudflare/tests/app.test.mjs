@@ -105,6 +105,7 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("FROM assets")) return { results: filtered("assets").slice(0, 25) };
             if (state.sql.includes("FROM clients")) return { results: filtered("clients").slice(0, 25) };
             if (state.sql.includes("FROM suppliers")) return { results: filtered("suppliers").slice(0, 25) };
+            if (state.sql.includes("FROM system_settings")) return { results: rows.settings || [] };
             return { results: [] };
           },
           async first() {
@@ -492,6 +493,22 @@ function billingLine(overrides = {}) {
     amount_total: 1075,
     ...overrides,
   };
+}
+
+function companySettings(overrides = {}) {
+  return Object.entries({
+    company_name: "Acme Logistics",
+    company_address: "123 Road",
+    company_contact_no: "0917-000-0000",
+    company_email: "ops@example.test",
+    company_tax_info: "TIN 123",
+    default_vat_enabled: "1",
+    prepared_by_default: "Maria",
+    checked_by_default: "Juan",
+    billing_footer_note: "Billing footer",
+    soa_footer_note: "SOA footer",
+    ...overrides,
+  }).map(([key, value]) => ({ key, value }));
 }
 
 function collectionBody(overrides = {}) {
@@ -1636,6 +1653,89 @@ test("printable reports and CSV export preserve filters and raw numeric values",
   text = await response.text();
   assert.match(text, /Trip Ticket \/ Waybill,Date,Client,Base Rate/);
   assert.match(text, /"TT-CSV","2026-07-15","Client CSV","1000"/);
+});
+
+test("settings page is admin-only and persists company defaults", async () => {
+  const runs = [];
+  let response = await handleRequest(await authedRequest("https://example.test/settings", "admin"), envWithRows({
+    settings: companySettings({ company_name: "Existing Company" }),
+  }));
+  let text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /Existing Company/);
+  assert.match(text, /Default VAT enabled/);
+
+  const body = new URLSearchParams({
+    company_name: "Updated Logistics",
+    company_address: "Updated Address",
+    company_contact_no: "123",
+    company_email: "ops@updated.test",
+    company_tax_info: "VAT 456",
+    default_vat_enabled: "1",
+    prepared_by_default: "Prepared Person",
+    checked_by_default: "Checked Person",
+    billing_footer_note: "Pay within 7 days",
+    soa_footer_note: "SOA note",
+  });
+  response = await handleRequest(await authedRequest("https://example.test/settings", "admin", { method: "POST", body }), envWithRows({ runs }));
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("location"), "/settings?ok=Settings%20updated.");
+  assert.equal(runs.filter((run) => run.sql.includes("INSERT INTO system_settings")).length, 10);
+  assert.deepEqual(runs.find((run) => run.params[0] === "company_name").params, ["company_name", "Updated Logistics"]);
+  assert.deepEqual(runs.find((run) => run.params[0] === "default_vat_enabled").params, ["default_vat_enabled", "1"]);
+
+  response = await handleRequest(await authedRequest("https://example.test/settings", "viewer"), envWithRows());
+  assert.equal(response.status, 403);
+  response = await handleRequest(await authedRequest("https://example.test/settings", "encoder"), envWithRows());
+  assert.equal(response.status, 403);
+  response = await handleRequest(await authedRequest("https://example.test/settings", "accounting"), envWithRows());
+  assert.equal(response.status, 403);
+});
+
+test("company settings flow into printables and billing VAT defaults", async () => {
+  const env = envWithRows({
+    settings: companySettings(),
+    trips: [sampleTrip()],
+    tripHelpers: [{ id: 1, employee_id: 4, helper_order: 1, full_name: "Helper One", employee_code: "EMP-004" }],
+    payItems: [{ id: 1, employee_type: "Driver", label: "Driver allowance", amount: 100, sort_order: 1 }],
+    payroll: [payrollEntry()],
+    payrollTrips: [payrollTrip()],
+    billing: [billingEntry()],
+    billingLines: [billingLine()],
+    billingAdjustments: [{ id: 1, line_type: "Addition", label: "Fuel adjustment", amount: 100 }],
+    collections: [collectionEntry()],
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One", billing_address: "Client Address" }],
+  });
+
+  for (const url of [
+    "https://example.test/trips/1/print",
+    "https://example.test/payroll/51/print",
+    "https://example.test/billing/61/print",
+    "https://example.test/billing/soa/print?client=1&mode=all&as_of=2026-08-10",
+    "https://example.test/reports/print?report=unbilled_trips&date_from=2026-07-01&date_to=2026-07-31",
+  ]) {
+    const response = await handleRequest(await authedRequest(url, "viewer"), env);
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, /Acme Logistics/);
+    assert.match(text, /123 Road/);
+  }
+
+  let response = await handleRequest(await authedRequest("https://example.test/billing/61/print", "viewer"), env);
+  let text = await response.text();
+  assert.match(text, /Billing footer/);
+  assert.match(text, /Maria<br>Prepared by/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/soa/print?client=1&mode=all&as_of=2026-08-10", "viewer"), env);
+  text = await response.text();
+  assert.match(text, /SOA footer/);
+  assert.match(text, /Juan<br>Checked by/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/new?client=1&period_from=2026-07-01&period_to=2026-07-31", "admin"), env);
+  text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /name="vat_enabled" value="1" checked/);
+  assert.match(text, /₱ 129\.00/);
 });
 
 test("user management lists filters and exports users without password hashes", async () => {

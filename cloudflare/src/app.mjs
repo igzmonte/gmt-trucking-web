@@ -127,6 +127,66 @@ function redirectWithHeaders(location, headers) {
   return new Response(null, { status: 303, headers: { Location: location, ...headers } });
 }
 
+const SETTINGS_FIELDS = [
+  ["company_name", "Company name", "text"],
+  ["company_address", "Address", "textarea"],
+  ["company_contact_no", "Contact no.", "text"],
+  ["company_email", "Email", "text"],
+  ["company_tax_info", "TIN / VAT registration", "text"],
+  ["default_vat_enabled", "Default VAT enabled", "checkbox"],
+  ["prepared_by_default", "Prepared by default", "text"],
+  ["checked_by_default", "Checked by default", "text"],
+  ["billing_footer_note", "Billing footer note", "textarea"],
+  ["soa_footer_note", "SOA footer note", "textarea"],
+];
+
+const DEFAULT_SETTINGS = Object.fromEntries(SETTINGS_FIELDS.map(([key]) => [key, ""]));
+DEFAULT_SETTINGS.company_name = "GMT Trucking";
+DEFAULT_SETTINGS.default_vat_enabled = "0";
+
+async function loadSettings(env) {
+  const settings = { ...DEFAULT_SETTINGS };
+  try {
+    const rows = await all(env, "SELECT key, value FROM system_settings");
+    for (const row of rows) {
+      if (row.key in settings) settings[row.key] = String(row.value ?? "");
+    }
+  } catch {
+    // Missing settings table should not break first-run views; migrations create it.
+  }
+  return settings;
+}
+
+function cleanSettings(data) {
+  const values = {};
+  for (const [key, , kind] of SETTINGS_FIELDS) {
+    values[key] = kind === "checkbox" ? (data[key] ? "1" : "0") : String(data[key] || "").trim();
+  }
+  if (!values.company_name) values.company_name = DEFAULT_SETTINGS.company_name;
+  return values;
+}
+
+function companyName(settings) {
+  return settings?.company_name || DEFAULT_SETTINGS.company_name;
+}
+
+function companyLines(settings) {
+  return [
+    settings.company_address,
+    [settings.company_contact_no, settings.company_email].filter(Boolean).join(" · "),
+    settings.company_tax_info,
+  ].filter(Boolean);
+}
+
+function companyHeader(settings, title = "") {
+  const lines = companyLines(settings).map((line) => `<br>${esc(line)}`).join("");
+  return `<h1>${esc(companyName(settings))}</h1>${title ? `<h2>${esc(title)}</h2>` : ""}${lines ? `<p class="company-lines">${lines}</p>` : ""}`;
+}
+
+function signatureLabel(value, fallback) {
+  return value ? `${value}<br>${fallback}` : fallback;
+}
+
 async function dashboardPage(env, user, path) {
   const data = await dashboard(env);
   const [payroll, repairs, payables, vale, cash, recentTrips, recentBillings, recentCollections, recentPayroll] = await Promise.all([
@@ -776,6 +836,12 @@ async function tripFormPage(request, env, user, path, id = null) {
   return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, row, id) }));
 }
 
+function tripPrintable(trip, helperNames, settings) {
+  const extraTable = EXTRA_FIELDS.filter((field) => Number(trip[field] || 0)).map((field) => `<tr><td>${esc(field.replaceAll("_", " "))}</td><td class="num">${esc(peso(trip[field]))}</td></tr>`).join("");
+  const payTable = (trip.pay_items || []).map((item) => `<tr><td>${esc(item.label)}</td><td>${esc(item.employee_type)}</td><td class="num">${esc(peso(item.amount))}</td></tr>`).join("") || `<tr><td colspan="3">No additional employee pay items.</td></tr>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(trip.trip_ticket_no)}</title><style>@page{size:A4 portrait;margin:12mm}body{font:12px Arial,sans-serif;color:#111}button{margin-bottom:10px}.header{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:14px;padding-bottom:8px}h1{margin:0;font-size:22px}h2{margin:2px 0 0;font-size:15px}.company-lines{margin:4px 0 0;line-height:1.35}table{width:100%;border-collapse:collapse;margin:10px 0}td,th{border:1px solid #333;padding:6px;vertical-align:top}.label{font-weight:bold;width:22%;background:#f3f3f3}.num{text-align:right}.signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:70px}.signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Print</button><div class="header"><div>${companyHeader(settings, "Trip Ticket / Waybill")}</div><div><strong>${esc(trip.trip_ticket_no)}</strong><br>${esc(trip.trip_date)}</div></div><table><tr><td class="label">Trip Ticket / Waybill</td><td>${esc(trip.trip_ticket_no)}</td><td class="label">Ref. No.</td><td>${esc(trip.reference_no || "—")}</td></tr><tr><td class="label">Date</td><td>${esc(trip.trip_date)}</td><td class="label">Type / Status</td><td>${esc(trip.trip_type)} / ${esc(trip.status)}</td></tr><tr><td class="label">Client</td><td colspan="3">${esc(trip.client_name || "")}</td></tr><tr><td class="label">Item / Job</td><td colspan="3">${esc(trip.job_description || "")}</td></tr><tr><td class="label">Origin</td><td>${esc(trip.origin || "")}</td><td class="label">Destination</td><td>${esc(trip.destination || "")}</td></tr><tr><td class="label">Unit</td><td>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · "))}</td><td class="label">Driver</td><td>${esc(trip.driver_name || "")}</td></tr><tr><td class="label">Helpers</td><td colspan="3">${esc(helperNames)}</td></tr><tr><td class="label">Dispatch</td><td>${esc(trip.dispatch_time || "")}</td><td class="label">Arrival</td><td>${esc(trip.arrival_time || "")}</td></tr></table><table><thead><tr><th>Charge</th><th class="num">Amount</th></tr></thead><tbody><tr><td>Base Trip Rate</td><td class="num">${esc(peso(trip.base_trip_rate))}</td></tr>${extraTable}<tr><th>Total</th><th class="num">${esc(peso(tripBillableTotal(trip)))}</th></tr></tbody></table><table><thead><tr><th>Employee Pay Item</th><th>Type</th><th class="num">Amount</th></tr></thead><tbody>${payTable}</tbody></table>${trip.notes ? `<p><strong>Notes:</strong><br>${esc(trip.notes)}</p>` : ""}<div class="signatures"><div>${signatureLabel(settings.prepared_by_default, "Prepared By")}</div><div>Driver</div><div>Client / Receiver</div></div></body></html>`;
+}
+
 async function tripDetailPage(request, env, user, path, id, print = false) {
   const access = requireView(user, "Trips");
   if (access) return errorResponse(access, user, path);
@@ -784,8 +850,10 @@ async function tripDetailPage(request, env, user, path, id, print = false) {
   const helperNames = (trip.helpers || []).map((row) => row.full_name).join("; ") || "None";
   const extraRows = EXTRA_FIELDS.filter((field) => Number(trip[field] || 0)).map((field) => `<dt>${esc(field.replaceAll("_", " "))}</dt><dd>${esc(peso(trip[field]))}</dd>`).join("");
   const payRows = (trip.pay_items || []).map((item) => `<div class="detail-pay-row"><span>${esc(item.label)} <small>${esc(item.employee_type)}</small></span><strong>${esc(peso(item.amount))}</strong></div>`).join("") || `<p class="muted">No additional pay items.</p>`;
+  if (print) return html(tripPrintable(trip, helperNames, await loadSettings(env)));
   const main = `<section class="panel detail-hero"><div><span class="dialog-kicker">${esc(trip.trip_type)} · Trip Ticket / Waybill</span><h3>${esc(trip.trip_ticket_no)}</h3><p>${esc(trip.client_name || "No client")} · ${esc(trip.trip_date)} · Ref. No.: ${esc(trip.reference_no || "—")}</p></div><span class="status detail-status">${esc(trip.status)}</span></section><div class="detail-grid"><section class="panel"><h3>Route & Schedule</h3><dl class="detail-list"><dt>Item / Job</dt><dd>${esc(trip.job_description || "—")}</dd><dt>Origin</dt><dd>${esc(trip.origin || "—")}</dd><dt>Destination</dt><dd>${esc(trip.destination || "—")}</dd><dt>Dispatch</dt><dd>${esc(trip.dispatch_time || "—")}</dd><dt>Arrival</dt><dd>${esc(trip.arrival_time || "—")}</dd><dt>Recurring Master</dt><dd>${esc(trip.recurring_code || "—")}</dd></dl></section><section class="panel"><h3>Unit & Crew</h3><dl class="detail-list"><dt>Asset</dt><dd>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · ") || "—")}</dd><dt>Driver</dt><dd>${esc(trip.driver_name || "—")}</dd><dt>Helpers</dt><dd>${esc(helperNames)}</dd><dt>Driver Pay Rate</dt><dd>${esc(peso(trip.driver_pay_rate))}</dd><dt>Helper Pay Pool</dt><dd>${esc(peso(trip.helper_pay_rate))}</dd></dl></section><section class="panel"><h3>Billing Breakdown</h3><dl class="detail-list"><dt>Base Trip Rate</dt><dd>${esc(peso(trip.base_trip_rate))}</dd>${extraRows}<dt class="detail-total">Billable Total</dt><dd class="detail-total">${esc(peso(tripBillableTotal(trip)))}</dd></dl></section><section class="panel"><h3>Employee Pay Items</h3>${payRows}</section></div>${trip.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(trip.notes)}</p></section>` : ""}`;
   if (print) {
+    const settings = await loadSettings(env);
     const extraTable = EXTRA_FIELDS.filter((field) => Number(trip[field] || 0)).map((field) => `<tr><td>${esc(field.replaceAll("_", " "))}</td><td class="num">${esc(peso(trip[field]))}</td></tr>`).join("");
     const payTable = (trip.pay_items || []).map((item) => `<tr><td>${esc(item.label)}</td><td>${esc(item.employee_type)}</td><td class="num">${esc(peso(item.amount))}</td></tr>`).join("") || `<tr><td colspan="3">No additional employee pay items.</td></tr>`;
     return html(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(trip.trip_ticket_no)}</title><style>@page{size:A4 portrait;margin:12mm}body{font:12px Arial,sans-serif;color:#111}button{margin-bottom:10px}.header{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:14px;padding-bottom:8px}h1{margin:0;font-size:22px}table{width:100%;border-collapse:collapse;margin:10px 0}td,th{border:1px solid #333;padding:6px;vertical-align:top}.label{font-weight:bold;width:22%;background:#f3f3f3}.num{text-align:right}.signatures{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:70px}.signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Print</button><div class="header"><div><h1>GMT Trucking</h1><strong>Trip Ticket / Waybill</strong></div><div><strong>${esc(trip.trip_ticket_no)}</strong><br>${esc(trip.trip_date)}</div></div><table><tr><td class="label">Trip Ticket / Waybill</td><td>${esc(trip.trip_ticket_no)}</td><td class="label">Ref. No.</td><td>${esc(trip.reference_no || "—")}</td></tr><tr><td class="label">Date</td><td>${esc(trip.trip_date)}</td><td class="label">Type / Status</td><td>${esc(trip.trip_type)} / ${esc(trip.status)}</td></tr><tr><td class="label">Client</td><td colspan="3">${esc(trip.client_name || "")}</td></tr><tr><td class="label">Item / Job</td><td colspan="3">${esc(trip.job_description || "")}</td></tr><tr><td class="label">Origin</td><td>${esc(trip.origin || "")}</td><td class="label">Destination</td><td>${esc(trip.destination || "")}</td></tr><tr><td class="label">Unit</td><td>${esc([trip.asset_code, trip.plate_no].filter(Boolean).join(" · "))}</td><td class="label">Driver</td><td>${esc(trip.driver_name || "")}</td></tr><tr><td class="label">Helpers</td><td colspan="3">${esc(helperNames)}</td></tr><tr><td class="label">Dispatch</td><td>${esc(trip.dispatch_time || "")}</td><td class="label">Arrival</td><td>${esc(trip.arrival_time || "")}</td></tr></table><table><thead><tr><th>Charge</th><th class="num">Amount</th></tr></thead><tbody><tr><td>Base Trip Rate</td><td class="num">${esc(peso(trip.base_trip_rate))}</td></tr>${extraTable}<tr><th>Total</th><th class="num">${esc(peso(tripBillableTotal(trip)))}</th></tr></tbody></table><table><thead><tr><th>Employee Pay Item</th><th>Type</th><th class="num">Amount</th></tr></thead><tbody>${payTable}</tbody></table>${trip.notes ? `<p><strong>Notes:</strong><br>${esc(trip.notes)}</p>` : ""}<div class="signatures"><div>Prepared By</div><div>Driver</div><div>Client / Receiver</div></div></body></html>`);
@@ -1605,7 +1673,7 @@ function payrollTripAmount(entry, trip) {
   return 0;
 }
 
-function payrollDetailContent(entry, user, print = false) {
+function payrollDetailContent(entry, user, print = false, settings = DEFAULT_SETTINGS) {
   const deductions = [
     ["Vale", entry.vale_deduction], ["Cash Advance", entry.cash_advance_deduction],
     ["SSS", entry.sss], ["PhilHealth", entry.philhealth], ["Pag-IBIG", entry.pagibig],
@@ -1614,7 +1682,7 @@ function payrollDetailContent(entry, user, print = false) {
   const tripRows = (entry.trips || []).map((trip) => ({ ...trip, payroll_amount: payrollTripAmount(entry, trip) }));
   if (print) {
     const rows = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td class="center">1</td><td class="num">${esc(money(row.payroll_amount))}</td><td>${esc(row.trip_ticket_no)}</td><td>${esc(row.origin || "")} to ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td><td class="num">${esc(money(row.payroll_amount))}</td></tr>`).join("") || `<tr><td colspan="7" class="center">No trip-level payroll detail captured for this entry.</td></tr>`;
-    return `<!doctype html><html><head><meta charset="utf-8"><title>Payroll #${esc(entry.id)}</title><style>@page{size:A5 landscape;margin:8mm}body{font:12px Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm 4mm 24mm}.print-button{margin-bottom:8px}.top{display:flex;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0 0 5px}.top h2{font-size:16px;margin:0;text-align:right}.meta{font-size:14px;margin:3px 0}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}th{background:#f0f0f0}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.center{text-align:center}.summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}.net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}.remarks-box{min-height:78px;white-space:pre-wrap}.remaining-balances{margin-top:8px}.signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><h1>Payroll for ${esc(entry.period_from)} to ${esc(entry.period_to)}</h1><div class="meta"><strong>Payroll ID:</strong> ${esc(entry.id)}</div><div class="meta"><strong>Name of ${esc(entry.employee_type)}:</strong> ${esc(entry.full_name || "")}</div><div class="meta"><strong>Work:</strong> ${esc(entry.unit_description || "")}</div></div><h2>${esc(entry.pay_date)}</h2></div><table><thead><tr><th>Date</th><th>Trips</th><th>Rate</th><th>Trip Ticket / Waybill</th><th>Origin-Destination</th><th>Item / Job</th><th>Amount</th></tr></thead><tbody>${rows}<tr><td></td><td class="center"><strong>${esc(entry.trips_count)}</strong></td><td colspan="4" class="num"><strong>Gross Pay</strong></td><td class="num"><strong>${esc(peso(entry.gross_pay))}</strong></td></tr></tbody></table><div class="summary"><table><tr><th colspan="2">Payroll Summary</th></tr><tr><td>Days Count</td><td>${esc(entry.days_count)}</td></tr><tr><td>Additional Pay</td><td class="num">${esc(peso(entry.additional_pay))}</td></tr></table><div><table><tr><th>Remarks</th></tr><tr><td class="remarks-box">${esc(entry.remarks || "")}</td></tr></table><table class="remaining-balances"><tr><td>Remaining Vale</td><td class="num">${esc(peso(entry.remaining_vale))}</td></tr><tr><td>Remaining Cash Advance</td><td class="num">${esc(peso(entry.remaining_cash))}</td></tr></table></div><div><table><tr><th colspan="2">Deductions</th></tr>${deductions.map(([label, amount]) => `<tr><td>${esc(label)}</td><td class="num">${numeric(amount) ? esc(peso(amount)) : ""}</td></tr>`).join("")}</table><div class="net">Net Pay: ${esc(peso(entry.net_pay))}</div></div></div><div class="signature">Received by: / Employee Signature</div></div></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Payroll #${esc(entry.id)}</title><style>@page{size:A5 landscape;margin:8mm}body{font:12px Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm 4mm 24mm}.print-button{margin-bottom:8px}.top{display:flex;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0 0 5px}.top h2{font-size:16px;margin:0;text-align:right}.company h1{font-size:18px;margin:0}.company-lines{margin:3px 0 6px;line-height:1.25}.meta{font-size:14px;margin:3px 0}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}th{background:#f0f0f0}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.center{text-align:center}.summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}.net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}.remarks-box{min-height:78px;white-space:pre-wrap}.remaining-balances{margin-top:8px}.signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><div class="company">${companyHeader(settings)}</div><h1>Payroll for ${esc(entry.period_from)} to ${esc(entry.period_to)}</h1><div class="meta"><strong>Payroll ID:</strong> ${esc(entry.id)}</div><div class="meta"><strong>Name of ${esc(entry.employee_type)}:</strong> ${esc(entry.full_name || "")}</div><div class="meta"><strong>Work:</strong> ${esc(entry.unit_description || "")}</div></div><h2>${esc(entry.pay_date)}</h2></div><table><thead><tr><th>Date</th><th>Trips</th><th>Rate</th><th>Trip Ticket / Waybill</th><th>Origin-Destination</th><th>Item / Job</th><th>Amount</th></tr></thead><tbody>${rows}<tr><td></td><td class="center"><strong>${esc(entry.trips_count)}</strong></td><td colspan="4" class="num"><strong>Gross Pay</strong></td><td class="num"><strong>${esc(peso(entry.gross_pay))}</strong></td></tr></tbody></table><div class="summary"><table><tr><th colspan="2">Payroll Summary</th></tr><tr><td>Days Count</td><td>${esc(entry.days_count)}</td></tr><tr><td>Additional Pay</td><td class="num">${esc(peso(entry.additional_pay))}</td></tr></table><div><table><tr><th>Remarks</th></tr><tr><td class="remarks-box">${esc(entry.remarks || "")}</td></tr></table><table class="remaining-balances"><tr><td>Remaining Vale</td><td class="num">${esc(peso(entry.remaining_vale))}</td></tr><tr><td>Remaining Cash Advance</td><td class="num">${esc(peso(entry.remaining_cash))}</td></tr></table></div><div><table><tr><th colspan="2">Deductions</th></tr>${deductions.map(([label, amount]) => `<tr><td>${esc(label)}</td><td class="num">${numeric(amount) ? esc(peso(amount)) : ""}</td></tr>`).join("")}</table><div class="net">Net Pay: ${esc(peso(entry.net_pay))}</div></div></div><div class="signature">Received by: / Employee Signature</div></div></body></html>`;
   }
   const tripBody = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td><a href="/trips/${row.trip_id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.origin || "")} → ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
   const lines = (entry.lines || []).map((line) => `<div class="detail-pay-row"><span>${esc(line.label)} <small>${esc(line.employee_type)}</small></span><strong>${esc(peso(line.amount))}</strong></div>`).join("") || `<p class="muted">No additional lines.</p>`;
@@ -1629,7 +1697,7 @@ async function payrollDetailPage(request, env, user, path, id, print = false) {
   if (access) return errorResponse(access, user, path);
   const entry = await loadPayrollEntry(env, id);
   if (!entry) return html("Not found", 404);
-  if (print) return html(payrollDetailContent(entry, user, true));
+  if (print) return html(payrollDetailContent(entry, user, true, await loadSettings(env)));
   return html(layout({ title: "Payroll Details", user, path, content: `${messagePanel(new URL(request.url))}${payrollDetailContent(entry, user)}` }));
 }
 
@@ -1836,6 +1904,13 @@ function billingDetailContent(entry, user, print = false) {
   return `${actions}${hero}${summary}<section class="panel"><h3>Trips</h3></section>${table(["Date", "Trip Ticket / Waybill", "Item / Job", "Route", "Unit", "Base", "Extras", "Total"], lineRows, { empty: "No billing lines." })}<section class="panel"><h3>Adjustments</h3></section>${table(["Type", "Label", "Amount"], adjustmentRows, { empty: "No adjustments." })}<section class="panel"><h3>Collections</h3></section>${table(["Date", "Reference", "Method", "Amount"], collectionRows, { empty: "No collections recorded." })}${entry.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(entry.notes)}</p></section>` : ""}${deleteForm}`;
 }
 
+function billingPrintable(entry, settings) {
+  const lineRows = (entry.lines || []).map((line) => `<tr><td>${esc(line.trip_date)}</td><td>${esc(line.trip_ticket_no)}<br><small>Ref. No.: ${esc(line.reference_no || "—")}</small></td><td>${esc(line.job_description || "")}</td><td>${esc(line.origin || "")} → ${esc(line.destination || "")}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`).join("") || `<tr><td colspan="8">No billing lines.</td></tr>`;
+  const adjustmentRows = (entry.adjustments || []).map((row) => `<tr><td>${esc(row.line_type)}</td><td>${esc(row.label)}</td><td class="num">${esc(peso(row.amount))}</td></tr>`).join("");
+  const footer = settings.billing_footer_note ? `<p class="footer-note">${esc(settings.billing_footer_note)}</p>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(entry.billing_no)} · Billing</title><style>@page{size:A4 portrait;margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111}.top{display:flex;justify-content:space-between;gap:24px}h1,h2{margin:0 0 6px}.company-lines{margin:4px 0 0;line-height:1.35}.muted{color:#555}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:320px}.footer-note{margin-top:18px;white-space:pre-wrap}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:60px;margin-top:48px}.sig{border-top:1px solid #111;text-align:center;padding-top:6px}.print-button{margin-bottom:10px}@media print{.print-button{display:none}}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="top"><div>${companyHeader(settings, "Billing Statement")}<p><strong>Client:</strong> ${esc(entry.client_name || "")}<br><strong>Address:</strong> ${esc(entry.billing_address || "")}<br><strong>Period:</strong> ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><div><h2>${esc(entry.billing_no)}</h2><p><strong>Date:</strong> ${esc(entry.billing_date)}<br><strong>Status:</strong> ${esc(entry.current_status)}</p></div></div><table><thead><tr><th>Date</th><th>Trip Ticket / Waybill</th><th>Item / Job</th><th>Route</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${lineRows}</tbody></table>${adjustmentRows ? `<table><thead><tr><th>Type</th><th>Adjustment</th><th>Amount</th></tr></thead><tbody>${adjustmentRows}</tbody></table>` : ""}<table class="totals"><tr><td>Gross</td><td class="num">${esc(peso(entry.gross_total))}</td></tr><tr><td>VAT</td><td class="num">${esc(peso(entry.vat_amount))}</td></tr><tr><td>Additions</td><td class="num">${esc(peso(entry.additions_total))}</td></tr><tr><td>Deductions</td><td class="num">${esc(peso(entry.deductions_total))}</td></tr><tr><th>Grand Total</th><th class="num">${esc(peso(entry.grand_total))}</th></tr><tr><td>Payments</td><td class="num">${esc(peso(entry.paid_amount))}</td></tr><tr><th>Balance</th><th class="num">${esc(peso(entry.balance))}</th></tr></table>${footer}<div class="signatures"><div class="sig">${signatureLabel(settings.prepared_by_default, "Prepared by")}</div><div class="sig">Received by / Conforme</div></div></body></html>`;
+}
+
 async function billingListPage(request, env, user, path) {
   const access = requireView(user, "Billing");
   if (access) return errorResponse(access, user, path);
@@ -1862,9 +1937,11 @@ async function billingNewPage(request, env, user, path) {
   const access = requireEdit(user, "Billing");
   if (access) return errorResponse(access, user, path);
   const clients = await billingClients(env);
+  const settings = await loadSettings(env);
   const source = request.method === "POST" ? await parseForm(request) : Object.fromEntries(new URL(request.url).searchParams.entries());
   const selection = { client: source.client || "", period_from: source.period_from || `${todayISO().slice(0, 8)}01`, period_to: source.period_to || todayISO() };
   const trips = selection.client ? await billingEligibleTrips(env, selection.client, selection.period_from, selection.period_to) : [];
+  const initialValues = request.method === "POST" ? source : { vat_enabled: settings.default_vat_enabled === "1" ? "1" : "" };
   if (request.method === "POST") {
     const cleaned = billingCleaned(source);
     const totals = billingTotals(trips, cleaned);
@@ -1873,7 +1950,7 @@ async function billingNewPage(request, env, user, path) {
     const id = await saveBilling(env, cleaned, trips);
     return redirect(`/billing/${id}?ok=${encodeURIComponent("Billing statement saved and trips marked as billed.")}`);
   }
-  return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips) }));
+  return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips, initialValues) }));
 }
 
 async function billingDetailPage(request, env, user, path, id, print = false) {
@@ -1881,7 +1958,7 @@ async function billingDetailPage(request, env, user, path, id, print = false) {
   if (access) return errorResponse(access, user, path);
   const entry = await loadBillingEntry(env, id);
   if (!entry) return html("Not found", 404);
-  if (print) return html(billingDetailContent(entry, user, true));
+  if (print) return html(billingPrintable(entry, await loadSettings(env)));
   return html(layout({ title: "Billing Details", user, path, content: `${messagePanel(new URL(request.url))}${billingDetailContent(entry, user)}` }));
 }
 
@@ -1989,6 +2066,14 @@ function soaPrintable(client, filters, rows) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Statement of Account · GMT</title><style>@page{size:A4 portrait;margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111}.top{display:flex;justify-content:space-between;gap:24px}h1,h2{margin:0 0 6px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.totals{margin-left:auto;width:330px}.signatures{display:grid;grid-template-columns:1fr 1fr 1fr;gap:32px;margin-top:56px}.sig{border-top:1px solid #111;text-align:center;padding-top:6px}.print-button{margin-bottom:10px}@media print{.print-button{display:none}}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><h1>GMT Trucking</h1><h2>Statement of Account</h2><p><strong>Client:</strong> ${esc(client?.client_name || "")}<br><strong>Code:</strong> ${esc(client?.client_code || "")}<br><strong>Address:</strong> ${esc(client?.billing_address || "")}</p></div><div><p><strong>As-of date:</strong> ${esc(filters.as_of)}<br><strong>Period:</strong> ${esc(period)}<br><strong>Mode:</strong> ${filters.mode === "all" ? "All Activity" : "Outstanding Only"}</p></div></div><table><thead><tr><th>Billing No.</th><th>Billing Date</th><th>Billing Period</th><th>Grand Total</th><th>Payments</th><th>Balance</th><th>Status</th></tr></thead><tbody>${body}</tbody></table><table class="totals"><tr><td>Total Billed</td><td class="num">${esc(peso(totals.billed))}</td></tr><tr><td>Total Payments</td><td class="num">${esc(peso(totals.paid))}</td></tr><tr><th>Total Balance</th><th class="num">${esc(peso(totals.balance))}</th></tr></table><div class="signatures"><div class="sig">Prepared by</div><div class="sig">Checked by</div><div class="sig">Received/Conforme</div></div></body></html>`;
 }
 
+function soaPrintableWithSettings(client, filters, rows, settings) {
+  const totals = soaTotals(rows);
+  const period = `${filters.date_from || "Beginning"} to ${filters.date_to || "Current"}`;
+  const body = rows.map((row) => `<tr><td>${esc(row.billing_no)}</td><td>${esc(row.billing_date)}</td><td>${esc(row.period_from || "")} to ${esc(row.period_to || "")}</td><td class="num">${esc(peso(row.grand_total))}</td><td class="num">${esc(peso(row.paid_as_of))}</td><td class="num">${esc(peso(row.balance_as_of))}</td><td>${esc(row.status_as_of)}</td></tr>`).join("") || `<tr><td colspan="7">No SOA rows found for the selected filters.</td></tr>`;
+  const footer = settings.soa_footer_note ? `<p class="footer-note">${esc(settings.soa_footer_note)}</p>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Statement of Account · GMT</title><style>@page{size:A4 portrait;margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111}.top{display:flex;justify-content:space-between;gap:24px}h1,h2{margin:0 0 6px}.company-lines{margin:4px 0 0;line-height:1.35}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.totals{margin-left:auto;width:330px}.footer-note{margin-top:18px;white-space:pre-wrap}.signatures{display:grid;grid-template-columns:1fr 1fr 1fr;gap:32px;margin-top:56px}.sig{border-top:1px solid #111;text-align:center;padding-top:6px}.print-button{margin-bottom:10px}@media print{.print-button{display:none}}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="top"><div>${companyHeader(settings, "Statement of Account")}<p><strong>Client:</strong> ${esc(client?.client_name || "")}<br><strong>Code:</strong> ${esc(client?.client_code || "")}<br><strong>Address:</strong> ${esc(client?.billing_address || "")}</p></div><div><p><strong>As-of date:</strong> ${esc(filters.as_of)}<br><strong>Period:</strong> ${esc(period)}<br><strong>Mode:</strong> ${filters.mode === "all" ? "All Activity" : "Outstanding Only"}</p></div></div><table><thead><tr><th>Billing No.</th><th>Billing Date</th><th>Billing Period</th><th>Grand Total</th><th>Payments</th><th>Balance</th><th>Status</th></tr></thead><tbody>${body}</tbody></table><table class="totals"><tr><td>Total Billed</td><td class="num">${esc(peso(totals.billed))}</td></tr><tr><td>Total Payments</td><td class="num">${esc(peso(totals.paid))}</td></tr><tr><th>Total Balance</th><th class="num">${esc(peso(totals.balance))}</th></tr></table>${footer}<div class="signatures"><div class="sig">${signatureLabel(settings.prepared_by_default, "Prepared by")}</div><div class="sig">${signatureLabel(settings.checked_by_default, "Checked by")}</div><div class="sig">Received/Conforme</div></div></body></html>`;
+}
+
 async function soaPage(request, env, user, path, { print = false, exportCsv = false } = {}) {
   const access = requireView(user, "Billing");
   if (access) return errorResponse(access, user, path);
@@ -2002,7 +2087,7 @@ async function soaPage(request, env, user, path, { print = false, exportCsv = fa
     for (const row of rows) lines.push(quotedCsvRow([row.billing_no, row.billing_date, `${row.period_from || ""} to ${row.period_to || ""}`, row.grand_total, row.paid_as_of, row.balance_as_of, row.status_as_of]));
     return csv(lines.join("\n"), "statement-of-account.csv");
   }
-  if (print) return html(soaPrintable(client, filters, rows));
+  if (print) return html(soaPrintableWithSettings(client, filters, rows, await loadSettings(env)));
   return html(layout({ title: "Statement of Account", user, path, content: soaContent(clients, client, filters, rows) }));
 }
 
@@ -2302,6 +2387,12 @@ function reportFilterBad(filters) {
   return filters.date_from && filters.date_to && filters.date_from > filters.date_to;
 }
 
+function reportPrintable(result, filters, settings) {
+  const activeFilters = [["Report", result.label], ["Search", filters.q], ["Date From", filters.date_from], ["Date To", filters.date_to], ["Status", filters.status]].filter(([, value]) => value);
+  const filterTags = activeFilters.length ? activeFilters.map(([label, value]) => `<span class="filter"><strong>${esc(label)}:</strong> ${esc(value)}</span>`).join("") : `<span class="filter">No filters applied</span>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(result.label)}</title><style>@page{size:A4 landscape;margin:11mm}body{font:10pt Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm}.print-button{margin-bottom:10px}.header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:10px}h1{font-size:18pt;margin:0 0 3px}h2{font-size:14pt;margin:0 0 4px}.company-lines{margin:4px 0 0;line-height:1.35}.muted{color:#555}.meta{font-size:9pt;text-align:right;line-height:1.45}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px}.filter{border:1px solid #bbb;border-radius:12px;padding:3px 8px;font-size:9pt}table{width:100%;border-collapse:collapse}th,td{border:1px solid #444;padding:4px 5px;vertical-align:top}th{background:#eee;text-align:left}tfoot td{font-weight:bold;background:#f7f7f7}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.report-empty{text-align:center;padding:18px}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="header"><div>${companyHeader(settings)}<h2>${esc(result.label)}</h2><div class="muted">${esc(result.description)}</div></div><div class="meta"><div><strong>Generated:</strong> ${esc(new Date().toISOString())}</div><div><strong>Rows:</strong> ${esc(result.row_count)}</div></div></div><div class="filters">${filterTags}</div>${reportTable(result)}</div></body></html>`;
+}
+
 async function reportWorkspace(request, env, user, path, { print = false, exportCsv = false } = {}) {
   const access = requireView(user, "Reports");
   if (access) return errorResponse(access, user, path);
@@ -2318,12 +2409,40 @@ async function reportWorkspace(request, env, user, path, { print = false, export
     return csv(lines.join("\n"), `${result.slug}.csv`);
   }
   if (print) {
+    return html(reportPrintable(result, filters, await loadSettings(env)));
     const activeFilters = [["Report", result.label], ["Search", filters.q], ["Date From", filters.date_from], ["Date To", filters.date_to], ["Status", filters.status]].filter(([, value]) => value);
     const filterTags = activeFilters.length ? activeFilters.map(([label, value]) => `<span class="filter"><strong>${esc(label)}:</strong> ${esc(value)}</span>`).join("") : `<span class="filter">No filters applied</span>`;
     return html(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(result.label)}</title><style>@page{size:A4 landscape;margin:11mm}body{font:10pt Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm}.print-button{margin-bottom:10px}.header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:10px}h1{font-size:18pt;margin:0 0 3px}h2{font-size:14pt;margin:0 0 4px}.muted{color:#555}.meta{font-size:9pt;text-align:right;line-height:1.45}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px}.filter{border:1px solid #bbb;border-radius:12px;padding:3px 8px;font-size:9pt}table{width:100%;border-collapse:collapse}th,td{border:1px solid #444;padding:4px 5px;vertical-align:top}th{background:#eee;text-align:left}tfoot td{font-weight:bold;background:#f7f7f7}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.report-empty{text-align:center;padding:18px}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="header"><div><h1>GMT Trucking</h1><h2>${esc(result.label)}</h2><div class="muted">${esc(result.description)}</div></div><div class="meta"><div><strong>Generated:</strong> ${esc(new Date().toISOString())}</div><div><strong>Rows:</strong> ${esc(result.row_count)}</div></div></div><div class="filters">${filterTags}</div>${reportTable(result)}</div></body></html>`);
   }
   const heading = `<section class="report-heading"><div><span class="dialog-kicker">Operational and Financial Report</span><h3>${esc(result.label)}</h3><p>${esc(result.description)}</p></div><div class="report-count"><strong>${esc(result.row_count)}</strong><span>row${result.row_count === 1 ? "" : "s"}</span></div></section>`;
   return html(layout({ title: "Reports", user, path, content: `${reportForm(filters)}${heading}${reportTable(result)}` }));
+}
+
+function settingsFormContent(settings, url, errors = []) {
+  const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
+  const fields = SETTINGS_FIELDS.map(([key, label, kind]) => {
+    if (kind === "checkbox") return `<label class="checkbox-row"><input type="checkbox" name="${esc(key)}" value="1"${settings[key] === "1" ? " checked" : ""}> ${esc(label)}</label>`;
+    if (kind === "textarea") return textareaInput(key, label, settings[key] || "", 'rows="3"');
+    return textInput(key, label, settings[key] || "");
+  });
+  return `${messagePanel(url)}${errorBox}<section class="panel"><h3>Company Profile & Document Defaults</h3><p class="muted">These values appear on printable trip tickets, payroll slips, billing statements, SOA, and printable reports. No calculations or database schema are changed.</p><form method="post" action="/settings"><div class="grid">${fields.join("")}</div><p><button>Save Settings</button></p></form></section>`;
+}
+
+async function settingsPage(request, env, user, path) {
+  const access = requireEdit(user, "Settings");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  if (request.method === "POST") {
+    const data = await parseForm(request);
+    const values = cleanSettings(data);
+    const errors = values.company_email && !values.company_email.includes("@") ? ["Email must contain @ when provided."] : [];
+    if (errors.length) return html(layout({ title: "Settings", user, path, content: settingsFormContent(values, url, errors) }), 400);
+    for (const [key] of SETTINGS_FIELDS) {
+      await run(env, "INSERT INTO system_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, values[key]]);
+    }
+    return redirect("/settings?ok=Settings%20updated.");
+  }
+  return html(layout({ title: "Settings", user, path, content: settingsFormContent(await loadSettings(env), url) }));
 }
 
 const USER_ROLES = [
@@ -2609,6 +2728,7 @@ export async function handleRequest(request, env) {
   if (path === "/reports") return reportWorkspace(request, env, user, path);
   if (path === "/reports/print") return reportWorkspace(request, env, user, path, { print: true });
   if (path === "/reports/export.csv") return reportWorkspace(request, env, user, path, { exportCsv: true });
+  if (path === "/settings") return settingsPage(request, env, user, path);
   if (path === "/users") return usersPage(request, env, user, path);
   if (path === "/users/new") return userFormPage(request, env, user, path);
   if (path === "/users/export.csv") return usersExportPage(request, env, user, path);
