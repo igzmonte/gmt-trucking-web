@@ -666,7 +666,9 @@ test("master data create validates required and unique fields", async () => {
   const body = new URLSearchParams({ employee_code: "EMP-001", full_name: "", employee_type: "", daily_rate: "abc", trip_rate: "" });
   let response = await handleRequest(await authedRequest("https://example.test/employees/new", "admin", { method: "POST", body }), envWithRows());
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /full name is required/);
+  let text = await response.text();
+  assert.match(text, /full name is required/);
+  assert.match(text, /data-dialog/);
 
   const duplicateBody = new URLSearchParams({ employee_code: "EMP-001", full_name: "Driver One", employee_type: "Driver" });
   response = await handleRequest(await authedRequest("https://example.test/employees/new", "admin", { method: "POST", body: duplicateBody }), envWithRows({ duplicate: 99 }));
@@ -681,8 +683,8 @@ test("master data create saves cleaned values and redirects with success", async
   assert.equal(response.status, 303);
   assert.match(response.headers.get("location"), /Employees%20created/);
   assert.match(runs[0].sql, /INSERT INTO employees/);
-  assert.equal(runs[0].params.at(-3), "1200.5");
-  assert.equal(runs[0].params.at(-2), "0");
+  assert.equal(runs[0].params[8], "1200.5");
+  assert.equal(runs[0].params[9], "0");
 });
 
 test("master data permissions block viewer mutations and accounting access", async () => {
@@ -856,7 +858,8 @@ test("trip form exposes searchable dropdowns, recurring autofill data, and crew 
   assert.equal(response.status, 200);
   assert.match(text, /<script defer src="\/app\.js"><\/script>/);
   assert.match(text, /data-searchable-select/);
-  assert.match(text, /Type to filter options/);
+  assert.match(text, /role="combobox"/);
+  assert.match(text, /placeholder="Search or select/);
   assert.match(text, /data-trip-crew-guidance/);
   assert.match(text, /id="trip-form-data"/);
   assert.match(text, /"default_extra_note":"Handle carefully"/);
@@ -865,8 +868,9 @@ test("trip form exposes searchable dropdowns, recurring autofill data, and crew 
 
 test("dropdown browser enhancement filters native selects and applies trip template fields", () => {
   const script = fs.readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(script, /data-combobox/);
   assert.match(script, /select\.options/);
-  assert.match(script, /option\.hidden/);
+  assert.match(script, /combobox-option/);
   assert.match(script, /setSelectValue\(form, "client_id", master\.client_id\)/);
   assert.match(script, /setFieldValue\(form, "job_description", master\.job_description\)/);
   assert.match(script, /Template remarks:/);
@@ -1654,13 +1658,12 @@ test("dashboard shows operational metrics and hides finance-heavy sections by ro
   assert.match(text, /Ongoing Trips/);
   assert.match(text, /Completed Trips/);
   assert.match(text, /Receivables/);
-  assert.match(text, /Payroll Totals/);
-  assert.match(text, /Open Repairs/);
+  assert.match(text, /Open Advances/);
   assert.match(text, /Open Payables/);
-  assert.match(text, /Recent Trips/);
-  assert.match(text, /Recent Billing/);
-  assert.match(text, /Recent Collections/);
-  assert.match(text, /Recent Payroll/);
+  assert.match(text, /Recent Activity/);
+  assert.match(text, /data-tab="billing"/);
+  assert.match(text, /data-tab="collections"/);
+  assert.match(text, /data-tab="payroll"/);
   assert.match(text, /TT-ONGOING/);
   assert.match(text, /BILL-DASH/);
   assert.match(text, /RCPT-DASH/);
@@ -1669,8 +1672,8 @@ test("dashboard shows operational metrics and hides finance-heavy sections by ro
   assert.equal(response.status, 200);
   text = await response.text();
   assert.doesNotMatch(text, /Receivables/);
-  assert.doesNotMatch(text, /Recent Billing/);
-  assert.doesNotMatch(text, /Recent Payroll/);
+  assert.doesNotMatch(text, /data-tab="billing"/);
+  assert.doesNotMatch(text, /data-tab="payroll"/);
   assert.match(text, /Open Repairs/);
 });
 
@@ -1697,7 +1700,7 @@ test("reports permissions, selector, invalid date validation, and all report slu
     response = await handleRequest(await authedRequest(`https://example.test/reports?report=${slug}`, "viewer"), envWithRows());
     assert.equal(response.status, 200);
     const text = await response.text();
-    assert.match(text, /Printable Report/);
+    assert.match(text, />Print</);
     assert.match(text, /Export CSV/);
     assert.match(text, /No rows match this report and its filters/);
   }
@@ -1773,7 +1776,7 @@ test("settings page is admin-only and persists company defaults", async () => {
   assert.match(text, /Existing Company/);
   assert.match(text, /Default VAT enabled/);
   assert.match(text, /Company logo/);
-  assert.match(text, /Generate Statement of Account/);
+  assert.doesNotMatch(text, /Generate Statement of Account/);
 
   const body = new URLSearchParams({
     company_name: "Updated Logistics",
@@ -1957,12 +1960,69 @@ test("company logo appears on customer printables but not payslips", async () =>
   assert.doesNotMatch(text, /data:image\/png;base64,TE9HTw==/);
 });
 
+test("restored shell removes preview wording and published credentials", async () => {
+  const response = await handleRequest(new Request("https://example.test/login"), { ...envWithRows(), GMT_APP_NAME: "GMT Operations" });
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /GMT Operations/);
+  assert.doesNotMatch(text, /migration preview|Cloudflare Migration|characterization-only|test_admin/i);
+});
+
+test("master data forms open as grouped dialogs over their list pages", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/employees/new", "admin"), envWithRows({
+    employees: [{ id: 1, employee_code: "EMP-001", full_name: "Existing Employee", employee_type: "Driver", payroll_basis: "Per Trip", employment_status: "Active" }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /class="app-dialog app-dialog-wide"/);
+  assert.match(text, /Existing Employee/);
+  assert.match(text, /Identity/);
+  assert.match(text, /Contact/);
+  assert.match(text, /Employment/);
+  assert.match(text, /Compensation/);
+  assert.match(text, /name="address"/);
+  assert.match(text, /name="date_hired"/);
+  assert.match(text, /name="active"/);
+});
+
+test("short operational forms use dialogs while complex work uses sectioned workspaces", async () => {
+  let response = await handleRequest(await authedRequest("https://example.test/advances/vale/new", "admin"), envWithRows());
+  let text = await response.text();
+  assert.match(text, /data-dialog/);
+  assert.match(text, /Vale \/ Cash Advance/);
+
+  response = await handleRequest(await authedRequest("https://example.test/collections/new", "admin"), envWithRows());
+  text = await response.text();
+  assert.match(text, /data-dialog/);
+  assert.match(text, /Payment record/);
+
+  response = await handleRequest(await authedRequest("https://example.test/repairs/new", "admin"), envWithRows());
+  text = await response.text();
+  assert.match(text, /Repair Information/);
+  assert.match(text, /Cost Breakdown/);
+  assert.match(text, /data-repair-total/);
+});
+
+test("trip workspace hides JSON and renders semantic sections with pay item controls", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin"), envWithRows());
+  const text = await response.text();
+  assert.match(text, /Trip Overview/);
+  assert.match(text, /Route &amp; Schedule/);
+  assert.match(text, /Unit &amp; Crew/);
+  assert.match(text, /Employee Pay Rates/);
+  assert.match(text, /Trip \/ Unit Charges/);
+  assert.match(text, /type="hidden" name="driver_pay_items"/);
+  assert.match(text, /data-add-pay-item/);
+  assert.doesNotMatch(text, /pay items JSON/);
+});
+
 test("compact layout css reduces screen scale for dense forms", () => {
   const css = fs.readFileSync(new URL("../public/app.css", import.meta.url), "utf8");
-  assert.match(css, /font:13px\/1\.32/);
-  assert.match(css, /grid-template-columns:248px 1fr/);
-  assert.match(css, /grid-template-columns:repeat\(auto-fit,minmax\(160px,1fr\)\)/);
-  assert.match(css, /padding:6px 8px/);
+  assert.match(css, /grid-template-columns:230px minmax\(0,1fr\)/);
+  assert.match(css, /sidebar-scroll\{min-height:0;overflow-y:auto/);
+  assert.match(css, /app-main\{min-width:0;height:100vh;overflow-y:auto/);
+  assert.match(css, /trip-top\{grid-template-columns/);
+  assert.match(css, /report-filters\{display:grid/);
   assert.match(css, /settings-logo-block/);
 });
 

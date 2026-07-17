@@ -1,7 +1,7 @@
 import { canEdit, canView, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, hashPassword, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
-import { cards, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
+import { cards, dialogShell, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
 import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
 
@@ -16,8 +16,8 @@ const MASTER = {
     labels: ["Code", "Name", "Type", "Basis", "Status"],
     required: ["full_name", "employee_type"],
     unique: ["employee_code"],
-    numeric: ["daily_rate", "trip_rate"],
-    defaults: { employment_status: "Active", payroll_basis: "Per Trip", daily_rate: 0, trip_rate: 0 },
+    numeric: ["daily_rate", "trip_rate", "active"],
+    defaults: { employment_status: "Active", payroll_basis: "Per Trip", daily_rate: 0, trip_rate: 0, active: 1 },
     deleteRefs: [
       ["assets", "assigned_employee_id", "assigned fleet/equipment"],
       ["recurring_trip_masters", "default_driver_id", "recurring trips"],
@@ -30,8 +30,9 @@ const MASTER = {
     ],
     fields: [
       ["employee_code", "Employee code"], ["full_name", "Full name"], ["employee_type", "Employee type"],
-      ["contact_no", "Contact no"], ["employment_status", "Employment status"], ["payroll_basis", "Payroll basis"],
-      ["daily_rate", "Daily rate", "number"], ["trip_rate", "Trip rate", "number"], ["notes", "Notes"],
+      ["contact_no", "Contact no"], ["address", "Address"], ["date_hired", "Date hired", "date"],
+      ["employment_status", "Employment status"], ["payroll_basis", "Payroll basis"],
+      ["daily_rate", "Daily rate", "number"], ["trip_rate", "Trip rate", "number"], ["active", "Active", "boolean"], ["notes", "Notes", "textarea"],
     ],
   },
   "/fleet": {
@@ -107,19 +108,20 @@ function errorResponse(error, user, path = "/") {
 }
 
 async function login(request, env) {
-  if (request.method === "GET") return html(loginPage());
+  const appName = env.GMT_APP_NAME || "GMT Trucking";
+  if (request.method === "GET") return html(loginPage("", appName));
   const data = await parseForm(request);
   let user;
   try {
     user = await first(env, "SELECT * FROM users WHERE username=? AND active=1", [data.username || ""]);
   } catch (error) {
     if (String(error?.message || error).toLowerCase().includes("users")) {
-      return html(loginPage("Database is not initialized yet. Run the D1 setup SQL scripts first."), 503);
+      return html(loginPage("Database is not initialized yet. Run the D1 setup SQL scripts first.", appName), 503);
     }
     throw error;
   }
   if (!user || !(await verifyPassword(data.password || "", user.password_hash))) {
-    return html(loginPage("Invalid username or password."), 401);
+    return html(loginPage("Invalid username or password.", appName), 401);
   }
   const token = await createSession(user, env.GMT_SESSION_SECRET || "development-secret");
   return redirectWithHeaders("/", sessionHeaders(token));
@@ -246,30 +248,22 @@ async function dashboardPage(env, user, path) {
     all(env, "SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id ORDER BY co.collection_date DESC, co.id DESC LIMIT 5"),
     all(env, "SELECT p.*, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id ORDER BY p.pay_date DESC, p.id DESC LIMIT 5"),
   ]);
-  const cardItems = [
-    ["Trips", data.trips],
-    ["Ongoing Trips", data.ongoing],
-    ["Completed Trips", data.completed],
-    ["Active Employees", data.employees],
-  ];
-  if (canView(user, "Billing")) cardItems.push(["Receivables", peso(data.receivables)]);
-  if (canView(user, "Payroll")) cardItems.push(["Payroll Totals", peso(payroll?.total || 0)]);
-  if (canView(user, "Repairs")) cardItems.push(["Open Repairs", repairs?.total || 0]);
-  if (canView(user, "Payables")) cardItems.push(["Open Payables", peso(payables?.total || 0)]);
-  if (canView(user, "Vale / Cash Advance")) {
-    cardItems.push(["Open Vale", peso(vale?.total || 0)]);
-    cardItems.push(["Open Cash Advance", peso(cash?.total || 0)]);
-  }
+  const finance = canView(user, "Billing") || canView(user, "Payables");
+  const advanceTotal = Number(vale?.total || 0) + Number(cash?.total || 0);
+  const cardItems = finance
+    ? [["Ongoing Trips", data.ongoing], ["Completed Trips", data.completed], ["Active Employees", data.employees], ["Receivables", peso(data.receivables)], ["Open Payables", peso(payables?.total || 0)], ["Open Advances", peso(advanceTotal)]]
+    : [["Total Trips", data.trips], ["Ongoing Trips", data.ongoing], ["Completed Trips", data.completed], ["Active Employees", data.employees], ["Open Repairs", repairs?.total || 0], ["Payroll Total", canView(user, "Payroll") ? peso(payroll?.total || 0) : "—"]];
   const tripsBody = recentTrips.map((row) => `<tr><td><a href="/trips/${row.id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.trip_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.status)}</td></tr>`);
   const billingBody = recentBillings.map((row) => `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.grand_total)}${moneyCell(outstandingBalance(row.grand_total, row.paid_amount))}</tr>`);
   const collectionBody = recentCollections.map((row) => `<tr><td>${esc(row.collection_date)}</td><td>${esc(row.billing_no || "")}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.reference_no || "")}</td>${moneyCell(row.amount_paid)}</tr>`);
   const payrollBody = recentPayroll.map((row) => `<tr><td><a href="/payroll/${row.id}">${esc(row.pay_date)}</a></td><td>${esc(row.full_name || "")}</td><td>${esc(row.employee_type || "")}</td>${moneyCell(row.net_pay)}</tr>`);
-  const financeTables = [
-    canView(user, "Billing") ? `<section class="panel"><h3>Recent Billing</h3></section>${table(["Billing No.", "Client", "Grand Total", "Balance"], billingBody, { empty: "No recent billings." })}` : "",
-    canView(user, "Collections") ? `<section class="panel"><h3>Recent Collections</h3></section>${table(["Date", "Billing No.", "Client", "Ref. No.", "Amount"], collectionBody, { empty: "No recent collections." })}` : "",
-    canView(user, "Payroll") ? `<section class="panel"><h3>Recent Payroll</h3></section>${table(["Pay Date", "Employee", "Type", "Net Pay"], payrollBody, { empty: "No recent payroll entries." })}` : "",
-  ].join("");
-  const content = `<section class="panel">${cards(cardItems)}</section><section class="panel"><h3>Recent Trips</h3></section>${table(["Trip Ticket / Waybill", "Date", "Client", "Status"], tripsBody, { empty: "No recent trips." })}${financeTables}`;
+  const activityTabs = [
+    ["trips", "Trips", table(["Trip Ticket / Waybill", "Date", "Client", "Status"], tripsBody, { empty: "No recent trips.", bare: true })],
+    ...(canView(user, "Billing") ? [["billing", "Billing", table(["Billing No.", "Client", "Grand Total", "Balance"], billingBody, { empty: "No recent billings.", bare: true })]] : []),
+    ...(canView(user, "Collections") ? [["collections", "Collections", table(["Date", "Billing No.", "Client", "Ref. No.", "Amount"], collectionBody, { empty: "No recent collections.", bare: true })]] : []),
+    ...(canView(user, "Payroll") ? [["payroll", "Payroll", table(["Pay Date", "Employee", "Type", "Net Pay"], payrollBody, { empty: "No recent payroll entries.", bare: true })]] : []),
+  ];
+  const content = `<section class="panel">${cards(cardItems)}</section><section class="panel activity-panel" data-tabs><div class="activity-header"><h3>Recent Activity</h3></div><div class="tab-list" role="tablist">${activityTabs.map(([key, label]) => `<button type="button" class="tab-button" data-tab="${key}" role="tab">${esc(label)}</button>`).join("")}</div>${activityTabs.map(([key, , markup]) => `<div class="tab-panel" data-tab-panel="${key}" role="tabpanel">${markup}</div>`).join("")}</section>`;
   return html(layout({ title: "Dashboard", user, path, content }));
 }
 
@@ -347,15 +341,31 @@ async function validateMaster(env, spec, values, id = null) {
 }
 
 function renderMasterForm(user, path, spec, row, id, errors = []) {
-  const fields = spec.fields.map(([name, label, kind]) => kind === "number" ? numberInput(name, label, row[name] ?? spec.defaults?.[name] ?? 0) : textInput(name, label, row[name] ?? spec.defaults?.[name] ?? ""));
+  const renderField = ([name, label, kind]) => {
+    const value = row[name] ?? spec.defaults?.[name] ?? "";
+    if (kind === "number") return numberInput(name, label, value);
+    if (kind === "date") return textInput(name, label, value, 'type="date"');
+    if (kind === "boolean") return selectInput(name, label, [{ id: "1", name: "Active" }, { id: "0", name: "Inactive" }], String(value), (item) => item.name, "");
+    if (kind === "textarea") return textareaInput(name, label, value, 'rows="2"');
+    return textInput(name, label, value);
+  };
+  const fields = spec.fields.map(renderField);
   const deleteForm = id ? `<form method="post" action="${path}/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this ${esc(spec.title)} record? This is blocked when related records exist.');"><button class="danger">Delete</button><span class="muted">Deletion is guarded when this record is used by trips, billing, payroll, or related records.</span></form>` : "";
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
-  return `${errorBox}${formPanel(id ? `${path}/${id}/edit` : `${path}/new`, fields, "Save")}${deleteForm}`;
+  let form;
+  if (spec.page === "Employees") {
+    const groups = [
+      ["Identity", fields.slice(0, 3)], ["Contact", fields.slice(3, 5)],
+      ["Employment", fields.slice(5, 9)], ["Compensation", fields.slice(9)],
+    ];
+    form = `<form method="post" action="${id ? `${path}/${id}/edit` : `${path}/new`}" class="app-form"><div class="grid-2">${groups.map(([title, items]) => `<section class="workspace-card"><h3>${title}</h3><div class="field-grid">${items.join("")}</div></section>`).join("")}</div><div class="form-actions"><button>Save Employee</button><a class="button secondary" href="${path}">Cancel</a></div></form>`;
+  } else {
+    form = formPanel(id ? `${path}/${id}/edit` : `${path}/new`, fields, "Save", { cancelHref: path });
+  }
+  return `${errorBox}${form}${deleteForm}`;
 }
 
-async function masterList(request, env, user, path, spec) {
-  const access = requireView(user, spec.page);
-  if (access) return errorResponse(access, user, path);
+async function masterListContent(request, env, user, path, spec) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
@@ -367,8 +377,13 @@ async function masterList(request, env, user, path, spec) {
   const exportParams = new URLSearchParams();
   if (query) exportParams.set("q", query);
   const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search ${esc(spec.title)}"><button>Search</button></form><div>${canEdit(user, spec.page) ? `<a class="button" href="${path}/new">New Record</a>` : ""} <a class="button secondary" href="${path}/export.csv${exportParams.toString() ? `?${exportParams.toString()}` : ""}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table([...spec.labels, "Actions"], bodyRows, { empty: `No ${spec.title.toLowerCase()} found.` })}${pagination(path, query, page, Number(countRow?.total || 0))}`;
-  return html(layout({ title: spec.title, user, path, content }));
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table([...spec.labels, "Actions"], bodyRows, { empty: `No ${spec.title.toLowerCase()} found.` })}${pagination(path, query, page, Number(countRow?.total || 0))}`;
+}
+
+async function masterList(request, env, user, path, spec) {
+  const access = requireView(user, spec.page);
+  if (access) return errorResponse(access, user, path);
+  return html(layout({ title: spec.title, user, path, content: await masterListContent(request, env, user, path, spec) }));
 }
 
 async function masterForm(request, env, user, path, spec, id = null) {
@@ -380,26 +395,34 @@ async function masterForm(request, env, user, path, spec, id = null) {
     const data = await parseForm(request);
     const valuesByField = masterValues(spec, data);
     const errors = await validateMaster(env, spec, valuesByField, id);
-    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, valuesByField, id, errors) }), 400);
+    if (errors.length) {
+      const list = await masterListContent(request, env, user, path, spec);
+      const dialog = dialogShell({ title: `${id ? "Edit" : "New"} ${spec.title}`, subtitle: id ? "Update record" : "Create record", body: renderMasterForm(user, path, spec, valuesByField, id, errors), closeHref: path });
+      return html(layout({ title: spec.title, user, path, content: `${list}${dialog}` }), 400);
+    }
     const fields = spec.fields.map(([name]) => name);
     const values = fields.map((name) => valuesByField[name]);
     if (id) {
       try {
         await run(env, `UPDATE ${spec.table} SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...values, id]);
       } catch (error) {
-        return html(layout({ title: `Edit ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, valuesByField, id, [`Could not save record: ${error.message || error}`]) }), 400);
+        const list = await masterListContent(request, env, user, path, spec);
+        return html(layout({ title: spec.title, user, path, content: `${list}${dialogShell({ title: `Edit ${spec.title}`, subtitle: "Update record", body: renderMasterForm(user, path, spec, valuesByField, id, [`Could not save record: ${error.message || error}`]), closeHref: path })}` }), 400);
       }
       return redirect(`${path}?ok=${encodeURIComponent(`${spec.title} updated.`)}`);
     } else {
       try {
         await run(env, `INSERT INTO ${spec.table} (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, values);
       } catch (error) {
-        return html(layout({ title: `New ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, valuesByField, id, [`Could not save record: ${error.message || error}`]) }), 400);
+        const list = await masterListContent(request, env, user, path, spec);
+        return html(layout({ title: spec.title, user, path, content: `${list}${dialogShell({ title: `New ${spec.title}`, subtitle: "Create record", body: renderMasterForm(user, path, spec, valuesByField, id, [`Could not save record: ${error.message || error}`]), closeHref: path })}` }), 400);
       }
       return redirect(`${path}?ok=${encodeURIComponent(`${spec.title} created.`)}`);
     }
   }
-  return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: renderMasterForm(user, path, spec, row, id) }));
+  const list = await masterListContent(request, env, user, path, spec);
+  const dialog = dialogShell({ title: `${id ? "Edit" : "New"} ${spec.title}`, subtitle: id ? "Update record" : "Create record", body: renderMasterForm(user, path, spec, row, id), closeHref: path });
+  return html(layout({ title: spec.title, user, path, content: `${list}${dialog}` }));
 }
 
 async function masterDelete(request, env, user, path, spec, id) {
@@ -786,33 +809,6 @@ function browserJson(value) {
 async function renderTripForm(env, row = {}, id = null, errors = []) {
   const existingHelpers = row.helpers || [];
   const [clients, assets, drivers, helpers, masters] = await tripChoices(env, row.recurring_master_id || "");
-  const fields = [
-    textInput("trip_ticket_no", "Trip Ticket / Waybill", row.trip_ticket_no || ""),
-    textInput("reference_no", "Ref. No.", row.reference_no || ""),
-    textInput("trip_date", "Trip date", row.trip_date || todayISO(), 'type="date" required'),
-    selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], row.trip_type || "Spot Trip", (r) => r.name, ""),
-    selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT),
-    selectInput("status", "Status", TRIP_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Planned", (r) => r.name, ""),
-    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT),
-    textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'),
-    textInput("origin", "Origin", row.origin || ""),
-    textInput("destination", "Destination", row.destination || ""),
-    textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'),
-    textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'),
-    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
-    selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
-    selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
-    selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
-    selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
-    `<p class="trip-crew-guidance muted" data-trip-crew-guidance aria-live="polite">Select an asset to see its helper allowance.</p>`,
-    numberInput("driver_pay_rate", "Driver pay rate", row.driver_pay_rate ?? 0),
-    numberInput("helper_pay_rate", "Helper pay rate", row.helper_pay_rate ?? 0),
-    numberInput("base_trip_rate", "Base trip rate", row.base_trip_rate ?? 0),
-    ...EXTRA_FIELDS.map((field) => numberInput(field, field.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase()), row[field] ?? 0)),
-    textareaInput("driver_pay_items", "Driver pay items JSON", row.driver_pay_items ?? payItemsJson(row.pay_items, "Driver"), 'rows="2" placeholder=\'[{"label":"Allowance","amount":100}]\''),
-    textareaInput("helper_pay_items", "Helper pay items JSON", row.helper_pay_items ?? payItemsJson(row.pay_items, "Helper"), 'rows="2" placeholder=\'[{"label":"Loading","amount":50}]\''),
-    textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
-  ];
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   const tripFormData = {
     assets: assets.map((asset) => ({ id: asset.id, asset_code: asset.asset_code, asset_type: asset.asset_type, helper_limit: HELPER_LIMITS[asset.asset_type] ?? 3 })),
@@ -832,7 +828,19 @@ async function renderTripForm(env, row = {}, id = null, errors = []) {
       remarks: master.remarks || "",
     })),
   };
-  return `${errorBox}<section data-trip-form>${formPanel(id ? `/trips/${id}/edit` : "/trips/new", fields, "Save Trip")}</section><script id="trip-form-data" type="application/json">${browserJson(tripFormData)}</script>`;
+  const action = id ? `/trips/${id}/edit` : "/trips/new";
+  const overview = [
+    textInput("trip_ticket_no", "Trip Ticket / Waybill", row.trip_ticket_no || ""), textInput("reference_no", "Ref. No.", row.reference_no || ""),
+    textInput("trip_date", "Trip date", row.trip_date || todayISO(), 'type="date" required'), selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], row.trip_type || "Spot Trip", (r) => r.name, ""),
+    selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT), selectInput("status", "Status", TRIP_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Planned", (r) => r.name, ""),
+  ];
+  const route = [selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT), textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'), textInput("origin", "Origin", row.origin || ""), textInput("destination", "Destination", row.destination || ""), textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'), textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'), textareaInput("notes", "Notes", row.notes || "", 'rows="2"')];
+  const crew = [selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT), selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT)];
+  const driverJson = row.driver_pay_items ?? payItemsJson(row.pay_items, "Driver");
+  const helperJson = row.helper_pay_items ?? payItemsJson(row.pay_items, "Helper");
+  const charges = EXTRA_FIELDS.map((field) => numberInput(field, field.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase()), row[field] ?? 0)).join("");
+  const form = `<section data-trip-form><form method="post" action="${action}" class="app-form trip-workspace"><div class="workspace-grid trip-top"><section class="workspace-card"><h3>Trip Overview</h3><div class="field-grid">${overview.join("")}</div></section><section class="workspace-card"><h3>Route &amp; Schedule</h3><div class="field-grid">${route.join("")}</div></section><section class="workspace-card"><h3>Unit &amp; Crew</h3><div class="field-grid">${crew.join("")}<p class="trip-crew-guidance muted" data-trip-crew-guidance aria-live="polite">Select an asset to see its helper allowance.</p></div></section></div><div class="workspace-grid trip-rates"><section class="workspace-card"><h3>Employee Pay Rates</h3><div class="field-grid one">${numberInput("driver_pay_rate", "Driver pay rate", row.driver_pay_rate ?? 0)}${numberInput("helper_pay_rate", "Helper pay rate", row.helper_pay_rate ?? 0)}</div></section><section class="workspace-card"><h3>Trip / Unit Charges</h3><div class="charge-grid">${numberInput("base_trip_rate", "Base trip rate", row.base_trip_rate ?? 0)}${charges}</div></section></div><section class="workspace-card"><h3>Pay Items</h3><input type="hidden" name="driver_pay_items" value="${esc(driverJson)}"><input type="hidden" name="helper_pay_items" value="${esc(helperJson)}"><div class="pay-items-area"><div class="pay-item-group" data-pay-items="driver"><h4>Driver Pay Items</h4><div data-pay-item-rows></div><button type="button" data-add-pay-item>Add Driver Item</button></div><div class="pay-item-group" data-pay-items="helper"><h4>Helper Pay Items</h4><div data-pay-item-rows></div><button type="button" data-add-pay-item>Add Helper Item</button></div></div><div class="trip-summary-bar"><div><span>Base</span><strong data-trip-base>0.00</strong></div><div><span>Extras</span><strong data-trip-extras>0.00</strong></div><div><span>Total</span><strong data-trip-total>0.00</strong></div></div></section><div class="sticky-actions"><a class="button secondary" href="/trips">Cancel</a><button>Save Trip</button></div></form></section>`;
+  return `${errorBox}${form}<script id="trip-form-data" type="application/json">${browserJson(tripFormData)}</script>`;
 }
 
 async function saveTrip(env, values, helpers, payItems, id = null) {
@@ -1035,22 +1043,10 @@ async function repairChoices(env) {
 
 async function renderRepairForm(env, row = {}, id = null, errors = []) {
   const [assets, suppliers] = await repairChoices(env);
-  const fields = [
-    textInput("repair_date", "Repair date", row.repair_date || todayISO(), 'type="date" required'),
-    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
-    textareaInput("repair_description", "Description", row.repair_description || "", 'rows="2" required'),
-    textInput("meter_value", "Meter value", row.meter_value || ""),
-    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", SEARCHABLE_SELECT),
-    numberInput("parts_cost", "Parts cost", row.parts_cost ?? 0),
-    numberInput("labor_cost", "Labor cost", row.labor_cost ?? 0),
-    numberInput("other_cost", "Other cost", row.other_cost ?? 0),
-    selectInput("status", "Status", REPAIR_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, ""),
-    selectInput("auto_generate_payable", "Auto-generate payable", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.auto_generate_payable ? "1" : "0", (r) => r.name, ""),
-    textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
-  ];
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   const deleteForm = id ? `<form method="post" action="/repairs/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this repair?');"><button class="danger">Delete</button></form>` : "";
-  return `${errorBox}${formPanel(id ? `/repairs/${id}/edit` : "/repairs/new", fields, "Save Repair")}${deleteForm}`;
+  const action = id ? `/repairs/${id}/edit` : "/repairs/new";
+  return `${errorBox}<form method="post" action="${action}" class="app-form" data-repair-form><div class="workspace-grid repair-layout"><div><section class="workspace-card"><h3>Repair Information</h3><div class="field-grid">${textInput("repair_date", "Repair date", row.repair_date || todayISO(), 'type="date" required')}${textareaInput("repair_description", "Description", row.repair_description || "", 'rows="2" required')}${textInput("meter_value", "Meter value", row.meter_value || "")}${selectInput("status", "Status", REPAIR_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, "")}</div></section><section class="workspace-card"><h3>Supplier / Unit</h3><div class="field-grid">${selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT)}${selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", SEARCHABLE_SELECT)}</div></section></div><div><section class="workspace-card"><h3>Cost Breakdown</h3><div class="cost-grid">${numberInput("parts_cost", "Parts cost", row.parts_cost ?? 0)}${numberInput("labor_cost", "Labor cost", row.labor_cost ?? 0)}${numberInput("other_cost", "Other cost", row.other_cost ?? 0)}</div><div class="calculated-total"><span>Total Cost</span><strong>₱ <span data-repair-total>0.00</span></strong></div></section><section class="workspace-card"><h3>Payable Options &amp; Notes</h3><div class="field-grid">${selectInput("auto_generate_payable", "Auto-generate payable", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.auto_generate_payable ? "1" : "0", (r) => r.name, "")}${textareaInput("notes", "Notes", row.notes || "", 'rows="3"')}</div></section></div></div><div class="form-actions"><a class="button secondary" href="/repairs">Cancel</a><button>Save Repair</button></div></form>${deleteForm}`;
 }
 
 async function validateRepair(values) {
@@ -1346,7 +1342,7 @@ async function renderAdvanceForm(env, type, row = {}, id = null, errors = []) {
   const spec = ADVANCE_SPECS[type];
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   const deleteForm = id ? `<form method="post" action="/advances/${type}/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this ${esc(spec.title)} record?');"><button class="danger">Delete</button></form>` : "";
-  return `${errorBox}${formPanel(id ? `/advances/${type}/${id}/edit` : `/advances/${type}/new`, fields, `Save ${spec.title}`)}${deleteForm}`;
+  return `${errorBox}${formPanel(id ? `/advances/${type}/${id}/edit` : `/advances/${type}/new`, fields, `Save ${spec.title}`, { cancelHref: "/advances" })}${deleteForm}`;
 }
 
 function advanceWhere(query, alias = "v") {
@@ -1357,9 +1353,7 @@ function advanceWhere(query, alias = "v") {
   };
 }
 
-async function advancesPage(request, env, user, path) {
-  const access = requireView(user, "Vale / Cash Advance");
-  if (access) return errorResponse(access, user, path);
+async function advancesListContent(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const valePage = Math.max(1, Number(url.searchParams.get("vale_page") || 1) || 1);
@@ -1377,8 +1371,13 @@ async function advancesPage(request, env, user, path) {
   const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search advances"><button>Search</button></form><div>${canEdit(user, "Vale / Cash Advance") ? `<a class="button" href="/advances/vale/new">New Vale</a> <a class="button" href="/advances/cash/new">New Cash Advance</a>` : ""}</div></div>`;
   const valeBody = valeRows.map((row) => `<tr><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/vale/${row.id}/edit">${esc(row.employee_name || "")}</a>` : esc(row.employee_name || "")}</td><td>${esc(row.date_granted)}</td>${moneyCell(row.amount)}${moneyCell(row.installment_amount)}${moneyCell(row.balance)}<td><span class="status">${esc(row.status)}</span></td><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/vale/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
   const cashBody = cashRows.map((row) => `<tr><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/cash/${row.id}/edit">${esc(row.employee_name || "")}</a>` : esc(row.employee_name || "")}</td><td>${esc(row.date_granted)}</td>${moneyCell(row.amount)}${moneyCell(row.balance)}<td>${row.applied ? "Yes" : "No"}</td><td><span class="status">${esc(row.status)}</span></td><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/cash/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section><section class="panel"><div class="toolbar"><h3>Vale</h3><a class="button secondary" href="${esc(`/advances/vale/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Vale CSV</a></div></section>${table(["Employee", "Date", "Amount", "Installment", "Balance", "Status", "Actions"], valeBody, { empty: "No vale records found." })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["cash_page", String(cashPage)]]), "vale_page", valePage, Number(valeCount?.total || 0))}<section class="panel"><div class="toolbar"><h3>Cash Advance</h3><a class="button secondary" href="${esc(`/advances/cash/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Cash CSV</a></div></section>${table(["Employee", "Date", "Amount", "Balance", "Applied", "Status", "Actions"], cashBody, { empty: "No cash advances found." })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["vale_page", String(valePage)]]), "cash_page", cashPage, Number(cashCount?.total || 0))}`;
-  return html(layout({ title: "Vale / Cash Advance", user, path, content }));
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section><section class="panel"><div class="toolbar"><h3>Vale</h3><a class="button secondary" href="${esc(`/advances/vale/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Vale CSV</a></div>${table(["Employee", "Date", "Amount", "Installment", "Balance", "Status", "Actions"], valeBody, { empty: "No vale records found.", bare: true })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["cash_page", String(cashPage)]]), "vale_page", valePage, Number(valeCount?.total || 0))}</section><section class="panel"><div class="toolbar"><h3>Cash Advance</h3><a class="button secondary" href="${esc(`/advances/cash/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Cash CSV</a></div>${table(["Employee", "Date", "Amount", "Balance", "Applied", "Status", "Actions"], cashBody, { empty: "No cash advances found.", bare: true })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["vale_page", String(valePage)]]), "cash_page", cashPage, Number(cashCount?.total || 0))}</section>`;
+}
+
+async function advancesPage(request, env, user, path) {
+  const access = requireView(user, "Vale / Cash Advance");
+  if (access) return errorResponse(access, user, path);
+  return html(layout({ title: "Vale / Cash Advance", user, path, content: await advancesListContent(request, env, user, path) }));
 }
 
 async function advanceFormPage(request, env, user, path, type, id = null) {
@@ -1391,17 +1390,17 @@ async function advanceFormPage(request, env, user, path, type, id = null) {
   if (request.method === "POST") {
     const values = advanceValues(await parseForm(request), type);
     const errors = validateAdvance(values, type);
-    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: await renderAdvanceForm(env, type, values, id, errors) }), 400);
+    if (errors.length) return html(layout({ title: "Vale / Cash Advance", user, path, content: `${await advancesListContent(request, env, user, path)}${dialogShell({ title: `${id ? "Edit" : "New"} ${spec.title}`, subtitle: "Advance record", body: await renderAdvanceForm(env, type, values, id, errors), closeHref: "/advances", wide: false })}` }), 400);
     const fields = Object.keys(values);
     try {
       if (id) await run(env, `UPDATE ${spec.table} SET ${fields.map((field) => `${field}=?`).join(", ")} WHERE id=?`, [...fields.map((field) => values[field]), id]);
       else await run(env, `INSERT INTO ${spec.table} (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
       return redirect(`/advances?ok=${encodeURIComponent(`${spec.title} ${id ? "updated" : "saved"}.`)}`);
     } catch (error) {
-      return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: await renderAdvanceForm(env, type, values, id, [`Could not save ${spec.title}: ${error.message || error}`]) }), 400);
+      return html(layout({ title: "Vale / Cash Advance", user, path, content: `${await advancesListContent(request, env, user, path)}${dialogShell({ title: `${id ? "Edit" : "New"} ${spec.title}`, subtitle: "Advance record", body: await renderAdvanceForm(env, type, values, id, [`Could not save ${spec.title}: ${error.message || error}`]), closeHref: "/advances", wide: false })}` }), 400);
     }
   }
-  return html(layout({ title: `${id ? "Edit" : "New"} ${spec.title}`, user, path, content: await renderAdvanceForm(env, type, row, id) }));
+  return html(layout({ title: "Vale / Cash Advance", user, path, content: `${await advancesListContent(request, env, user, path)}${dialogShell({ title: `${id ? "Edit" : "New"} ${spec.title}`, subtitle: "Advance record", body: await renderAdvanceForm(env, type, row, id), closeHref: "/advances", wide: false })}` }));
 }
 
 async function advanceDeletePage(request, env, user, path, type, id) {
@@ -2222,7 +2221,7 @@ async function collectionFormContent(env, row, errors = [], id = null) {
   ];
   const summary = selectedBilling ? `<section class="panel">${cards([["Billing", selectedBilling.billing_no], ["Client", selectedBilling.client_name || ""], ["Available Balance", peso(outstanding)], ["Status", billingStatus(selectedBilling.grand_total, selectedBilling.paid_amount)]])}</section>` : "";
   const deleteForm = id ? `<section class="detail-danger"><form method="post" action="/collections/${id}/delete" onsubmit="return confirm('Delete this collection and recalculate billing balance?');"><button class="danger-button">Delete Collection</button></form></section>` : "";
-  return `${errorBox}${summary}${formPanel(id ? `/collections/${id}/edit` : "/collections/new", fields, "Save Collection")}${deleteForm}`;
+  return `${errorBox}${summary}${formPanel(id ? `/collections/${id}/edit` : "/collections/new", fields, "Save Collection", { cancelHref: "/collections" })}${deleteForm}`;
 }
 
 async function validateCollection(env, values, id = null, original = null) {
@@ -2240,9 +2239,7 @@ async function validateCollection(env, values, id = null, original = null) {
   return { errors, billing };
 }
 
-async function collectionsPage(request, env, user, path) {
-  const access = requireView(user, "Collections");
-  if (access) return errorResponse(access, user, path);
+async function collectionsListContent(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
@@ -2253,8 +2250,13 @@ async function collectionsPage(request, env, user, path) {
   const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY co.collection_date DESC, co.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((row) => `<tr><td>${esc(row.collection_date)}</td><td><a href="/billing/${row.billing_id}">${esc(row.billing_no || "")}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.amount_paid)}<td>${esc(row.reference_no || "")}</td><td>${esc(row.payment_method || "")}</td><td>${canEdit(user, "Collections") ? `<a href="/collections/${row.id}/edit">Edit</a>` : "—"}</td></tr>`);
   const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search collections"><button>Search</button></form><div>${canEdit(user, "Collections") ? `<a class="button" href="/collections/new">New Collection</a>` : ""} <a class="button secondary" href="${esc(`/collections/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Billing No.", "Client", "Amount", "Reference", "Method", "Actions"], body, { empty: "No collections found." })}${paginationWithParams("/collections", params, page, Number(countRow?.total || 0))}`;
-  return html(layout({ title: "Collections", user, path, content }));
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Billing No.", "Client", "Amount", "Reference", "Method", "Actions"], body, { empty: "No collections found." })}${paginationWithParams("/collections", params, page, Number(countRow?.total || 0))}`;
+}
+
+async function collectionsPage(request, env, user, path) {
+  const access = requireView(user, "Collections");
+  if (access) return errorResponse(access, user, path);
+  return html(layout({ title: "Collections", user, path, content: await collectionsListContent(request, env, user, path) }));
 }
 
 async function collectionFormPage(request, env, user, path, id = null) {
@@ -2267,7 +2269,7 @@ async function collectionFormPage(request, env, user, path, id = null) {
   values.original_amount_paid = original?.amount_paid || 0;
   if (request.method === "POST") {
     const { errors, billing } = await validateCollection(env, values, id, original);
-    if (errors.length) return html(layout({ title: id ? "Edit Collection" : "New Collection", user, path, content: await collectionFormContent(env, { ...source, ...values }, errors, id) }), 400);
+    if (errors.length) return html(layout({ title: "Collections", user, path, content: `${await collectionsListContent(request, env, user, path)}${dialogShell({ title: id ? "Edit Collection" : "New Collection", subtitle: "Payment record", body: await collectionFormContent(env, { ...source, ...values }, errors, id), closeHref: "/collections", wide: false })}` }), 400);
     values.client_id = billing.client_id;
     if (id) await run(env, "UPDATE collections SET collection_date=?, client_id=?, billing_id=?, amount_paid=?, reference_no=?, payment_method=?, notes=? WHERE id=?", [values.collection_date, values.client_id, values.billing_id, values.amount_paid, values.reference_no, values.payment_method, values.notes, id]);
     else await run(env, "INSERT INTO collections (collection_date, client_id, billing_id, amount_paid, reference_no, payment_method, notes) VALUES (?,?,?,?,?,?,?)", [values.collection_date, values.client_id, values.billing_id, values.amount_paid, values.reference_no, values.payment_method, values.notes]);
@@ -2275,7 +2277,7 @@ async function collectionFormPage(request, env, user, path, id = null) {
     if (id && original.billing_id && String(original.billing_id) !== String(values.billing_id)) await recalcBillingStatus(env, original.billing_id);
     return redirect(`/collections?ok=${encodeURIComponent("Collection saved and billing balance recalculated.")}`);
   }
-  return html(layout({ title: id ? "Edit Collection" : "New Collection", user, path, content: await collectionFormContent(env, source, [], id) }));
+  return html(layout({ title: "Collections", user, path, content: `${await collectionsListContent(request, env, user, path)}${dialogShell({ title: id ? "Edit Collection" : "New Collection", subtitle: "Payment record", body: await collectionFormContent(env, source, [], id), closeHref: "/collections", wide: false })}` }));
 }
 
 async function collectionDeletePage(request, env, user, path, id) {
@@ -2464,7 +2466,7 @@ function reportForm(filters) {
   const params = reportParams(filters);
   const options = REPORTS.map(([slug, label]) => `<option value="${esc(slug)}"${filters.report === slug ? " selected" : ""}>${esc(label)}</option>`).join("");
   const statusOptions = `<option value="">All statuses</option>${REPORT_STATUSES.map((status) => `<option value="${esc(status)}"${filters.status === status ? " selected" : ""}>${esc(status)}</option>`).join("")}`;
-  return `<section class="panel report-filter-panel"><form method="get" class="report-filters"><label>Report<select name="report">${options}</select></label><label>Search<input name="q" value="${esc(filters.q)}"></label><label>Date From<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date To<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><label>Status<select name="status">${statusOptions}</select></label><button>Load Report</button><a class="button secondary" href="/reports/print?${esc(params.toString())}" target="_blank">Printable Report</a><a class="button secondary" href="/reports/export.csv?${esc(params.toString())}">Export CSV</a></form></section>`;
+  return `<section class="panel report-filter-panel"><form method="get" class="report-filters"><label>Report<select name="report">${options}</select></label><label>Search<input name="q" value="${esc(filters.q)}" placeholder="Search report"></label><label>Date From<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date To<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><label>Status<select name="status">${statusOptions}</select></label><div class="report-actions"><button>Load Report</button><a class="button secondary" href="/reports/print?${esc(params.toString())}" target="_blank">Print</a><a class="button secondary" href="/reports/export.csv?${esc(params.toString())}">Export CSV</a></div></form></section>`;
 }
 
 function reportTable(result) {
@@ -2504,7 +2506,7 @@ async function reportWorkspace(request, env, user, path, { print = false, export
     const filterTags = activeFilters.length ? activeFilters.map(([label, value]) => `<span class="filter"><strong>${esc(label)}:</strong> ${esc(value)}</span>`).join("") : `<span class="filter">No filters applied</span>`;
     return html(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(result.label)}</title><style>@page{size:A4 landscape;margin:11mm}body{font:10pt Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm}.print-button{margin-bottom:10px}.header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:10px}h1{font-size:18pt;margin:0 0 3px}h2{font-size:14pt;margin:0 0 4px}.muted{color:#555}.meta{font-size:9pt;text-align:right;line-height:1.45}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px}.filter{border:1px solid #bbb;border-radius:12px;padding:3px 8px;font-size:9pt}table{width:100%;border-collapse:collapse}th,td{border:1px solid #444;padding:4px 5px;vertical-align:top}th{background:#eee;text-align:left}tfoot td{font-weight:bold;background:#f7f7f7}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.report-empty{text-align:center;padding:18px}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="header"><div><h1>GMT Trucking</h1><h2>${esc(result.label)}</h2><div class="muted">${esc(result.description)}</div></div><div class="meta"><div><strong>Generated:</strong> ${esc(new Date().toISOString())}</div><div><strong>Rows:</strong> ${esc(result.row_count)}</div></div></div><div class="filters">${filterTags}</div>${reportTable(result)}</div></body></html>`);
   }
-  const heading = `<section class="report-heading"><div><span class="dialog-kicker">Operational and Financial Report</span><h3>${esc(result.label)}</h3><p>${esc(result.description)}</p></div><div class="report-count"><strong>${esc(result.row_count)}</strong><span>row${result.row_count === 1 ? "" : "s"}</span></div></section>`;
+  const heading = `<section class="report-heading"><div><span class="dialog-kicker">Operational and Financial Report</span><h3>${esc(result.label)}</h3><p>${esc(result.description)}</p></div><div class="report-count"><strong>${esc(result.row_count)}</strong> <span>${result.row_count === 1 ? "row" : "rows"}</span></div></section>`;
   return html(layout({ title: "Reports", user, path, content: `${reportForm(filters)}${heading}${reportTable(result)}` }));
 }
 
@@ -2516,7 +2518,7 @@ function settingsFormContent(settings, url, errors = []) {
     return textInput(key, label, settings[key] || "");
   });
   const logoPreview = settings.company_logo_data_url ? `<div class="logo-preview"><img src="${esc(settings.company_logo_data_url)}" alt="Company logo preview"><label class="checkbox-row"><input type="checkbox" name="remove_company_logo" value="1"> Remove current logo</label></div>` : `<p class="muted">No company logo uploaded yet.</p>`;
-  return `${messagePanel(url)}${errorBox}<section class="panel"><h3>Company Profile & Document Defaults</h3><p class="muted">These values appear on printable trip tickets, payroll slips, billing statements, SOA, and printable reports. The logo is excluded from payslips.</p><form method="post" action="/settings" enctype="multipart/form-data"><div class="settings-logo-block"><label>Company logo<input type="file" name="company_logo" accept="image/png,image/jpeg,image/webp,image/svg+xml"></label>${logoPreview}<p class="muted">PNG, JPEG, WebP, or SVG only. Maximum 250 KB.</p></div><div class="grid">${fields.join("")}</div><p><button>Save Settings</button></p></form></section><section class="panel"><h3>Document Actions</h3><p class="muted">Generate client-facing documents using the saved company details.</p><a class="button" href="/billing/soa">Generate Statement of Account</a></section>`;
+  return `${messagePanel(url)}${errorBox}<section class="panel"><h3>Company Profile &amp; Document Defaults</h3><p class="muted">These values appear on printable trip tickets, billing statements, statements of account, and reports. The logo is excluded from payslips.</p><form method="post" action="/settings" enctype="multipart/form-data"><div class="settings-logo-block"><label>Company logo<input type="file" name="company_logo" accept="image/png,image/jpeg,image/webp,image/svg+xml"></label>${logoPreview}<p class="muted">PNG, JPEG, WebP, or SVG only. Maximum 250 KB.</p></div><div class="grid">${fields.join("")}</div><div class="form-actions"><button>Save Settings</button></div></form></section>`;
 }
 
 async function settingsPage(request, env, user, path) {
@@ -3006,6 +3008,7 @@ async function handleApplicationRequest(request, env) {
 
   const user = await readSession(request, env);
   if (!user) return redirect("/login");
+  user.appName = env.GMT_APP_NAME || "GMT Trucking";
 
   if (path === "/") return dashboardPage(env, user, path);
   for (const [base, spec] of Object.entries(MASTER)) {

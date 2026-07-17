@@ -10,28 +10,30 @@ const nav = [
   ["System", [["User Management", "/users"], ["Settings", "/settings"], ["Data Tools", "/data-tools"]]],
 ];
 
-export function layout({ title, user, path = "/", content }) {
+export function layout({ title, user, path = "/", content, appName = "GMT Trucking" }) {
+  const brand = user?.appName || appName;
   const menu = nav.map(([group, items]) => {
     const links = items.filter(([page]) => canView(user, page)).map(([page, href]) => {
       const active = path === href || (href !== "/" && path.startsWith(href));
-      const extras = canEdit(user, page) && page === "Trips" ? `<a class="sub" href="/trips/new">+ New Trip Details</a>` : "";
-      return `<a class="${active ? "active" : ""}" href="${href}">${esc(page === "Trips" ? "Trips List" : page)}</a>${extras}`;
+      const extras = canEdit(user, page) && page === "Trips" ? `<a class="nav-sub" href="/trips/new">New Trip Details</a>` : "";
+      return `<a class="nav-link${active ? " active" : ""}" href="${href}">${esc(page === "Trips" ? "Trips List" : page)}</a>${extras}`;
     }).join("");
-    return links ? `<section><h2>${esc(group)}</h2>${links}</section>` : "";
+    return links ? `<section class="nav-group"><h2>${esc(group)}</h2>${links}</section>` : "";
   }).join("");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · GMT</title><link rel="stylesheet" href="/app.css"><script defer src="/app.js"></script></head><body><div class="shell"><aside><h1>GMT Trucking</h1><p class="user">${esc(user?.username || "")} · ${esc(user?.role || "")}</p><nav>${menu}</nav><form method="post" action="/logout"><button>Sign out</button></form></aside><main><header><h2>${esc(title)}</h2><span>GMT Cloudflare Migration</span></header>${content}</main></div></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · ${esc(brand)}</title><link rel="stylesheet" href="/app.css"><script>document.documentElement.classList.add('js')</script><script defer src="/app.js"></script></head><body><div class="app-shell"><aside class="sidebar"><div class="sidebar-brand"><h1>${esc(brand)}</h1><p>${esc(user?.username || "")} · ${esc(user?.role || "")}</p></div><div class="sidebar-scroll"><nav>${menu}</nav></div><form class="sidebar-footer" method="post" action="/logout"><button class="button secondary">Sign out</button></form></aside><main class="app-main"><header class="page-header"><h1>${esc(title)}</h1><span>${esc(brand)}</span></header><div class="page-content">${content}</div></main></div></body></html>`;
 }
 
-export function loginPage(error = "") {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · GMT</title><link rel="stylesheet" href="/app.css"></head><body class="login"><form method="post" class="login-card"><h1>GMT Trucking</h1><p>Sign in to the Cloudflare migration preview.</p>${error ? `<p class="error">${esc(error)}</p>` : ""}<label>Username<input name="username" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button><p><small>Preview: test_admin / characterization-only</small></p></form></body></html>`;
+export function loginPage(error = "", appName = "GMT Trucking") {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · ${esc(appName)}</title><link rel="stylesheet" href="/app.css"></head><body class="login"><form method="post" class="login-card"><h1>${esc(appName)}</h1><p class="muted">Sign in to continue.</p>${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}<label>Username<input name="username" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form></body></html>`;
 }
 
 export function cards(items) {
-  return `<div class="cards">${items.map(([label, value]) => `<div class="card"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}</div>`;
+  return `<div class="metric-grid">${items.map(([label, value]) => `<article class="metric-card"><span>${esc(label)}</span><strong>${esc(value)}</strong></article>`).join("")}</div>`;
 }
 
-export function table(headers, rows, { empty = "No records found." } = {}) {
-  return `<div class="panel"><table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.length ? rows.join("") : `<tr><td colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+export function table(headers, rows, { empty = "No records found.", bare = false, className = "" } = {}) {
+  const markup = `<div class="table-scroll ${esc(className)}"><table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.length ? rows.join("") : `<tr><td class="empty-state" colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+  return bare ? markup : `<section class="panel table-panel">${markup}</section>`;
 }
 
 export function textInput(name, label, value = "", attrs = "") {
@@ -47,13 +49,19 @@ export function textareaInput(name, label, value = "", attrs = "") {
 }
 
 export function selectInput(name, label, rows, selected = "", labeler = (row) => row.name, blank = "---------", { searchable = false, attrs = "" } = {}) {
-  const select = `<select name="${esc(name)}"${searchable ? " data-searchable-select" : ""}${attrs ? ` ${attrs}` : ""}><option value="">${esc(blank)}</option>${rows.map((row) => `<option value="${esc(row.id)}"${String(selected) === String(row.id) ? " selected" : ""}>${esc(labeler(row))}</option>`).join("")}</select>`;
-  const filter = searchable ? `<input class="select-filter" type="search" placeholder="Type to filter options" autocomplete="off" data-select-filter>` : "";
-  return `<label${searchable ? " class=\"searchable-select\"" : ""}>${esc(label)}${filter}${select}</label>`;
+  const options = `<option value="">${esc(blank)}</option>${rows.map((row) => `<option value="${esc(row.id)}"${String(selected) === String(row.id) ? " selected" : ""}>${esc(labeler(row))}</option>`).join("")}`;
+  if (!searchable) return `<label>${esc(label)}<select name="${esc(name)}"${attrs ? ` ${attrs}` : ""}>${options}</select></label>`;
+  const selectedRow = rows.find((row) => String(row.id) === String(selected));
+  const selectedLabel = selectedRow ? labeler(selectedRow) : "";
+  return `<label class="combobox-field">${esc(label)}<span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" placeholder="Search or select…" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>▾</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span></label>`;
 }
 
-export function formPanel(action, fields, submit = "Save") {
-  return `<form method="post" action="${esc(action)}" class="panel"><div class="grid">${fields.join("")}</div><p><button>${esc(submit)}</button> <a class="button secondary" href="javascript:history.back()">Cancel</a></p></form>`;
+export function formPanel(action, fields, submit = "Save", { className = "", enctype = "", cancelHref = "javascript:history.back()" } = {}) {
+  return `<form method="post" action="${esc(action)}" class="panel app-form ${esc(className)}"${enctype ? ` enctype="${esc(enctype)}"` : ""}><div class="form-grid">${fields.join("")}</div><div class="form-actions"><button>${esc(submit)}</button><a class="button secondary" href="${esc(cancelHref)}">Cancel</a></div></form>`;
+}
+
+export function dialogShell({ title, subtitle = "", body, closeHref, wide = true }) {
+  return `<dialog class="app-dialog${wide ? " app-dialog-wide" : ""}" open data-dialog><div class="dialog-header"><div><span class="dialog-kicker">${esc(subtitle)}</span><h2>${esc(title)}</h2></div><a class="dialog-close" href="${esc(closeHref)}" aria-label="Close">×</a></div><div class="dialog-body">${body}</div></dialog><div class="dialog-backdrop" data-dialog-backdrop></div>`;
 }
 
 export function moneyCell(value) {
