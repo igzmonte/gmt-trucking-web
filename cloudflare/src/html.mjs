@@ -19,7 +19,7 @@ export function layout({ title, user, path = "/", content }) {
     }).join("");
     return links ? `<section><h2>${esc(group)}</h2>${links}</section>` : "";
   }).join("");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · GMT</title><link rel="stylesheet" href="/app.css"></head><body><div class="shell"><aside><h1>GMT Trucking</h1><p class="user">${esc(user?.username || "")} · ${esc(user?.role || "")}</p><nav>${menu}</nav><form method="post" action="/logout"><button>Sign out</button></form></aside><main><header><h2>${esc(title)}</h2><span>GMT Cloudflare Migration</span></header>${content}</main></div></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · GMT</title><link rel="stylesheet" href="/app.css"><script defer src="/app.js"></script></head><body><div class="shell"><aside><h1>GMT Trucking</h1><p class="user">${esc(user?.username || "")} · ${esc(user?.role || "")}</p><nav>${menu}</nav><form method="post" action="/logout"><button>Sign out</button></form></aside><main><header><h2>${esc(title)}</h2><span>GMT Cloudflare Migration</span></header>${content}</main></div></body></html>`;
 }
 
 export function loginPage(error = "") {
@@ -46,8 +46,10 @@ export function textareaInput(name, label, value = "", attrs = "") {
   return `<label>${esc(label)}<textarea name="${esc(name)}" ${attrs}>${esc(value)}</textarea></label>`;
 }
 
-export function selectInput(name, label, rows, selected = "", labeler = (row) => row.name, blank = "---------") {
-  return `<label>${esc(label)}<select name="${esc(name)}"><option value="">${esc(blank)}</option>${rows.map((row) => `<option value="${esc(row.id)}"${String(selected) === String(row.id) ? " selected" : ""}>${esc(labeler(row))}</option>`).join("")}</select></label>`;
+export function selectInput(name, label, rows, selected = "", labeler = (row) => row.name, blank = "---------", { searchable = false, attrs = "" } = {}) {
+  const select = `<select name="${esc(name)}"${searchable ? " data-searchable-select" : ""}${attrs ? ` ${attrs}` : ""}><option value="">${esc(blank)}</option>${rows.map((row) => `<option value="${esc(row.id)}"${String(selected) === String(row.id) ? " selected" : ""}>${esc(labeler(row))}</option>`).join("")}</select>`;
+  const filter = searchable ? `<input class="select-filter" type="search" placeholder="Type to filter options" autocomplete="off" data-select-filter>` : "";
+  return `<label${searchable ? " class=\"searchable-select\"" : ""}>${esc(label)}${filter}${select}</label>`;
 }
 
 export function formPanel(action, fields, submit = "Save") {

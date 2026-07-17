@@ -99,6 +99,8 @@ const MASTER = {
   },
 };
 
+const SEARCHABLE_SELECT = { searchable: true };
+
 function errorResponse(error, user, path = "/") {
   if (error?.redirect) return redirect(error.redirect);
   return html(layout({ title: "Forbidden", user, path, content: `<section class="panel"><p class="error">${esc(error?.message || "Forbidden")}</p></section>` }), error?.status || 403);
@@ -483,12 +485,12 @@ async function renderRecurringForm(env, row = {}, id = null, errors = []) {
   const [clients, assets, drivers] = await recurringChoices(env);
   const fields = [
     textInput("master_code", "Code", row.master_code || "", "required"),
-    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r)),
+    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT),
     textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'),
     textInput("origin", "Origin", row.origin || ""),
     textInput("destination", "Destination", row.destination || ""),
-    selectInput("default_asset_id", "Default asset", assets, row.default_asset_id || "", (r) => choiceLabel("asset", r)),
-    selectInput("default_driver_id", "Default driver", drivers, row.default_driver_id || "", (r) => choiceLabel("employee", r)),
+    selectInput("default_asset_id", "Default asset", assets, row.default_asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
+    selectInput("default_driver_id", "Default driver", drivers, row.default_driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
     numberInput("default_helper_count", "Default helper count", row.default_helper_count ?? 0),
     numberInput("standard_base_rate", "Base rate", row.standard_base_rate ?? 0),
     numberInput("driver_pay_rate", "Driver pay", row.driver_pay_rate ?? 0),
@@ -610,13 +612,13 @@ async function tripForm(request, env, user, path) {
     textInput("reference_no", "Ref. No."),
     textInput("trip_date", "Trip date", todayISO(), 'type="date" required'),
     selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], "Spot Trip", (r) => r.name),
-    selectInput("recurring_master_id", "Recurring master", masters, "", (r) => choiceLabel("recurring", r)),
-    selectInput("client_id", "Client", clients, "", (r) => choiceLabel("client", r)),
+    selectInput("recurring_master_id", "Recurring master", masters, "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT),
+    selectInput("client_id", "Client", clients, "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT),
     textInput("job_description", "Item / Job"),
     textInput("origin", "Origin"),
     textInput("destination", "Destination"),
-    selectInput("asset_id", "Asset", assets, "", (r) => choiceLabel("asset", r)),
-    selectInput("driver_id", "Driver", drivers, "", (r) => choiceLabel("employee", r)),
+    selectInput("asset_id", "Asset", assets, "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
+    selectInput("driver_id", "Driver", drivers, "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
     textInput("status", "Status", "Planned"),
     numberInput("base_trip_rate", "Base trip rate"),
     numberInput("driver_pay_rate", "Driver pay rate"),
@@ -773,6 +775,10 @@ function payItemsJson(items, type) {
   return JSON.stringify((items || []).filter((item) => item.employee_type === type).map((item) => ({ label: item.label, amount: item.amount })));
 }
 
+function browserJson(value) {
+  return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e").replaceAll("&", "\\u0026");
+}
+
 async function renderTripForm(env, row = {}, id = null, errors = []) {
   const existingHelpers = row.helpers || [];
   const [clients, assets, drivers, helpers, masters] = await tripChoices(env, row.recurring_master_id || "");
@@ -781,19 +787,20 @@ async function renderTripForm(env, row = {}, id = null, errors = []) {
     textInput("reference_no", "Ref. No.", row.reference_no || ""),
     textInput("trip_date", "Trip date", row.trip_date || todayISO(), 'type="date" required'),
     selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], row.trip_type || "Spot Trip", (r) => r.name, ""),
-    selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r)),
+    selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT),
     selectInput("status", "Status", TRIP_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Planned", (r) => r.name, ""),
-    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r)),
+    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT),
     textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'),
     textInput("origin", "Origin", row.origin || ""),
     textInput("destination", "Destination", row.destination || ""),
     textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'),
     textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'),
-    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r)),
-    selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r)),
-    selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r)),
-    selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r)),
-    selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r)),
+    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
+    selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    `<p class="trip-crew-guidance muted" data-trip-crew-guidance aria-live="polite">Select an asset to see its helper allowance.</p>`,
     numberInput("driver_pay_rate", "Driver pay rate", row.driver_pay_rate ?? 0),
     numberInput("helper_pay_rate", "Helper pay rate", row.helper_pay_rate ?? 0),
     numberInput("base_trip_rate", "Base trip rate", row.base_trip_rate ?? 0),
@@ -803,7 +810,25 @@ async function renderTripForm(env, row = {}, id = null, errors = []) {
     textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
   ];
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
-  return `${errorBox}${formPanel(id ? `/trips/${id}/edit` : "/trips/new", fields, "Save Trip")}`;
+  const tripFormData = {
+    assets: assets.map((asset) => ({ id: asset.id, asset_code: asset.asset_code, asset_type: asset.asset_type, helper_limit: HELPER_LIMITS[asset.asset_type] ?? 3 })),
+    masters: masters.map((master) => ({
+      id: master.id,
+      client_id: master.client_id,
+      job_description: master.job_description || "",
+      origin: master.origin || "",
+      destination: master.destination || "",
+      asset_id: master.default_asset_id || "",
+      driver_id: master.default_driver_id || "",
+      helper_count: Number(master.default_helper_count || 0),
+      base_trip_rate: master.standard_base_rate ?? 0,
+      driver_pay_rate: master.driver_pay_rate ?? 0,
+      helper_pay_rate: master.helper_pay_rate ?? 0,
+      default_extra_note: master.default_extra_note || "",
+      remarks: master.remarks || "",
+    })),
+  };
+  return `${errorBox}<section data-trip-form>${formPanel(id ? `/trips/${id}/edit` : "/trips/new", fields, "Save Trip")}</section><script id="trip-form-data" type="application/json">${browserJson(tripFormData)}</script>`;
 }
 
 async function saveTrip(env, values, helpers, payItems, id = null) {
@@ -1002,10 +1027,10 @@ async function renderRepairForm(env, row = {}, id = null, errors = []) {
   const [assets, suppliers] = await repairChoices(env);
   const fields = [
     textInput("repair_date", "Repair date", row.repair_date || todayISO(), 'type="date" required'),
-    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r)),
+    selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
     textareaInput("repair_description", "Description", row.repair_description || "", 'rows="2" required'),
     textInput("meter_value", "Meter value", row.meter_value || ""),
-    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r)),
+    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", SEARCHABLE_SELECT),
     numberInput("parts_cost", "Parts cost", row.parts_cost ?? 0),
     numberInput("labor_cost", "Labor cost", row.labor_cost ?? 0),
     numberInput("other_cost", "Other cost", row.other_cost ?? 0),
@@ -1165,14 +1190,14 @@ async function renderPayableForm(env, row = {}, id = null, errors = []) {
   const [suppliers, repairs] = await payableChoices(env);
   const fields = [
     textInput("payable_date", "Payable date", row.payable_date || todayISO(), 'type="date" required'),
-    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r)),
+    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", SEARCHABLE_SELECT),
     textInput("source_type", "Source type", row.source_type || "Manual"),
     textInput("reference_no", "Reference no.", row.reference_no || ""),
     textareaInput("description", "Description", row.description || "", 'rows="2" required'),
     numberInput("amount", "Amount", row.amount ?? 0),
     textInput("due_date", "Due date", row.due_date || "", 'type="date"'),
     selectInput("status", "Status", PAYABLE_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, ""),
-    selectInput("linked_repair_id", "Linked repair", repairs, row.linked_repair_id || "", (r) => `Repair #${r.id} — ${r.repair_date} — ${r.repair_description}`),
+    selectInput("linked_repair_id", "Linked repair", repairs, row.linked_repair_id || "", (r) => `Repair #${r.id} — ${r.repair_date} — ${r.repair_description}`, "---------", SEARCHABLE_SELECT),
     textareaInput("notes", "Notes", row.notes || "", 'rows="2"'),
   ];
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
@@ -1300,7 +1325,7 @@ function validateAdvance(values, type) {
 async function renderAdvanceForm(env, type, row = {}, id = null, errors = []) {
   const employees = await all(env, "SELECT * FROM employees WHERE active=1 ORDER BY full_name");
   const fields = [
-    selectInput("employee_id", "Employee", employees, row.employee_id || "", (r) => choiceLabel("employee", r)),
+    selectInput("employee_id", "Employee", employees, row.employee_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
     textInput("date_granted", "Date granted", row.date_granted || todayISO(), 'type="date" required'),
     numberInput("amount", "Amount", row.amount ?? 0),
     ...(type === "vale" ? [numberInput("installment_amount", "Installment amount", row.installment_amount ?? 0)] : [selectInput("applied", "Applied", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.applied ? "1" : "0", (r) => r.name, "")]),
@@ -1529,7 +1554,8 @@ function payrollFormContent(employees, selection, preview, values = {}, errors =
   const employeeId = selection.employee || values.employee || "";
   const periodFrom = selection.period_from || values.period_from || periodStartToday();
   const periodTo = selection.period_to || values.period_to || todayISO();
-  const selector = `<section class="panel payroll-selector"><h3>1. Select Employee & Period</h3><form method="get" class="selector-row"><label>Employee<select name="employee" required><option value="">Select employee</option>${employees.map((employee) => `<option value="${esc(employee.id)}"${String(employeeId) === String(employee.id) ? " selected" : ""}>${esc(choiceLabel("employee", employee))}</option>`).join("")}</select></label><label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Payroll</button></form></section>`;
+  const employeeSelect = selectInput("employee", "Employee", employees, employeeId, (employee) => choiceLabel("employee", employee), "Select employee", { searchable: true, attrs: "required" });
+  const selector = `<section class="panel payroll-selector"><h3>1. Select Employee & Period</h3><form method="get" class="selector-row">${employeeSelect}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Payroll</button></form></section>`;
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   if (!preview) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select an employee and period, then choose <strong>Preview Payroll</strong>.</p></section>`;
   const formValues = {
@@ -1877,7 +1903,7 @@ function billingFormContent(clients, selection, trips, values = {}, errors = [])
   const periodTo = selection.period_to || values.period_to || todayISO();
   const cleaned = billingCleaned({ client: clientId, period_from: periodFrom, period_to: periodTo, ...values });
   const totals = billingTotals(trips || [], cleaned);
-  const selector = `<section class="panel"><h3>1. Select Client & Period</h3><form method="get" class="selector-row">${selectInput("client", "Client", clients, clientId, (client) => choiceLabel("client", client), "Select client")}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Billing</button></form></section>`;
+  const selector = `<section class="panel"><h3>1. Select Client & Period</h3><form method="get" class="selector-row">${selectInput("client", "Client", clients, clientId, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required" })}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Billing</button></form></section>`;
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   if (!clientId) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select a client and billing period to preview eligible trips.</p></section>`;
   const hidden = `<input type="hidden" name="client" value="${esc(clientId)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify((trips || []).map((trip) => trip.id)))}">`;
@@ -2082,7 +2108,7 @@ function soaTotals(rows) {
 }
 
 function soaFilterForm(clients, filters) {
-  return `<section class="panel"><h3>Statement of Account</h3><form class="selector-row" method="get" action="/billing/soa">${selectInput("client", "Client", clients, filters.client_id, (client) => choiceLabel("client", client), "Select client")}<label>Mode<select name="mode"><option value="outstanding"${filters.mode === "outstanding" ? " selected" : ""}>Outstanding Only</option><option value="all"${filters.mode === "all" ? " selected" : ""}>All Activity</option></select></label><label>As-of date<input type="date" name="as_of" value="${esc(filters.as_of)}" required></label><label>Date from<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date to<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Generate SOA</button></form></section>`;
+  return `<section class="panel"><h3>Statement of Account</h3><form class="selector-row" method="get" action="/billing/soa">${selectInput("client", "Client", clients, filters.client_id, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required" })}<label>Mode<select name="mode"><option value="outstanding"${filters.mode === "outstanding" ? " selected" : ""}>Outstanding Only</option><option value="all"${filters.mode === "all" ? " selected" : ""}>All Activity</option></select></label><label>As-of date<input type="date" name="as_of" value="${esc(filters.as_of)}" required></label><label>Date from<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date to<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Generate SOA</button></form></section>`;
 }
 
 function soaRowsTable(rows, { links = true } = {}) {
@@ -2157,11 +2183,10 @@ async function collectionFormContent(env, row, errors = [], id = null) {
   const paidExcludingCurrent = selectedBilling ? Math.max(0, numeric(selectedBilling.paid_amount) - numeric(row.original_amount_paid)) : 0;
   const outstanding = selectedBilling ? outstandingBalance(selectedBilling.grand_total, paidExcludingCurrent) : 0;
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
-  const billingSelect = `<label>Billing Statement<select name="billing_id" required><option value="">Select billing</option>${billings.map((billing) => {
+  const billingSelect = selectInput("billing_id", "Billing Statement", billings, row.billing_id || "", (billing) => {
     const paid = numeric(billing.paid_amount);
-    const label = `${billing.billing_no} — ${billing.client_name || ""} — ${billing.billing_date} — ${peso(outstandingBalance(billing.grand_total, paid))} / ${billingStatus(billing.grand_total, paid)}`;
-    return `<option value="${esc(billing.id)}"${String(row.billing_id) === String(billing.id) ? " selected" : ""}>${esc(label)}</option>`;
-  }).join("")}</select></label>`;
+    return `${billing.billing_no} — ${billing.client_name || ""} — ${billing.billing_date} — ${peso(outstandingBalance(billing.grand_total, paid))} / ${billingStatus(billing.grand_total, paid)}`;
+  }, "Select billing", { searchable: true, attrs: "required" });
   const fields = [
     textInput("collection_date", "Collection date", row.collection_date || todayISO(), 'type="date" required'),
     billingSelect,

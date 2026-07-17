@@ -839,6 +839,41 @@ test("trip create dropdown uses recurring template detail labels", async () => {
   assert.match(text, /Delivery/);
 });
 
+test("trip form exposes searchable dropdowns, recurring autofill data, and crew guidance", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/trips/new", "admin"), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One", active: 1 }],
+    assets: [{ id: 2, asset_code: "UNIT-001", plate_no: "ABC-123", asset_type: "Cargo Truck", make_model: "Isuzu" }],
+    drivers: [{ id: 3, employee_code: "EMP-003", full_name: "Driver One", employee_type: "Driver", payroll_basis: "Per Trip", active: 1 }],
+    helpers: [{ id: 4, employee_code: "EMP-004", full_name: "Helper One", employee_type: "Helper", payroll_basis: "Per Trip", active: 1 }],
+    recurring: [{
+      id: 5, master_code: "REC-005", client_id: 1, client_name: "Client One", job_description: "Cement delivery",
+      origin: "Warehouse", destination: "Site", default_asset_id: 2, default_driver_id: 3,
+      default_helper_count: 2, standard_base_rate: 2500, driver_pay_rate: 600, helper_pay_rate: 350,
+      default_extra_note: "Handle carefully", remarks: "Call client before arrival", active: 1,
+    }],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /<script defer src="\/app\.js"><\/script>/);
+  assert.match(text, /data-searchable-select/);
+  assert.match(text, /Type to filter options/);
+  assert.match(text, /data-trip-crew-guidance/);
+  assert.match(text, /id="trip-form-data"/);
+  assert.match(text, /"default_extra_note":"Handle carefully"/);
+  assert.match(text, /"helper_limit":2/);
+});
+
+test("dropdown browser enhancement filters native selects and applies trip template fields", () => {
+  const script = fs.readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(script, /select\.options/);
+  assert.match(script, /option\.hidden/);
+  assert.match(script, /setSelectValue\(form, "client_id", master\.client_id\)/);
+  assert.match(script, /setFieldValue\(form, "job_description", master\.job_description\)/);
+  assert.match(script, /Template remarks:/);
+  assert.match(script, /tripType\.value === "Spot Trip"/);
+  assert.match(script, /Too many helpers/);
+});
+
 test("trips list supports search, status filter, pagination, totals, and actions", async () => {
   const response = await handleRequest(await authedRequest("https://example.test/trips?q=OR-123&status=Planned&page=2", "admin"), envWithRows({
     tripsCount: 30,
