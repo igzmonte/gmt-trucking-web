@@ -31,8 +31,13 @@ test("payroll net and billing helpers preserve financial behavior", () => {
 
 test("running number and dropdown labels stay readable", () => {
   assert.equal(nextTripTicketNo("2026-07-04", 9), "TT-2026-000010");
-  assert.equal(choiceLabel("asset", { asset_code: "UNIT-001", plate_no: "ABC-123", asset_type: "Cargo Truck", make_model: "Isuzu" }), "UNIT-001 — ABC-123 — Cargo Truck — Isuzu");
-  assert.equal(choiceLabel("employee", { employee_code: "EMP-001", full_name: "Driver One", employee_type: "Driver", payroll_basis: "Per Trip" }), "EMP-001 — Driver One — Driver — Per Trip");
+  assert.equal(choiceLabel("asset", { asset_code: "UNIT-001", plate_no: "ABC-123", asset_type: "Cargo Truck", make_model: "Isuzu" }), "UNIT-001, ABC-123, Cargo Truck");
+  assert.equal(choiceLabel("employee", { employee_code: "EMP-001", full_name: "Driver One", employee_type: "Driver", payroll_basis: "Per Trip" }), "EMP-001, Driver One, Driver");
+  assert.equal(choiceLabel("client", { client_code: "CLI-001", client_name: "Client One" }), "CLI-001, Client One");
+  assert.equal(choiceLabel("supplier", { supplier_name: "Parts Co.", contact_person: "Pat Reyes" }), "Parts Co., Pat Reyes");
+  assert.equal(choiceLabel("recurring", { master_code: "REC-001", client_name: "Client One", origin: "Manila", destination: "Cebu", job_description: "Cargo" }), "REC-001, Client One, Manila → Cebu, Cargo");
+  assert.equal(choiceLabel("billing", { billing_no: "BILL-001", client_name: "Client One", status: "Open" }), "BILL-001, Client One, Open");
+  assert.equal(choiceLabel("repair", { id: 7, repair_date: "2026-07-17", repair_description: "Brake service" }), "Repair #7, 2026-07-17, Brake service");
 });
 
 test("role permissions match current Django matrix", () => {

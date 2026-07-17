@@ -52,10 +52,12 @@ export function applyVat(grossTotal, enabled) {
 
 export function choiceLabel(kind, row) {
   if (!row) return "";
-  if (kind === "employee") return [row.employee_code, row.full_name, row.employee_type, row.payroll_basis].filter(Boolean).join(" — ");
-  if (kind === "asset") return [row.asset_code, row.plate_no, row.asset_type, row.make_model].filter(Boolean).join(" — ");
-  if (kind === "client") return [row.client_code, row.client_name].filter(Boolean).join(" — ");
-  if (kind === "supplier") return [row.supplier_name, row.contact_person].filter(Boolean).join(" — ");
-  if (kind === "recurring") return [row.master_code, row.client_name, [row.origin, row.destination].filter(Boolean).join(" → "), row.job_description].filter(Boolean).join(" — ");
+  if (kind === "employee") return [row.employee_code, row.full_name, row.employee_type].filter(Boolean).join(", ");
+  if (kind === "asset") return [row.asset_code, row.plate_no, row.asset_type].filter(Boolean).join(", ");
+  if (kind === "client") return [row.client_code, row.client_name].filter(Boolean).join(", ");
+  if (kind === "supplier") return [row.supplier_name, row.contact_person].filter(Boolean).join(", ");
+  if (kind === "recurring") return [row.master_code, row.client_name, [row.origin, row.destination].filter(Boolean).join(" → "), row.job_description].filter(Boolean).join(", ");
+  if (kind === "billing") return [row.billing_no, row.client_name, row.status].filter(Boolean).join(", ");
+  if (kind === "repair") return [`Repair #${row.id}`, row.repair_date, row.repair_description].filter(Boolean).join(", ");
   return String(row.id ?? "");
 }

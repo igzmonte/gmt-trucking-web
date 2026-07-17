@@ -864,6 +864,11 @@ test("trip form exposes searchable dropdowns, recurring autofill data, and crew 
   assert.match(text, /id="trip-form-data"/);
   assert.match(text, /"default_extra_note":"Handle carefully"/);
   assert.match(text, /"helper_limit":2/);
+  assert.match(text, /CLI-001, Client One/);
+  assert.match(text, /UNIT-001, ABC-123, Cargo Truck/);
+  assert.match(text, /EMP-003, Driver One, Driver/);
+  assert.doesNotMatch(text, /Per Trip/);
+  assert.match(text, /REC-005, Client One, Warehouse → Site, Cement delivery/);
 });
 
 test("dropdown browser enhancement filters native selects and applies trip template fields", () => {
@@ -2012,16 +2017,26 @@ test("trip workspace hides JSON and renders semantic sections with pay item cont
   assert.match(text, /Employee Pay Rates/);
   assert.match(text, /Trip \/ Unit Charges/);
   assert.match(text, /type="hidden" name="driver_pay_items"/);
-  assert.match(text, /data-add-pay-item/);
+  assert.match(text, /class="field-span-2 trip-recurring-field"/);
+  assert.match(text, /class="field-span-2 trip-status-field"/);
+  assert.ok(text.indexOf("trip-recurring-field") < text.indexOf("trip-status-field"));
+  assert.match(text, /class="pay-item-header"><h4>Driver Pay Items<\/h4><button type="button" data-add-pay-item>/);
+  assert.match(text, /class="pay-item-header"><h4>Helper Pay Items<\/h4><button type="button" data-add-pay-item>/);
+  assert.match(text, /data-pay-items="driver"[\s\S]*data-pay-item-rows/);
   assert.doesNotMatch(text, /pay items JSON/);
 });
 
 test("compact layout css reduces screen scale for dense forms", () => {
   const css = fs.readFileSync(new URL("../public/app.css", import.meta.url), "utf8");
-  assert.match(css, /grid-template-columns:230px minmax\(0,1fr\)/);
+  assert.match(css, /body\{margin:0;font:13px\/1\.3/);
+  assert.match(css, /grid-template-columns:218px minmax\(0,1fr\)/);
   assert.match(css, /sidebar-scroll\{min-height:0;overflow-y:auto/);
   assert.match(css, /app-main\{min-width:0;height:100vh;overflow-y:auto/);
   assert.match(css, /trip-top\{grid-template-columns/);
+  assert.match(css, /field-span-2\{grid-column:1\/-1/);
+  assert.match(css, /pay-items-card\{display:grid/);
+  assert.match(css, /pay-item-header\{display:flex/);
+  assert.match(css, /combobox-input\{[^}]*text-overflow:ellipsis/);
   assert.match(css, /report-filters\{display:grid/);
   assert.match(css, /settings-logo-block/);
 });

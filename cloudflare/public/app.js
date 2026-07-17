@@ -48,6 +48,7 @@
       function choose(value) {
         select.value = value;
         input.value = select.selectedOptions[0]?.textContent || "";
+        input.title = input.value;
         select.dispatchEvent(new Event("change", { bubbles: true }));
         close();
       }
@@ -67,7 +68,7 @@
           close();
         }
       }, 100));
-      select.addEventListener("change", () => { input.value = select.selectedOptions[0]?.value ? select.selectedOptions[0].textContent : ""; });
+      select.addEventListener("change", () => { input.value = select.selectedOptions[0]?.value ? select.selectedOptions[0].textContent : ""; input.title = input.value; });
     });
   }
 

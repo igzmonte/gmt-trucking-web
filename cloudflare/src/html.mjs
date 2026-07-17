@@ -53,7 +53,7 @@ export function selectInput(name, label, rows, selected = "", labeler = (row) =>
   if (!searchable) return `<label>${esc(label)}<select name="${esc(name)}"${attrs ? ` ${attrs}` : ""}>${options}</select></label>`;
   const selectedRow = rows.find((row) => String(row.id) === String(selected));
   const selectedLabel = selectedRow ? labeler(selectedRow) : "";
-  return `<label class="combobox-field">${esc(label)}<span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" placeholder="Search or select…" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>▾</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span></label>`;
+  return `<label class="combobox-field">${esc(label)}<span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" title="${esc(selectedLabel)}" placeholder="Search or select…" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>▾</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span></label>`;
 }
 
 export function formPanel(action, fields, submit = "Save", { className = "", enctype = "", cancelHref = "javascript:history.back()" } = {}) {
