@@ -897,6 +897,100 @@ test("trips list supports search, status filter, pagination, totals, and actions
   assert.match(text, /\/trips\/1\/edit/);
   assert.match(text, /\/trips\/1\/print/);
   assert.match(text, /\/trips\/export\.csv\?q=OR-123&amp;status=Planned/);
+  assert.match(text, /class="status status-planned status-link"/);
+  assert.match(text, /\/trips\/1\/status\?next=/);
+  assert.match(text, /Mark Complete/);
+});
+
+test("trip status controls are interactive for editors and read-only for viewers", async () => {
+  const rows = { trips: [sampleTrip({ status: "Ongoing" })] };
+  let response = await handleRequest(await authedRequest("https://example.test/trips", "encoder"), envWithRows(rows));
+  let text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /status-ongoing status-link/);
+  assert.match(text, /Mark Complete/);
+
+  response = await handleRequest(await authedRequest("https://example.test/trips", "viewer"), envWithRows(rows));
+  text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /<span class="status status-ongoing">Ongoing<\/span>/);
+  assert.doesNotMatch(text, /\/trips\/1\/status/);
+  assert.doesNotMatch(text, /Mark Complete/);
+});
+
+test("trip status dialog shows context, allowed statuses, and preserves list filters", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/trips/1/status?next=%2Ftrips%3Fq%3DOR-123%26status%3DOngoing%26page%3D2", "admin"), envWithRows({
+    tripsCount: 30,
+    trips: [sampleTrip({ status: "Ongoing" })],
+  }));
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /data-dialog/);
+  assert.match(text, /Update Trip Status/);
+  assert.match(text, /TT-2026-000001/);
+  assert.match(text, /Client One/);
+  assert.match(text, /Warehouse.*Site/);
+  assert.match(text, /Current Status/);
+  assert.match(text, /Completed trips become eligible for Payroll and Billing/);
+  assert.match(text, /name="next" value="\/trips\?q=OR-123&amp;status=Ongoing&amp;page=2"/);
+  assert.match(text, /Page 2 of 2/);
+});
+
+test("trip status POST updates valid statuses and preserves list context", async () => {
+  const runs = [];
+  const body = new URLSearchParams({ status: "Completed", next: "/trips?q=OR-123&status=Ongoing&page=2" });
+  const response = await handleRequest(await authedRequest("https://example.test/trips/1/status", "encoder", { method: "POST", body }), envWithRows({
+    trips: [sampleTrip({ status: "Ongoing" })],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  const location = new URL(response.headers.get("location"), "https://example.test");
+  assert.equal(location.pathname, "/trips");
+  assert.equal(location.searchParams.get("q"), "OR-123");
+  assert.equal(location.searchParams.get("status"), "Ongoing");
+  assert.equal(location.searchParams.get("page"), "2");
+  assert.match(location.searchParams.get("ok"), /status changed to Completed/);
+  const update = runs.find((item) => item.sql === "UPDATE trips SET status=? WHERE id=?");
+  assert.deepEqual(update?.params, ["Completed", 1]);
+});
+
+test("trip status rejects invalid, system-controlled, and financially linked changes", async () => {
+  let runs = [];
+  let response = await handleRequest(await authedRequest("https://example.test/trips/1/status", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ status: "Paid", next: "/trips" }),
+  }), envWithRows({ trips: [sampleTrip()], runs }));
+  assert.equal(response.status, 303);
+  assert.match(new URL(response.headers.get("location"), "https://example.test").searchParams.get("error"), /valid operational/);
+  assert.equal(runs.filter((item) => item.sql.startsWith("UPDATE trips SET status")).length, 0);
+
+  runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/trips/1/status", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ status: "Completed", next: "/trips" }),
+  }), envWithRows({ trips: [sampleTrip({ status: "Billed" })], runs }));
+  assert.equal(response.status, 303);
+  assert.match(new URL(response.headers.get("location"), "https://example.test").searchParams.get("error"), /controlled by Billing/);
+  assert.equal(runs.length, 0);
+
+  for (const linkedTable of ["billing_lines", "payroll_trips"]) {
+    runs = [];
+    response = await handleRequest(await authedRequest("https://example.test/trips/1/status", "admin", {
+      method: "POST",
+      body: new URLSearchParams({ status: "Cancelled", next: "/trips" }),
+    }), envWithRows({ trips: [sampleTrip({ status: "Completed" })], refs: { [linkedTable]: 1 }, runs }));
+    assert.equal(response.status, 303);
+    assert.match(new URL(response.headers.get("location"), "https://example.test").searchParams.get("error"), /status is locked/);
+    assert.equal(runs.length, 0);
+  }
+});
+
+test("trip status permissions block viewer mutation and accounting access", async () => {
+  const body = new URLSearchParams({ status: "Completed", next: "/trips" });
+  let response = await handleRequest(await authedRequest("https://example.test/trips/1/status", "viewer", { method: "POST", body }), envWithRows({ trips: [sampleTrip()] }));
+  assert.equal(response.status, 403);
+  response = await handleRequest(await authedRequest("https://example.test/trips/1/status", "accounting"), envWithRows({ trips: [sampleTrip()] }));
+  assert.equal(response.status, 403);
 });
 
 test("trips CSV export uses Django-compatible headers and raw totals", async () => {
@@ -948,6 +1042,21 @@ test("trip edit clears recurring master for spot trips and preserves helper orde
   assert.equal(runs[0].params[3], null);
   const helperRuns = runs.filter((run) => run.sql.includes("INSERT INTO trip_helpers"));
   assert.deepEqual(helperRuns.map((run) => run.params.slice(1)), [["4", 1], ["5", 2]]);
+});
+
+test("trip detail edit preserves Billed and Paid system statuses", async () => {
+  for (const systemStatus of ["Billed", "Paid"]) {
+    const runs = [];
+    const body = tripBody({ trip_ticket_no: "TT-2026-000001", status: "Planned" });
+    const response = await handleRequest(await authedRequest("https://example.test/trips/1/edit", "admin", { method: "POST", body }), envWithRows({
+      runs,
+      trips: [sampleTrip({ status: systemStatus })],
+      assets: [{ id: 2, asset_type: "Trailer Truck", asset_code: "UNIT-001" }],
+    }));
+    assert.equal(response.status, 303);
+    const update = runs.find((item) => item.sql.startsWith("UPDATE trips SET"));
+    assert.equal(update?.params[13], systemStatus);
+  }
 });
 
 test("trip validation rejects required, helper, recurring, and money errors", async () => {

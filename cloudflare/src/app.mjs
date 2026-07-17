@@ -679,6 +679,32 @@ const TRIP_MONEY_FIELDS = [
 ];
 
 const TRIP_STATUSES = ["Planned", "Ongoing", "Completed", "Cancelled"];
+const SYSTEM_TRIP_STATUSES = ["Billed", "Paid"];
+
+function tripStatusSlug(status) {
+  return String(status || "").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
+
+function safeTripsReturnPath(value) {
+  try {
+    const parsed = new URL(String(value || "/trips"), "https://gmt.local");
+    if (parsed.origin !== "https://gmt.local" || parsed.pathname !== "/trips") return "/trips";
+    const clean = new URLSearchParams();
+    for (const name of ["q", "status", "page"]) {
+      const item = parsed.searchParams.get(name);
+      if (item) clean.set(name, item);
+    }
+    return `/trips${clean.toString() ? `?${clean.toString()}` : ""}`;
+  } catch {
+    return "/trips";
+  }
+}
+
+function tripReturnWithMessage(returnPath, kind, message) {
+  const parsed = new URL(safeTripsReturnPath(returnPath), "https://gmt.local");
+  parsed.searchParams.set(kind, message);
+  return `${parsed.pathname}?${parsed.searchParams.toString()}`;
+}
 
 function moneyValue(value) {
   const number = Number(value || 0);
@@ -699,7 +725,7 @@ function tripWhere(query, status) {
   return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
 }
 
-function tripValues(data) {
+function tripValues(data, preservedStatus = "") {
   const values = {
     trip_ticket_no: (data.trip_ticket_no || "").trim(),
     reference_no: (data.reference_no || "").trim(),
@@ -714,7 +740,7 @@ function tripValues(data) {
     driver_id: data.driver_id || null,
     dispatch_time: data.dispatch_time || null,
     arrival_time: data.arrival_time || null,
-    status: TRIP_STATUSES.includes(data.status) ? data.status : "Planned",
+    status: preservedStatus || (TRIP_STATUSES.includes(data.status) ? data.status : "Planned"),
     notes: (data.notes || "").trim(),
   };
   for (const field of TRIP_MONEY_FIELDS) values[field] = moneyValue(data[field]);
@@ -763,6 +789,19 @@ async function loadTrip(env, id) {
   return trip;
 }
 
+async function tripStatusLock(env, trip) {
+  if (!trip) return "Trip not found.";
+  if (SYSTEM_TRIP_STATUSES.includes(trip.status)) return `${trip.status} is controlled by Billing and cannot be changed manually.`;
+  const [billing, payroll] = await Promise.all([
+    first(env, "SELECT COUNT(*) AS total FROM billing_lines WHERE trip_id=?", [trip.id]),
+    first(env, "SELECT COUNT(*) AS total FROM payroll_trips WHERE trip_id=?", [trip.id]),
+  ]);
+  const links = [];
+  if (Number(billing?.total || 0) > 0) links.push("Billing");
+  if (Number(payroll?.total || 0) > 0) links.push("Payroll");
+  return links.length ? `This trip is already linked to ${links.join(" and ")}; its status is locked.` : "";
+}
+
 async function validateTrip(env, values, helpers, payItems, id = null) {
   const errors = [];
   if (!values.trip_date) errors.push("trip date is required.");
@@ -806,7 +845,7 @@ function browserJson(value) {
   return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e").replaceAll("&", "\\u0026");
 }
 
-async function renderTripForm(env, row = {}, id = null, errors = []) {
+async function renderTripForm(env, row = {}, id = null, errors = [], statusLock = "") {
   const existingHelpers = row.helpers || [];
   const [clients, assets, drivers, helpers, masters] = await tripChoices(env, row.recurring_master_id || "");
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
@@ -829,13 +868,16 @@ async function renderTripForm(env, row = {}, id = null, errors = []) {
     })),
   };
   const action = id ? `/trips/${id}/edit` : "/trips/new";
+  const statusControl = statusLock
+    ? `<label>Status<input value="${esc(row.status || "Planned")}" disabled><input type="hidden" name="status" value="${esc(row.status || "Planned")}"><small class="field-help">${esc(statusLock)}</small></label>`
+    : selectInput("status", "Status", TRIP_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Planned", (r) => r.name, "");
   const overview = [
     `<div>${textInput("trip_ticket_no", "Trip Ticket / Waybill", row.trip_ticket_no || "")}</div>`,
     `<div>${textInput("reference_no", "Ref. No.", row.reference_no || "")}</div>`,
     `<div>${textInput("trip_date", "Trip date", row.trip_date || todayISO(), 'type="date" required')}</div>`,
     `<div>${selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], row.trip_type || "Spot Trip", (r) => r.name, "")}</div>`,
     `<div class="field-span-2 trip-recurring-field">${selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT)}</div>`,
-    `<div class="field-span-2 trip-status-field">${selectInput("status", "Status", TRIP_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Planned", (r) => r.name, "")}</div>`,
+    `<div class="field-span-2 trip-status-field">${statusControl}</div>`,
   ];
   const route = [selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT), textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'), textInput("origin", "Origin", row.origin || ""), textInput("destination", "Destination", row.destination || ""), textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'), textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'), textareaInput("notes", "Notes", row.notes || "", 'rows="2"')];
   const crew = [selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT), selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT)];
@@ -870,9 +912,21 @@ async function saveTrip(env, values, helpers, payItems, id = null) {
   return tripId;
 }
 
-async function tripListPage(request, env, user, path) {
-  const access = requireView(user, "Trips");
-  if (access) return errorResponse(access, user, path);
+function tripStatusBadge(trip, user, returnPath) {
+  const status = trip.status || "Planned";
+  const className = `status status-${tripStatusSlug(status)}`;
+  if (canEdit(user, "Trips") && TRIP_STATUSES.includes(status)) {
+    return `<a class="${className} status-link" href="/trips/${trip.id}/status?next=${encodeURIComponent(returnPath)}" aria-label="Change status for ${esc(trip.trip_ticket_no)}">${esc(status)}</a>`;
+  }
+  return `<span class="${className}">${esc(status)}</span>`;
+}
+
+function tripQuickComplete(trip, user, returnPath) {
+  if (!canEdit(user, "Trips") || !["Planned", "Ongoing"].includes(trip.status)) return "";
+  return `<form method="post" action="/trips/${trip.id}/status" class="inline-status-form" onsubmit="return confirm('Mark this trip as Completed? Completed trips become eligible for Payroll and Billing.');"><input type="hidden" name="status" value="Completed"><input type="hidden" name="next" value="${esc(returnPath)}"><button class="status-action">Mark Complete</button></form>`;
+}
+
+async function tripListContent(request, env, user) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const status = (url.searchParams.get("status") || "").trim();
@@ -880,15 +934,71 @@ async function tripListPage(request, env, user, path) {
   const where = tripWhere(query, status);
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql}`, where.params);
   const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY t.trip_date DESC, t.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
-  const body = rows.map((t) => `<tr><td><a href="/trips/${t.id}">${esc(t.trip_ticket_no)}</a></td><td>${esc(t.reference_no || "—")}</td><td>${esc(t.trip_date)}</td><td>${esc(t.client_name || "")}</td><td>${esc(t.origin)} → ${esc(t.destination)}</td><td>${esc(t.driver_name || "")}${t.helper_names ? `<small class="cell-detail">${esc(t.helper_names)}</small>` : ""}</td><td>${esc(t.asset_code || "")}</td><td><span class="status">${esc(t.status)}</span></td>${moneyCell(t.base_trip_rate)}${moneyCell(tripExtraTotal(t))}${moneyCell(tripBillableTotal(t))}<td><a href="/trips/${t.id}">View</a> <a href="/trips/${t.id}/print" target="_blank">Print</a>${canEdit(user, "Trips") ? ` <a href="/trips/${t.id}/edit">Edit</a>` : ""}</td></tr>`);
   const params = new URLSearchParams();
   if (query) params.set("q", query);
   if (status) params.set("status", status);
-  const statusOptions = `<select name="status"><option value="">All statuses</option>${TRIP_STATUSES.map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
-  const exportHref = `/trips/export.csv${params.toString() ? `?${params.toString()}` : ""}`;
+  if (page > 1) params.set("page", String(page));
+  const returnPath = `/trips${params.toString() ? `?${params.toString()}` : ""}`;
+  const body = rows.map((t) => `<tr><td><a href="/trips/${t.id}">${esc(t.trip_ticket_no)}</a></td><td>${esc(t.reference_no || "—")}</td><td>${esc(t.trip_date)}</td><td>${esc(t.client_name || "")}</td><td>${esc(t.origin)} → ${esc(t.destination)}</td><td>${esc(t.driver_name || "")}${t.helper_names ? `<small class="cell-detail">${esc(t.helper_names)}</small>` : ""}</td><td>${esc(t.asset_code || "")}</td><td>${tripStatusBadge(t, user, returnPath)}</td>${moneyCell(t.base_trip_rate)}${moneyCell(tripExtraTotal(t))}${moneyCell(tripBillableTotal(t))}<td><a href="/trips/${t.id}">View</a> <a href="/trips/${t.id}/print" target="_blank">Print</a>${canEdit(user, "Trips") ? ` <a href="/trips/${t.id}/edit">Edit</a>` : ""}${tripQuickComplete(t, user, returnPath)}</td></tr>`);
+  const statusOptions = `<select name="status"><option value="">All statuses</option>${[...TRIP_STATUSES, ...SYSTEM_TRIP_STATUSES].map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
+  const exportParams = new URLSearchParams(params);
+  exportParams.delete("page");
+  const exportHref = `/trips/export.csv${exportParams.toString() ? `?${exportParams.toString()}` : ""}`;
   const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search trips">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Trips") ? `<a class="button" href="/trips/new">New Trip</a>` : ""} <a class="button secondary" href="${esc(exportHref)}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Trip Ticket / Waybill", "Ref. No.", "Date", "Client", "Route", "Driver / Helpers", "Unit", "Status", "Base", "Extra", "Total", "Actions"], body, { empty: "No trips found." })}${paginationWithParams("/trips", params, page, Number(countRow?.total || 0))}`;
-  return html(layout({ title: "Trips List", user, path, content }));
+  const paginationParams = new URLSearchParams(params);
+  paginationParams.delete("page");
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Trip Ticket / Waybill", "Ref. No.", "Date", "Client", "Route", "Driver / Helpers", "Unit", "Status", "Base", "Extra", "Total", "Actions"], body, { empty: "No trips found." })}${paginationWithParams("/trips", paginationParams, page, Number(countRow?.total || 0))}`;
+}
+
+async function tripListPage(request, env, user, path) {
+  const access = requireView(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  return html(layout({ title: "Trips List", user, path, content: await tripListContent(request, env, user) }));
+}
+
+function tripStatusDialog(trip, returnPath, lockMessage = "") {
+  const currentBadge = `<span class="status status-${tripStatusSlug(trip.status)}">${esc(trip.status)}</span>`;
+  const summary = `<dl class="trip-status-summary"><dt>Trip Ticket / Waybill</dt><dd>${esc(trip.trip_ticket_no)}</dd><dt>Client</dt><dd>${esc(trip.client_name || "—")}</dd><dt>Route</dt><dd>${esc(trip.origin || "—")} → ${esc(trip.destination || "—")}</dd><dt>Current Status</dt><dd>${currentBadge}</dd></dl>`;
+  if (lockMessage) {
+    return `${summary}<div class="status-warning"><strong>Status locked</strong><p>${esc(lockMessage)}</p></div><div class="form-actions"><a class="button secondary" href="${esc(returnPath)}">Close</a></div>`;
+  }
+  const choices = TRIP_STATUSES.filter((status) => status !== trip.status).map((status) => ({ id: status, name: status }));
+  return `${summary}<form method="post" action="/trips/${trip.id}/status" class="app-form status-update-form" onsubmit="if(this.status.value === 'Completed') return confirm('Mark this trip as Completed? Completed trips become eligible for Payroll and Billing.');"><input type="hidden" name="next" value="${esc(returnPath)}">${selectInput("status", "New status", choices, "", (row) => row.name, "Select status")}<div class="status-warning"><strong>Before you continue</strong><p>Completed trips become eligible for Payroll and Billing. This update changes only the trip status.</p></div><div class="form-actions"><button>Update Status</button><a class="button secondary" href="${esc(returnPath)}">Cancel</a></div></form>`;
+}
+
+async function tripStatusPage(request, env, user, path, id) {
+  const access = requireEdit(user, "Trips");
+  if (access) return errorResponse(access, user, path);
+  const url = new URL(request.url);
+  const submitted = request.method === "POST" ? await parseForm(request) : null;
+  const returnPath = safeTripsReturnPath(submitted?.next || url.searchParams.get("next") || "/trips");
+  const trip = await loadTrip(env, id);
+  if (!trip) return redirect(tripReturnWithMessage(returnPath, "error", "Trip not found."));
+  const lockMessage = await tripStatusLock(env, trip);
+
+  if (request.method === "POST") {
+    const status = String(submitted.status || "").trim();
+    if (!TRIP_STATUSES.includes(status)) {
+      return redirect(tripReturnWithMessage(returnPath, "error", "Select a valid operational trip status."));
+    }
+    if (lockMessage) return redirect(tripReturnWithMessage(returnPath, "error", lockMessage));
+    if (status !== trip.status) await run(env, "UPDATE trips SET status=? WHERE id=?", [status, id]);
+    const message = status === trip.status ? `Trip ${trip.trip_ticket_no} is already ${status}.` : `Trip ${trip.trip_ticket_no} status changed to ${status}.`;
+    return redirect(tripReturnWithMessage(returnPath, "ok", message));
+  }
+  if (request.method !== "GET") return html("Method Not Allowed", 405);
+
+  const listUrl = new URL(returnPath, request.url);
+  const listRequest = new Request(listUrl, { headers: request.headers });
+  const content = await tripListContent(listRequest, env, user);
+  const modal = dialogShell({
+    title: "Update Trip Status",
+    subtitle: "Trip workflow",
+    body: tripStatusDialog(trip, returnPath, lockMessage),
+    closeHref: returnPath,
+    wide: false,
+  });
+  return html(layout({ title: "Trips List", user, path: "/trips", content: `${content}${modal}` }));
 }
 
 async function tripFormPage(request, env, user, path, id = null) {
@@ -896,24 +1006,25 @@ async function tripFormPage(request, env, user, path, id = null) {
   if (access) return errorResponse(access, user, path);
   const row = id ? await loadTrip(env, id) : { trip_date: todayISO(), trip_type: "Spot Trip", status: "Planned" };
   if (id && !row) return html("Not found", 404);
+  const statusLock = id ? await tripStatusLock(env, row) : "";
   if (request.method === "POST") {
     const data = await parseForm(request);
-    const values = tripValues(data);
+    const values = tripValues(data, statusLock ? row.status : "");
     const helpers = [data.helper_1 || "", data.helper_2 || "", data.helper_3 || ""];
     const driverPay = parsePayItems(data.driver_pay_items, "Driver");
     const helperPay = parsePayItems(data.helper_pay_items, "Helper");
     const payItems = [...driverPay.items, ...helperPay.items];
     if (!values.trip_ticket_no && values.trip_date) values.trip_ticket_no = await nextTicket(env, values.trip_date);
     const errors = [...driverPay.errors, ...helperPay.errors, ...(await validateTrip(env, values, helpers, payItems, id))];
-    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, { ...values, ...data }, id, errors) }), 400);
+    if (errors.length) return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, { ...values, ...data, status: values.status }, id, errors, statusLock) }), 400);
     try {
       const tripId = await saveTrip(env, values, helpers, payItems, id);
       return redirect(`/trips/${tripId}?ok=${encodeURIComponent(id ? "Trip record updated." : "Trip record saved.")}`);
     } catch (error) {
-      return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, { ...values, ...data }, id, [`Could not save trip: ${error.message || error}`]) }), 400);
+      return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, { ...values, ...data, status: values.status }, id, [`Could not save trip: ${error.message || error}`], statusLock) }), 400);
     }
   }
-  return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, row, id) }));
+  return html(layout({ title: `${id ? "Edit" : "New"} Trip Details`, user, path, content: await renderTripForm(env, row, id, [], statusLock) }));
 }
 
 function tripPrintable(trip, helperNames, settings) {
@@ -3034,6 +3145,8 @@ async function handleApplicationRequest(request, env) {
   if (path === "/trips") return tripListPage(request, env, user, path);
   if (path === "/trips/new") return tripFormPage(request, env, user, path);
   if (path === "/trips/export.csv") return tripExportPage(request, env, user, path);
+  match = path.match(/^\/trips\/(\d+)\/status$/);
+  if (match) return tripStatusPage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/trips\/(\d+)\/print$/);
   if (match) return tripDetailPage(request, env, user, path, Number(match[1]), true);
   match = path.match(/^\/trips\/(\d+)\/edit$/);
