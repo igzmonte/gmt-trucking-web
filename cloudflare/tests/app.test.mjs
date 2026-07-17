@@ -1457,6 +1457,8 @@ test("billing validation, detail, print, and delete protection work", async () =
   assert.equal(response.status, 200);
   text = await response.text();
   assert.match(text, /Billing Statement/);
+  assert.match(text, /<th>Ref\. No\.<\/th>/);
+  assert.match(text, /OR-CLIENT-1/);
   assert.match(text, /Received by \/ Conforme/);
 
   response = await handleRequest(await authedRequest("https://example.test/billing/61/delete", "admin"), envWithRows());
@@ -1922,8 +1924,34 @@ test("company logo appears on customer printables but not payslips", async () =>
     assert.match(text, /data:image\/png;base64,TE9HTw==/);
   }
 
-  const response = await handleRequest(await authedRequest("https://example.test/payroll/51/print", "viewer"), env);
-  const text = await response.text();
+  let response = await handleRequest(await authedRequest("https://example.test/trips/1/print", "viewer"), env);
+  let text = await response.text();
+  assert.match(text, /Trip Ticket \/ Waybill/);
+  assert.match(text, /Ref\. No\./);
+  assert.match(text, /Item \/ Job/);
+  assert.match(text, /Handle with care/);
+  assert.match(text, /Prepared By/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/61/print", "viewer"), env);
+  text = await response.text();
+  assert.match(text, /<th>Ref\. No\.<\/th>/);
+  assert.match(text, /OR-CLIENT-1/);
+  assert.match(text, /Billing footer/);
+  assert.match(text, /Maria<br>Prepared by/);
+
+  response = await handleRequest(await authedRequest("https://example.test/billing/soa/print?client=1&mode=all&as_of=2026-08-10", "viewer"), env);
+  text = await response.text();
+  assert.match(text, /SOA footer/);
+  assert.match(text, /Maria<br>Prepared by/);
+  assert.match(text, /Juan<br>Checked by/);
+
+  response = await handleRequest(await authedRequest("https://example.test/reports/print?report=unbilled_trips&date_from=2026-07-01&date_to=2026-07-31", "viewer"), env);
+  text = await response.text();
+  assert.match(text, /Rows:/);
+  assert.match(text, /No rows match this report and its filters|TT-2026-000001/);
+
+  response = await handleRequest(await authedRequest("https://example.test/payroll/51/print", "viewer"), env);
+  text = await response.text();
   assert.equal(response.status, 200);
   assert.doesNotMatch(text, /class="company-logo"/);
   assert.doesNotMatch(text, /data:image\/png;base64,TE9HTw==/);
