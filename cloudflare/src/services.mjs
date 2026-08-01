@@ -23,6 +23,40 @@ export function tripBillableTotal(trip) {
   return decimal(Number(trip?.base_trip_rate || 0) + tripExtraTotal(trip));
 }
 
+export function projectExtraTotal(record) {
+  return decimal(
+    EXTRA_FIELDS.reduce((total, field) => total + Number(record?.[field] || 0), 0),
+  );
+}
+
+export function projectBaseAmount(record) {
+  return decimal(
+    Number(record?.billing_quantity || 0) * Number(record?.client_unit_rate || 0),
+  );
+}
+
+export function projectBillableTotal(record) {
+  return decimal(projectBaseAmount(record) + projectExtraTotal(record));
+}
+
+export function projectEmployeeBasePay(record, role = "primary", helperCount = 0) {
+  if (role === "helper") {
+    if (!helperCount) return 0;
+    const pool =
+      record?.helper_pay_basis === "Manual"
+        ? Number(record?.helper_manual_pay || 0)
+        : Number(record?.helper_pay_quantity || 0) *
+          Number(record?.helper_pay_rate || 0);
+    return decimal(pool / helperCount);
+  }
+  return decimal(
+    record?.primary_pay_basis === "Manual"
+      ? Number(record?.primary_manual_pay || 0)
+      : Number(record?.primary_pay_quantity || 0) *
+        Number(record?.primary_pay_rate || 0),
+  );
+}
+
 export function calculateNet(grossPay, additionalPay, deductions) {
   const deductionTotal = [
     "vale_deduction", "cash_advance_deduction", "sss", "philhealth", "pagibig",
@@ -34,6 +68,28 @@ export function calculateNet(grossPay, additionalPay, deductions) {
 export function nextTripTicketNo(dateValue, lastNumber = 0) {
   const year = String(dateValue || new Date().toISOString().slice(0, 10)).slice(0, 4);
   return `TT-${year}-${String(Number(lastNumber || 0) + 1).padStart(6, "0")}`;
+}
+
+export function nextProjectNo(projectDate, previousProjectNo = "") {
+  const year =
+    String(projectDate || "").slice(0, 4) ||
+    String(new Date().getUTCFullYear());
+  const prefix = `PRJ-${year}-`;
+  const previousNumber = String(previousProjectNo || "").startsWith(prefix)
+    ? Number(String(previousProjectNo).slice(prefix.length))
+    : 0;
+  return `${prefix}${String(previousNumber + 1).padStart(6, "0")}`;
+}
+
+export function nextProjectWorkNo(workDate, previousWorkNo = "") {
+  const year =
+    String(workDate || "").slice(0, 4) ||
+    String(new Date().getUTCFullYear());
+  const prefix = `PWL-${year}-`;
+  const previousNumber = String(previousWorkNo || "").startsWith(prefix)
+    ? Number(String(previousWorkNo).slice(prefix.length))
+    : 0;
+  return `${prefix}${String(previousNumber + 1).padStart(6, "0")}`;
 }
 
 export function billingStatus(grandTotal, paidTotal) {

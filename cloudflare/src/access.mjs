@@ -1,13 +1,13 @@
 export const ROLE_PAGE_ACCESS = {
-  admin: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports", "Settings", "User Management", "Data Tools"]),
-  encoder: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance"]),
-  viewer: new Set(["Dashboard", "Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports"]),
+  admin: new Set(["Dashboard", "Trips", "Projects", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports", "Settings", "User Management", "Data Tools"]),
+  encoder: new Set(["Dashboard", "Trips", "Projects", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance"]),
+  viewer: new Set(["Dashboard", "Trips", "Projects", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance", "Payroll", "Billing", "Collections", "Payables", "Reports"]),
   accounting: new Set(["Dashboard", "Payroll", "Billing", "Collections", "Payables", "Reports"]),
 };
 
 export const ROLE_EDIT_ACCESS = {
   admin: "*",
-  encoder: new Set(["Trips", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance"]),
+  encoder: new Set(["Trips", "Projects", "Recurring Trips", "Employees", "Fleet / Equipment", "Clients", "Suppliers", "Repairs", "Vale / Cash Advance"]),
   viewer: new Set(),
   accounting: new Set(["Payroll", "Billing", "Collections", "Payables"]),
 };

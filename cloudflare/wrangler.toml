@@ -9,4 +9,3 @@ database_id = "3a6fd272-3393-4a36-ba66-3abd48fbc032"
 
 [vars]
 GMT_APP_NAME = "GMT Trucking"
-GMT_SESSION_SECRET = "replace-this-in-cloudflare-pages-settings"

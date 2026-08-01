@@ -20,6 +20,14 @@ function envWithRows(rows = {}) {
           payroll_entries: "payroll",
           payroll_trips: "payrollTrips",
           payroll_additional_lines: "payrollLines",
+          payroll_project_entries: "payrollProjectEntries",
+          projects: "projects",
+          project_helpers: "projectHelpers",
+          project_pay_item_defaults: "projectPayDefaults",
+          project_work_entries: "projectWork",
+          project_work_helpers: "projectWorkHelpers",
+          project_work_pay_items: "projectWorkPayItems",
+          billing_project_lines: "billingProjectLines",
           recurring_trip_masters: "recurring",
           system_settings: "settings",
           trip_employee_pay_items: "payItems",
@@ -93,6 +101,15 @@ function envWithRows(rows = {}) {
             if (state.sql.trim().startsWith("SELECT p.") && state.sql.includes("FROM payroll_entries p")) return { results: rows.payroll || [] };
             if (state.sql.trim().startsWith("SELECT pt.") && state.sql.includes("FROM payroll_trips pt")) return { results: rows.payrollTrips || [] };
             if (state.sql.includes("FROM payroll_additional_lines")) return { results: rows.payrollLines || [] };
+            if ((state.sql.trim().startsWith("SELECT ppe.") || state.sql.trim() === "SELECT * FROM payroll_project_entries") && state.sql.includes("FROM payroll_project_entries")) return { results: rows.payrollProjectEntries || [] };
+            if ((state.sql.trim().startsWith("SELECT bpl.") || state.sql.trim().startsWith("SELECT work_entry_id FROM billing_project_lines") || state.sql.trim() === "SELECT * FROM billing_project_lines") && state.sql.includes("FROM billing_project_lines")) return { results: rows.billingProjectLines || [] };
+            if ((state.sql.trim().startsWith("SELECT wh.") || state.sql.trim() === "SELECT * FROM project_work_helpers") && state.sql.includes("FROM project_work_helpers")) return { results: rows.projectWorkHelpers || [] };
+            if (state.sql.includes("FROM project_work_pay_items")) return { results: rows.projectWorkPayItems || [] };
+            if (state.sql.includes("FROM project_helpers")) return { results: rows.projectHelpers || [] };
+            if (state.sql.includes("FROM project_pay_item_defaults")) return { results: rows.projectPayDefaults || [] };
+            if (state.sql.trim().startsWith("SELECT w.") && state.sql.includes("FROM project_work_entries w")) return { results: rows.projectWork || [] };
+            if (state.sql.trim() === "SELECT * FROM project_work_entries") return { results: rows.projectWork || [] };
+            if (state.sql.includes("FROM projects p")) return { results: filtered("projects").slice(0, 25) };
             if (state.sql.includes("FROM vale_records WHERE")) return { results: rows.vale || [] };
             if (state.sql.includes("FROM cash_advances WHERE")) return { results: rows.cashAdvances || [] };
             if (state.sql.includes("FROM repairs r")) return { results: rows.repairs || [] };
@@ -154,6 +171,20 @@ function envWithRows(rows = {}) {
             if (state.sql.includes("SELECT b.*, COALESCE") && state.sql.includes("FROM billing_statements b WHERE b.id=?")) return byId("billing") || null;
             if (state.sql.includes("SELECT * FROM collections WHERE id=?")) return byId("collections") || null;
             if (state.sql.includes("COUNT(*) AS total FROM payroll_entries p")) return { total: rows.payrollCount ?? filtered("payroll").length };
+            if (state.sql.includes("COUNT(*) AS total FROM projects p")) return { total: rows.projectsCount ?? filtered("projects").length };
+            if (state.sql.includes("SELECT p.*,") && state.sql.includes("FROM projects p") && state.sql.includes("WHERE p.id=?")) return byId("projects") || null;
+            if (state.sql.includes("SELECT w.*,") && state.sql.includes("FROM project_work_entries w") && state.sql.includes("WHERE w.id=?")) return byId("projectWork") || null;
+            if (state.sql.includes("SELECT project_no FROM projects WHERE project_no LIKE")) return rows.lastProject || null;
+            if (state.sql.includes("SELECT work_no FROM project_work_entries WHERE work_no LIKE")) return rows.lastProjectWork || null;
+            if (state.sql.includes("SELECT id FROM projects WHERE project_no=?")) {
+              if (rows.duplicateProject) return { id: rows.duplicateProject };
+              if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO projects"))) return { id: rows.createdProjectId || 81 };
+              return null;
+            }
+            if (state.sql.includes("SELECT id FROM project_work_entries WHERE work_no=?")) {
+              if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO project_work_entries"))) return { id: rows.createdProjectWorkId || 91 };
+              return null;
+            }
             if (state.sql.includes("SELECT p.*,") && state.sql.includes("FROM payroll_entries p")) return byId("payroll") || null;
             if (state.sql.includes("SELECT id FROM payroll_entries WHERE employee_id=?")) {
               if ((rows.runs || []).some((run) => run.sql.includes("INSERT INTO payroll_entries"))) return { id: rows.createdPayrollId || 51 };
@@ -251,6 +282,15 @@ function envWithRows(rows = {}) {
                 base_total: trips.reduce((total, trip) => total + Number(trip.base_trip_rate || 0), 0),
                 extra_total: trips.reduce((total, trip) => total + extra(trip), 0),
                 billable_total: trips.reduce((total, trip) => total + Number(trip.base_trip_rate || 0) + extra(trip), 0),
+              };
+            }
+            if (state.sql.includes("SUM(base_charge)") && state.sql.includes("FROM project_work_entries")) {
+              const work = source("project_work_entries");
+              return {
+                count: work.length,
+                base_total: work.reduce((total, row) => total + Number(row.base_charge || 0), 0),
+                extra_total: work.reduce((total, row) => total + Number(row.extra_total || 0), 0),
+                billable_total: work.reduce((total, row) => total + Number(row.total_charge || 0), 0),
               };
             }
             if (state.sql.includes("SUM(gross_pay)") && state.sql.includes("FROM payroll_entries")) {
@@ -1396,6 +1436,45 @@ test("payroll save creates entry, claims trips, adds lines, and applies advance 
   assert.ok(runs.some((run) => run.sql.includes("UPDATE cash_advances SET balance=?, status=?, applied=?") && run.params[0] === "0" && run.params[1] === "Paid" && Number(run.params[2]) === 1));
 });
 
+test("payroll previews and uniquely claims completed project work", async () => {
+  const work = projectFinancialWork();
+  let response = await handleRequest(await authedRequest("https://example.test/payroll/new?employee=3&period_from=2026-07-01&period_to=2026-07-31", "accounting"), envWithRows({
+    employees: [payrollEmployee()],
+    projectWork: [work],
+    projectWorkPayItems: [{ id: 1, work_entry_id: 91, employee_type: "Primary", label: "Night Work", amount: 100 }],
+  }));
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /PRJ-2026-000001/);
+  assert.match(text, /4 Trip/);
+  assert.match(text, /1,200\.00/);
+  assert.match(text, /Night Work/);
+  assert.match(text, /name="expected_project_entry_ids" value="\[91\]"/);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/payroll/new", "accounting", {
+    method: "POST",
+    body: payrollBody({
+      expected_trip_ids: "[]",
+      expected_project_entry_ids: "[91]",
+      gross_pay: "1200",
+      additional_pay: "100",
+      vale_deduction: "0",
+      cash_advance_deduction: "0",
+      other_deduction: "0",
+    }),
+  }), envWithRows({
+    employees: [payrollEmployee()],
+    projectWork: [work],
+    projectWorkPayItems: [{ id: 1, work_entry_id: 91, employee_type: "Primary", label: "Night Work", amount: 100 }],
+    createdPayrollId: 51,
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO payroll_project_entries") && Number(run.params[1]) === 91 && Number(run.params[2]) === 3));
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO payroll_additional_lines") && run.params.includes("Night Work")));
+});
+
 test("payroll save rejects stale eligibility and deduction values above available balances", async () => {
   let response = await handleRequest(await authedRequest("https://example.test/payroll/new", "admin", { method: "POST", body: payrollBody({ expected_trip_ids: "[99]" }) }), envWithRows({
     employees: [payrollEmployee()],
@@ -1434,6 +1513,24 @@ test("payroll detail and print show payslip trip rows, remarks, balances, deduct
       helper_count: 2,
     }],
     payrollLines: [{ payroll_id: 51, label: "Night Shift", amount: 150 }],
+    payrollProjectEntries: [{
+      payroll_id: 51,
+      work_entry_id: 91,
+      employee_id: 3,
+      project_id: 81,
+      project_no: "PRJ-2026-000001",
+      work_date: "2026-07-15",
+      billing_unit: "Trip",
+      billing_quantity: 4,
+      pay_basis: "Per Trip",
+      pay_quantity: 4,
+      pay_rate: 300,
+      base_amount: 1200,
+      job_description_snapshot: "Hauling aggregates",
+      origin_snapshot: "Quarry",
+      destination_snapshot: "Site",
+      asset_code: "UNIT-002",
+    }],
     vale: [{ id: 7, employee_id: 3, balance: 250 }],
     cashAdvances: [{ id: 8, employee_id: 3, balance: 1000 }],
   });
@@ -1445,6 +1542,8 @@ test("payroll detail and print show payslip trip rows, remarks, balances, deduct
   assert.match(text, /Item \/ Job/);
   assert.match(text, /Payroll delivery service/);
   assert.match(text, /Night Shift/);
+  assert.match(text, /Claimed Project Work/);
+  assert.match(text, /PRJ-2026-000001/);
   assert.match(text, /Net Pay/);
 
   response = await handleRequest(await authedRequest("https://example.test/payroll/51/print", "viewer"), env);
@@ -1454,6 +1553,8 @@ test("payroll detail and print show payslip trip rows, remarks, balances, deduct
   assert.match(text, /Remaining Vale/);
   assert.match(text, /Remaining Cash Advance/);
   assert.match(text, /Deductions/);
+  assert.match(text, /PRJ-2026-000001/);
+  assert.match(text, /Hauling aggregates/);
   assert.match(text, /Received by: \/ Employee Signature/);
 });
 
@@ -1548,6 +1649,42 @@ test("billing save creates statement, lines, adjustments, and marks trips billed
   assert.ok(runs.some((run) => run.sql.includes("UPDATE trips SET status='Billed' WHERE id=?") && run.params[0] === 1));
 });
 
+test("billing previews and uniquely claims completed project work", async () => {
+  const work = projectFinancialWork();
+  let response = await handleRequest(await authedRequest("https://example.test/billing/new?client=1&period_from=2026-07-01&period_to=2026-07-31", "accounting"), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    projectWork: [work],
+  }));
+  assert.equal(response.status, 200);
+  let text = await response.text();
+  assert.match(text, /Eligible Project Work/);
+  assert.match(text, /PRJ-2026-000001/);
+  assert.match(text, /4 Trip/);
+  assert.match(text, /4,075\.00/);
+  assert.match(text, /name="expected_project_entry_ids" value="\[91\]"/);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/billing/new", "accounting", {
+    method: "POST",
+    body: billingBody({
+      expected_trip_ids: "[]",
+      expected_project_entry_ids: "[91]",
+      vat_enabled: "0",
+      addition_amount: "0",
+      deduction_amount: "0",
+    }),
+  }), envWithRows({
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
+    projectWork: [work],
+    lastBilling: { billing_no: "BILL-2026-000060" },
+    createdBillingId: 61,
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((run) => run.sql.includes("INSERT INTO billing_project_lines") && Number(run.params[1]) === 91));
+  assert.ok(runs.some((run) => run.sql.includes("UPDATE project_work_entries SET status='Billed' WHERE id=?") && Number(run.params[0]) === 91));
+});
+
 test("billing validation, detail, print, and delete protection work", async () => {
   let response = await handleRequest(await authedRequest("https://example.test/billing/new", "admin", { method: "POST", body: billingBody({ deduction_amount: "2000" }) }), envWithRows({
     clients: [{ id: 1, client_code: "CLI-001", client_name: "Client One" }],
@@ -1559,6 +1696,23 @@ test("billing validation, detail, print, and delete protection work", async () =
   const env = envWithRows({
     billing: [billingEntry()],
     billingLines: [billingLine()],
+    billingProjectLines: [{
+      id: 2,
+      billing_id: 61,
+      work_entry_id: 91,
+      project_id: 81,
+      project_no: "PRJ-2026-000001",
+      work_date: "2026-07-15",
+      reference_no: "DR-101",
+      billing_unit: "Trip",
+      billing_quantity: 4,
+      client_unit_rate: 1000,
+      job_description_snapshot: "Hauling aggregates",
+      asset_code: "UNIT-002",
+      amount_base: 4000,
+      amount_extra: 75,
+      amount_total: 4075,
+    }],
     billingAdjustments: [{ billing_id: 61, line_type: "Addition", label: "Fuel adjustment", amount: 100 }],
     collections: [collectionEntry()],
   });
@@ -1569,6 +1723,8 @@ test("billing validation, detail, print, and delete protection work", async () =
   assert.match(text, /Ref\. No\.: OR-CLIENT-1/);
   assert.match(text, /Item \/ Job/);
   assert.match(text, /Billing delivery service/);
+  assert.match(text, /Project Work/);
+  assert.match(text, /PRJ-2026-000001/);
   assert.match(text, /Collections/);
 
   response = await handleRequest(await authedRequest("https://example.test/billing/61/print", "viewer"), env);
@@ -1577,6 +1733,8 @@ test("billing validation, detail, print, and delete protection work", async () =
   assert.match(text, /Billing Statement/);
   assert.match(text, /<th>Ref\. No\.<\/th>/);
   assert.match(text, /OR-CLIENT-1/);
+  assert.match(text, /Equipment Project Work/);
+  assert.match(text, /PRJ-2026-000001/);
   assert.match(text, /Received by \/ Conforme/);
 
   response = await handleRequest(await authedRequest("https://example.test/billing/61/delete", "admin"), envWithRows());
@@ -1764,6 +1922,7 @@ test("dashboard shows operational metrics and hides finance-heavy sections by ro
     payables: [{ id: 31, status: "Open", payable_date: "2026-07-15", description: "Supplier invoice", amount: 2000 }],
     vale: [{ id: 21, status: "Open", balance: 250 }],
     cashAdvances: [{ id: 22, status: "Open", balance: 400 }],
+    projects: [projectFixture({ status: "Active" })],
   });
 
   let response = await handleRequest(await authedRequest("https://example.test/", "admin"), env);
@@ -1774,6 +1933,8 @@ test("dashboard shows operational metrics and hides finance-heavy sections by ro
   assert.match(text, /Receivables/);
   assert.match(text, /Open Advances/);
   assert.match(text, /Open Payables/);
+  assert.match(text, /Active Projects/);
+  assert.match(text, /PRJ-2026-000001/);
   assert.match(text, /Recent Activity/);
   assert.match(text, /data-tab="billing"/);
   assert.match(text, /data-tab="collections"/);
@@ -1804,6 +1965,7 @@ test("reports permissions, selector, invalid date validation, and all report slu
     "cash_advance_balance",
     "payroll_summary",
     "repair_summary",
+    "equipment_project_work_summary",
     "fleet_utilization",
   ];
 
@@ -1834,6 +1996,7 @@ test("reports filter trips, receivables, and fleet utilization with correct core
     billing: [billingEntry({ id: 61, billing_no: "BILL-REPORT", grand_total: 1254, status: "Partially Paid" })],
     collections: [collectionEntry({ billing_id: 61, amount_paid: 500 })],
     assets: [{ id: 2, asset_code: "UNIT-001", asset_type: "Truck", plate_no: "ABC-123" }],
+    projectWork: [projectFinancialWork({ asset_id_snapshot: 2, asset_code: "UNIT-001", project_no: "PRJ-REPORT" })],
   });
 
   let response = await handleRequest(await authedRequest("https://example.test/reports?report=unbilled_trips&date_from=2026-07-01&date_to=2026-07-31", "viewer"), env);
@@ -1854,8 +2017,14 @@ test("reports filter trips, receivables, and fleet utilization with correct core
   text = await response.text();
   assert.match(text, /UNIT-001/);
   assert.match(text, /Truck/);
-  assert.match(text, /1,700\.00/);
-  assert.match(text, /85\.00/);
+  assert.match(text, /5,700\.00/);
+  assert.match(text, /160\.00/);
+
+  response = await handleRequest(await authedRequest("https://example.test/reports?report=equipment_project_work_summary&date_from=2026-07-01&date_to=2026-07-31", "viewer"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /PRJ-REPORT/);
+  assert.match(text, /4,075\.00/);
 });
 
 test("printable reports and CSV export preserve filters and raw numeric values", async () => {
@@ -2414,4 +2583,291 @@ test("user management permissions and live role refresh are enforced", async () 
   }));
   assert.equal(response.status, 303);
   assert.equal(response.headers.get("location"), "/login");
+});
+
+function projectFixture(overrides = {}) {
+  return {
+    id: 81,
+    project_no: "PRJ-2026-000001",
+    reference_no: "PO-100",
+    start_date: "2026-07-01",
+    end_date: "",
+    client_id: 1,
+    client_name: "Sample Client",
+    job_description: "Hauling aggregates",
+    origin: "Quarry",
+    destination: "Site",
+    project_location: "",
+    asset_id: 2,
+    asset_code: "UNIT-002",
+    asset_type: "Cargo Truck",
+    primary_employee_id: 3,
+    primary_name: "Driver One",
+    primary_code: "EMP-003",
+    primary_type: "Driver",
+    billing_basis: "Trip",
+    default_billing_quantity: 4,
+    client_unit_rate: 1000,
+    primary_pay_basis: "Per Trip",
+    primary_pay_rate: 300,
+    helper_pay_basis: "Per Trip",
+    helper_pay_rate: 200,
+    fuel_surcharge: 50,
+    loading_fee: 0,
+    unloading_fee: 0,
+    waiting_fee: 0,
+    tolls: 0,
+    additional_stop_charge: 0,
+    special_handling_fee: 0,
+    other_charges: 0,
+    status: "Active",
+    notes: "",
+    ...overrides,
+  };
+}
+
+function projectPost(overrides = {}) {
+  return new URLSearchParams({
+    project_no: "",
+    reference_no: "PO-100",
+    start_date: "2026-07-01",
+    end_date: "",
+    client_id: "1",
+    job_description: "Hauling aggregates",
+    origin: "Quarry",
+    destination: "Site",
+    project_location: "",
+    asset_id: "2",
+    primary_employee_id: "3",
+    helper_1: "4",
+    helper_2: "",
+    helper_3: "",
+    billing_basis: "Trip",
+    default_billing_quantity: "4",
+    client_unit_rate: "1000",
+    primary_pay_basis: "Per Trip",
+    primary_pay_rate: "300",
+    helper_pay_basis: "Per Trip",
+    helper_pay_rate: "200",
+    fuel_surcharge: "50",
+    loading_fee: "0",
+    unloading_fee: "0",
+    waiting_fee: "0",
+    tolls: "0",
+    additional_stop_charge: "0",
+    special_handling_fee: "0",
+    other_charges: "0",
+    status: "Active",
+    primary_pay_items: "[]",
+    helper_pay_items: "[]",
+    notes: "",
+    ...overrides,
+  });
+}
+
+function projectWorkPost(overrides = {}) {
+  return new URLSearchParams({
+    work_no: "",
+    work_date: "2026-07-15",
+    reference_no: "DR-101",
+    billing_unit: "Trip",
+    billing_quantity: "4",
+    client_unit_rate: "1000",
+    primary_pay_basis: "Per Trip",
+    primary_pay_quantity: "4",
+    primary_pay_rate: "300",
+    primary_manual_pay: "0",
+    helper_pay_basis: "Per Trip",
+    helper_pay_quantity: "4",
+    helper_pay_rate: "200",
+    helper_manual_pay: "0",
+    start_time: "08:00",
+    end_time: "17:00",
+    meter_start: "",
+    meter_end: "",
+    fuel_surcharge: "50",
+    loading_fee: "0",
+    unloading_fee: "0",
+    waiting_fee: "0",
+    tolls: "0",
+    additional_stop_charge: "0",
+    special_handling_fee: "0",
+    other_charges: "0",
+    primary_pay_items: JSON.stringify([{ label: "Meal", amount: 100 }]),
+    helper_pay_items: "[]",
+    notes: "Four completed loads",
+    ...overrides,
+  });
+}
+
+function projectFinancialWork(overrides = {}) {
+  return {
+    id: 91,
+    project_id: 81,
+    project_no: "PRJ-2026-000001",
+    work_no: "PWL-2026-000001",
+    work_date: "2026-07-15",
+    reference_no: "DR-101",
+    status: "Completed",
+    client_id_snapshot: 1,
+    asset_id_snapshot: 2,
+    asset_code: "UNIT-002",
+    primary_employee_id: 3,
+    project_role: "Primary",
+    helper_count: 1,
+    billing_unit: "Trip",
+    billing_quantity: 4,
+    client_unit_rate: 1000,
+    base_charge: 4000,
+    fuel_surcharge: 50,
+    loading_fee: 25,
+    unloading_fee: 0,
+    waiting_fee: 0,
+    tolls: 0,
+    additional_stop_charge: 0,
+    special_handling_fee: 0,
+    other_charges: 0,
+    extra_total: 75,
+    total_charge: 4075,
+    primary_pay_basis: "Per Trip",
+    primary_pay_quantity: 4,
+    primary_pay_rate: 300,
+    primary_manual_pay: 0,
+    helper_pay_basis: "Per Trip",
+    helper_pay_quantity: 4,
+    helper_pay_rate: 200,
+    helper_manual_pay: 0,
+    job_description_snapshot: "Hauling aggregates",
+    origin_snapshot: "Quarry",
+    destination_snapshot: "Site",
+    ...overrides,
+  };
+}
+
+test("projects list, workspace, CSV, and permissions follow Operations roles", async () => {
+  const rows = {
+    projects: [projectFixture({ work_count: 2 })],
+    clients: [{ id: 1, client_code: "CLI-001", client_name: "Sample Client", active: 1 }],
+    assets: [{ id: 2, asset_code: "UNIT-002", plate_no: "ABC-123", asset_type: "Cargo Truck" }],
+    employees: [
+      { id: 3, employee_code: "EMP-003", full_name: "Driver One", employee_type: "Driver", active: 1 },
+      { id: 4, employee_code: "EMP-004", full_name: "Helper One", employee_type: "Helper", active: 1 },
+    ],
+  };
+  let response = await handleRequest(await authedRequest("https://example.test/projects?q=Sample&status=Active"), envWithRows(rows));
+  assert.equal(response.status, 200);
+  let body = await response.text();
+  assert.match(body, /Projects List/);
+  assert.match(body, /PRJ-2026-000001/);
+  assert.match(body, /New Project/);
+
+  response = await handleRequest(await authedRequest("https://example.test/projects/new"), envWithRows(rows));
+  body = await response.text();
+  assert.match(body, /Project Overview/);
+  assert.match(body, /Client &amp; Scope/);
+  assert.match(body, /Client Billing Rate/);
+  assert.match(body, /Employee Pay Rates/);
+  assert.doesNotMatch(body, /textarea[^>]+primary_pay_items/);
+
+  response = await handleRequest(await authedRequest("https://example.test/projects/export.csv", "viewer"), envWithRows(rows));
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /"Project No.","Ref. No."/);
+
+  response = await handleRequest(await authedRequest("https://example.test/projects/new", "viewer"), envWithRows(rows));
+  assert.equal(response.status, 403);
+  response = await handleRequest(await authedRequest("https://example.test/projects", "accounting"), envWithRows(rows));
+  assert.equal(response.status, 403);
+});
+
+test("project create generates PRJ number and saves ordered helpers and pay defaults", async () => {
+  const runs = [];
+  const response = await handleRequest(await authedRequest("https://example.test/projects/new", "encoder", {
+    method: "POST",
+    body: projectPost({ primary_pay_items: JSON.stringify([{ label: "Operator allowance", amount: 125 }]) }),
+  }), envWithRows({
+    clients: [{ id: 1, client_name: "Sample Client", active: 1 }],
+    assets: [{ id: 2, asset_code: "UNIT-002", asset_type: "Cargo Truck" }],
+    employees: [{ id: 3, full_name: "Driver One", employee_type: "Driver", active: 1 }, { id: 4, full_name: "Helper One", employee_type: "Helper", active: 1 }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/projects\/81/);
+  const insert = runs.find((item) => item.sql.includes("INSERT INTO projects"));
+  assert.ok(insert);
+  assert.equal(insert.params[0], "PRJ-2026-000001");
+  assert.ok(runs.some((item) => item.sql.includes("INSERT INTO project_helpers") && item.params[1] === "4"));
+  assert.ok(runs.some((item) => item.sql.includes("INSERT INTO project_pay_item_defaults") && item.params.includes("Operator allowance")));
+});
+
+test("daily project work multiplies quantity while keeping extras flat and snapshots crew", async () => {
+  const runs = [];
+  const project = projectFixture();
+  const response = await handleRequest(await authedRequest("https://example.test/projects/81/work/new", "admin", {
+    method: "POST",
+    body: projectWorkPost(),
+  }), envWithRows({
+    projects: [project],
+    projectHelpers: [{ id: 1, project_id: 81, employee_id: 4, helper_order: 1, full_name: "Helper One" }],
+    projectPayDefaults: [],
+    assets: [{ id: 2, asset_type: "Cargo Truck" }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  const insert = runs.find((item) => item.sql.includes("INSERT INTO project_work_entries"));
+  assert.ok(insert);
+  const columns = insert.sql.match(/\((.+)\) VALUES/)?.[1].split(",");
+  const values = Object.fromEntries(columns.map((column, index) => [column.trim(), insert.params[index]]));
+  assert.equal(values.work_no, "PWL-2026-000001");
+  assert.equal(values.base_charge, 4000);
+  assert.equal(values.extra_total, 50);
+  assert.equal(values.total_charge, 4050);
+  assert.equal(values.client_id_snapshot, 1);
+  assert.equal(values.asset_id_snapshot, 2);
+  assert.ok(runs.some((item) => item.sql.includes("INSERT INTO project_work_helpers")));
+  assert.ok(runs.some((item) => item.sql.includes("INSERT INTO project_work_pay_items") && item.params.includes("Meal")));
+});
+
+test("project work completion is explicit and financially linked work is locked", async () => {
+  const work = {
+    id: 91,
+    project_id: 81,
+    project_no: "PRJ-2026-000001",
+    work_no: "PWL-2026-000001",
+    work_date: "2026-07-15",
+    billing_unit: "Trip",
+    billing_quantity: 4,
+    status: "Draft",
+  };
+  const runs = [];
+  let response = await handleRequest(await authedRequest("https://example.test/projects/81/work/91/status", "encoder", {
+    method: "POST",
+    body: new URLSearchParams({ status: "Completed" }),
+  }), envWithRows({ projectWork: [work], runs }));
+  assert.equal(response.status, 303);
+  assert.ok(runs.some((item) => item.sql.includes("UPDATE project_work_entries SET status=?") && item.params[0] === "Completed"));
+
+  response = await handleRequest(await authedRequest("https://example.test/projects/81/work/91/status", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ status: "Cancelled" }),
+  }), envWithRows({ projectWork: [work], refs: { billing_project_lines: 1 } }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /locked/);
+});
+
+test("project summary print shows completed quantity, charges, logo, and signatures", async () => {
+  const project = projectFixture();
+  const response = await handleRequest(await authedRequest("https://example.test/projects/81/print?date_from=2026-07-01&date_to=2026-07-31", "viewer"), envWithRows({
+    projects: [project],
+    projectHelpers: [],
+    projectPayDefaults: [],
+    projectWork: [{ id: 91, project_id: 81, work_no: "PWL-2026-000001", work_date: "2026-07-15", reference_no: "DR-1", billing_unit: "Trip", billing_quantity: 4, client_unit_rate: 1000, base_charge: 4000, extra_total: 50, total_charge: 4050, status: "Completed" }],
+    settings: [{ setting_key: "company_name", setting_value: "GMT Trucking" }, { setting_key: "company_logo_data_url", setting_value: "data:image/png;base64,LOGO" }],
+  }));
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /Equipment Project Work Summary/);
+  assert.match(body, /PWL-2026-000001/);
+  assert.match(body, /data:image\/png;base64,LOGO/);
+  assert.match(body, /Prepared by/);
+  assert.match(body, /Client \/ Conforme/);
 });

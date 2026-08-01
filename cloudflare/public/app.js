@@ -170,5 +170,36 @@
     fields.forEach((field) => field?.addEventListener("input", update)); update();
   }
 
-  setupComboboxes(); setupTabs(); setupDialogs(); setupTripForm(); setupRepairTotal();
+  function setupProjectForms() {
+    const projectForm = document.querySelector("[data-project-form] form");
+    if (projectForm) setupPayItems(projectForm);
+    const workForm = document.querySelector("[data-project-work-form] form");
+    if (!workForm) return;
+    setupPayItems(workForm);
+    const number = (name) => Number(workForm.querySelector(`[name="${name}"]`)?.value || 0);
+    const update = () => {
+      const base = number("billing_quantity") * number("client_unit_rate");
+      const extras = moneyFields.reduce((sum, name) => sum + number(name), 0);
+      workForm.querySelector("[data-project-base]")?.replaceChildren(document.createTextNode(base.toLocaleString(undefined, { minimumFractionDigits: 2 })));
+      workForm.querySelector("[data-project-extras]")?.replaceChildren(document.createTextNode(extras.toLocaleString(undefined, { minimumFractionDigits: 2 })));
+      workForm.querySelector("[data-project-total]")?.replaceChildren(document.createTextNode((base + extras).toLocaleString(undefined, { minimumFractionDigits: 2 })));
+    };
+    workForm.querySelectorAll('input[type="number"]').forEach((field) => field.addEventListener("input", update));
+    const billingUnit = workForm.querySelector('[name="billing_unit"]');
+    const billingQuantity = workForm.querySelector('[name="billing_quantity"]');
+    const defaults = (kind) => {
+      const basis = workForm.querySelector(`[name="${kind}_pay_basis"]`);
+      const quantity = workForm.querySelector(`[name="${kind}_pay_quantity"]`);
+      if (!basis || !quantity || Number(quantity.value || 0) > 0) return;
+      if (basis.value === "Per Day") quantity.value = "1";
+      else if (basis.value.replace("Per ", "") === billingUnit?.value) quantity.value = billingQuantity?.value || "";
+    };
+    ["primary", "helper"].forEach((kind) => workForm.querySelector(`[name="${kind}_pay_basis"]`)?.addEventListener("change", () => defaults(kind)));
+    billingQuantity?.addEventListener("input", () => { defaults("primary"); defaults("helper"); });
+    billingUnit?.addEventListener("change", () => { defaults("primary"); defaults("helper"); });
+    defaults("primary"); defaults("helper");
+    update();
+  }
+
+  setupComboboxes(); setupTabs(); setupDialogs(); setupTripForm(); setupProjectForms(); setupRepairTotal();
 })();

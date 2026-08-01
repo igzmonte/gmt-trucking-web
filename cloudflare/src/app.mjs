@@ -2,7 +2,8 @@ import { canEdit, canView, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, hashPassword, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, dashboard, first, run } from "./db.mjs";
 import { cards, dialogShell, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
-import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, tripBillableTotal, tripExtraTotal } from "./services.mjs";
+import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, projectEmployeeBasePay, projectExtraTotal, tripBillableTotal, tripExtraTotal } from "./services.mjs";
+import { handleProjects } from "./projects.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
 
 const MASTER = {
@@ -27,6 +28,10 @@ const MASTER = {
       ["cash_advances", "employee_id", "cash advances"],
       ["payroll_entries", "employee_id", "payroll entries"],
       ["payroll_trips", "employee_id", "payroll trip claims"],
+      ["projects", "primary_employee_id", "equipment projects"],
+      ["project_helpers", "employee_id", "project helper assignments"],
+      ["project_work_entries", "primary_employee_id", "project work entries"],
+      ["project_work_helpers", "employee_id", "project-work helper snapshots"],
     ],
     fields: [
       ["employee_code", "Employee code"], ["full_name", "Full name"], ["employee_type", "Employee type"],
@@ -50,6 +55,8 @@ const MASTER = {
       ["recurring_trip_masters", "default_asset_id", "recurring trips"],
       ["trips", "asset_id", "trips"],
       ["repairs", "asset_id", "repairs"],
+      ["projects", "asset_id", "equipment projects"],
+      ["project_work_entries", "asset_id_snapshot", "project work snapshots"],
     ],
     fields: [
       ["asset_code", "Asset code"], ["asset_type", "Asset type"], ["plate_no", "Plate no"],
@@ -73,6 +80,8 @@ const MASTER = {
       ["trips", "client_id", "trips"],
       ["billing_statements", "client_id", "billing statements"],
       ["collections", "client_id", "collections"],
+      ["projects", "client_id", "equipment projects"],
+      ["project_work_entries", "client_id_snapshot", "project work snapshots"],
     ],
     fields: [
       ["client_code", "Client code"], ["client_name", "Client name"], ["billing_address", "Billing address"],
@@ -237,33 +246,36 @@ function customerPrintStyles(page = "A4 portrait") {
 
 async function dashboardPage(env, user, path) {
   const data = await dashboard(env);
-  const [payroll, repairs, payables, vale, cash, recentTrips, recentBillings, recentCollections, recentPayroll] = await Promise.all([
-    first(env, "SELECT COALESCE(SUM(net_pay),0) AS total FROM payroll_entries"),
+  const [repairs, payables, vale, cash, activeProjects, recentTrips, recentProjects, recentBillings, recentCollections, recentPayroll] = await Promise.all([
     first(env, "SELECT COUNT(*) AS total FROM repairs WHERE status='Open'"),
     first(env, "SELECT COALESCE(SUM(amount),0) AS total FROM payables WHERE status IN ('Open','Partial')"),
     first(env, "SELECT COALESCE(SUM(balance),0) AS total FROM vale_records WHERE status='Open'"),
     first(env, "SELECT COALESCE(SUM(balance),0) AS total FROM cash_advances WHERE status='Open'"),
+    first(env, "SELECT COUNT(*) AS total FROM projects WHERE status='Active'"),
     all(env, "SELECT t.*, c.client_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id ORDER BY t.trip_date DESC, t.id DESC LIMIT 5"),
+    all(env, "SELECT p.*,c.client_name,a.asset_code FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id ORDER BY p.start_date DESC,p.id DESC LIMIT 5"),
     all(env, "SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id ORDER BY b.billing_date DESC, b.id DESC LIMIT 5"),
     all(env, "SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id ORDER BY co.collection_date DESC, co.id DESC LIMIT 5"),
     all(env, "SELECT p.*, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id ORDER BY p.pay_date DESC, p.id DESC LIMIT 5"),
   ]);
   const finance = canView(user, "Billing") || canView(user, "Payables");
   const advanceTotal = Number(vale?.total || 0) + Number(cash?.total || 0);
-  const cardItems = finance
-    ? [["Ongoing Trips", data.ongoing], ["Completed Trips", data.completed], ["Active Employees", data.employees], ["Receivables", peso(data.receivables)], ["Open Payables", peso(payables?.total || 0)], ["Open Advances", peso(advanceTotal)]]
-    : [["Total Trips", data.trips], ["Ongoing Trips", data.ongoing], ["Completed Trips", data.completed], ["Active Employees", data.employees], ["Open Repairs", repairs?.total || 0], ["Payroll Total", canView(user, "Payroll") ? peso(payroll?.total || 0) : "—"]];
+  const dashboardCards = finance
+    ? [["Ongoing Trips", data.ongoing], ["Active Projects", activeProjects?.total || 0], ["Completed Trips", data.completed], ["Receivables", peso(data.receivables)], ["Open Payables", peso(payables?.total || 0)], ["Open Advances", peso(advanceTotal)]]
+    : [["Total Trips", data.trips], ["Ongoing Trips", data.ongoing], ["Active Projects", activeProjects?.total || 0], ["Completed Trips", data.completed], ["Active Employees", data.employees], ["Open Repairs", repairs?.total || 0]];
   const tripsBody = recentTrips.map((row) => `<tr><td><a href="/trips/${row.id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.trip_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.status)}</td></tr>`);
+  const projectBody = recentProjects.map((row) => `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.start_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.status)}</td></tr>`);
   const billingBody = recentBillings.map((row) => `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.grand_total)}${moneyCell(outstandingBalance(row.grand_total, row.paid_amount))}</tr>`);
   const collectionBody = recentCollections.map((row) => `<tr><td>${esc(row.collection_date)}</td><td>${esc(row.billing_no || "")}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.reference_no || "")}</td>${moneyCell(row.amount_paid)}</tr>`);
   const payrollBody = recentPayroll.map((row) => `<tr><td><a href="/payroll/${row.id}">${esc(row.pay_date)}</a></td><td>${esc(row.full_name || "")}</td><td>${esc(row.employee_type || "")}</td>${moneyCell(row.net_pay)}</tr>`);
   const activityTabs = [
     ["trips", "Trips", table(["Trip Ticket / Waybill", "Date", "Client", "Status"], tripsBody, { empty: "No recent trips.", bare: true })],
+    ...(canView(user, "Projects") ? [["projects", "Projects", table(["Project No.", "Start", "Client", "Asset", "Status"], projectBody, { empty: "No recent projects.", bare: true })]] : []),
     ...(canView(user, "Billing") ? [["billing", "Billing", table(["Billing No.", "Client", "Grand Total", "Balance"], billingBody, { empty: "No recent billings.", bare: true })]] : []),
     ...(canView(user, "Collections") ? [["collections", "Collections", table(["Date", "Billing No.", "Client", "Ref. No.", "Amount"], collectionBody, { empty: "No recent collections.", bare: true })]] : []),
     ...(canView(user, "Payroll") ? [["payroll", "Payroll", table(["Pay Date", "Employee", "Type", "Net Pay"], payrollBody, { empty: "No recent payroll entries.", bare: true })]] : []),
   ];
-  const content = `<section class="panel">${cards(cardItems)}</section><section class="panel activity-panel" data-tabs><div class="activity-header"><h3>Recent Activity</h3></div><div class="tab-list" role="tablist">${activityTabs.map(([key, label]) => `<button type="button" class="tab-button" data-tab="${key}" role="tab">${esc(label)}</button>`).join("")}</div>${activityTabs.map(([key, , markup]) => `<div class="tab-panel" data-tab-panel="${key}" role="tabpanel">${markup}</div>`).join("")}</section>`;
+  const content = `<section class="panel">${cards(dashboardCards)}</section><section class="panel activity-panel" data-tabs><div class="activity-header"><h3>Recent Activity</h3></div><div class="tab-list" role="tablist">${activityTabs.map(([key, label]) => `<button type="button" class="tab-button" data-tab="${key}" role="tab">${esc(label)}</button>`).join("")}</div>${activityTabs.map(([key, , markup]) => `<div class="tab-panel" data-tab-panel="${key}" role="tabpanel">${markup}</div>`).join("")}</section>`;
   return html(layout({ title: "Dashboard", user, path, content }));
 }
 
@@ -540,7 +552,7 @@ async function recurringListPage(request, env, user, path) {
   const where = recurringWhere(query);
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id${where.sql}`, where.params);
   const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY r.master_code, r.id LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
-  const body = rows.map((r) => `<tr><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">${esc(r.master_code)}</a>` : esc(r.master_code)}</td><td>${esc(r.client_name || "")}</td><td>${esc(r.origin)} â†’ ${esc(r.destination)}</td><td>${esc(r.asset_code || "")}</td><td>${esc(r.driver_name || "")}</td><td class="num">${esc(r.default_helper_count || 0)}</td><td class="num">${money(r.standard_base_rate)}</td><td class="num">${money(r.driver_pay_rate)}</td><td class="num">${money(r.helper_pay_rate)}</td><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
+  const body = rows.map((r) => `<tr><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">${esc(r.master_code)}</a>` : esc(r.master_code)}</td><td>${esc(r.client_name || "")}</td><td>${esc(r.origin)} → ${esc(r.destination)}</td><td>${esc(r.asset_code || "")}</td><td>${esc(r.driver_name || "")}</td><td class="num">${esc(r.default_helper_count || 0)}</td><td class="num">${money(r.standard_base_rate)}</td><td class="num">${money(r.driver_pay_rate)}</td><td class="num">${money(r.helper_pay_rate)}</td><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
   const params = new URLSearchParams();
   if (query) params.set("q", query);
   const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search recurring trips"><button>Search</button></form><div>${canEdit(user, "Recurring Trips") ? `<a class="button" href="/recurring-trips/new">New Template</a>` : ""} <a class="button secondary" href="/recurring-trips/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a></div></div>`;
@@ -1608,6 +1620,39 @@ async function payrollEligibleTrips(env, employee, periodFrom, periodTo) {
   return [];
 }
 
+async function payrollEligibleProjectWork(env, employee, periodFrom, periodTo) {
+  if (!employee || !periodFrom || !periodTo) return [];
+  return await all(
+    env,
+    `SELECT w.*, p.project_no, a.asset_code,
+            (SELECT COUNT(*) FROM project_work_helpers wh2 WHERE wh2.work_entry_id=w.id) AS helper_count,
+            CASE WHEN w.primary_employee_id=? THEN 'Primary' ELSE 'Helper' END AS project_role
+       FROM project_work_entries w
+       JOIN projects p ON p.id=w.project_id
+       LEFT JOIN assets a ON a.id=w.asset_id_snapshot
+      WHERE w.work_date BETWEEN ? AND ?
+        AND w.status IN ('Completed','Billed')
+        AND (w.primary_employee_id=? OR EXISTS (
+          SELECT 1 FROM project_work_helpers wh
+           WHERE wh.work_entry_id=w.id AND wh.employee_id=?
+        ))
+        AND NOT EXISTS (
+          SELECT 1 FROM payroll_project_entries ppe
+           WHERE ppe.work_entry_id=w.id AND ppe.employee_id=?
+        )
+      ORDER BY w.work_date,p.project_no,w.id`,
+    [employee.id, periodFrom, periodTo, employee.id, employee.id, employee.id],
+  );
+}
+
+async function payrollProjectItems(env, workId, employeeType) {
+  return await all(
+    env,
+    "SELECT * FROM project_work_pay_items WHERE work_entry_id=? AND employee_type=? ORDER BY sort_order,id",
+    [workId, employeeType],
+  );
+}
+
 async function payrollAdvancePlan(env, table, employeeId) {
   return await all(env, `SELECT * FROM ${table} WHERE employee_id=? AND status='Open' AND balance>0 ORDER BY date_granted, id`, [employeeId]);
 }
@@ -1616,6 +1661,7 @@ async function payrollPreview(env, employeeId, periodFrom, periodTo) {
   const employee = await loadPayrollEmployee(env, employeeId);
   if (!employee) return null;
   const trips = await payrollEligibleTrips(env, employee, periodFrom, periodTo);
+  const projectEntries = await payrollEligibleProjectWork(env, employee, periodFrom, periodTo);
   let gross = 0;
   const lineTotals = new Map();
   const tripRows = [];
@@ -1636,6 +1682,20 @@ async function payrollPreview(env, employeeId, periodFrom, periodTo) {
       if (amount > 0) lineTotals.set(employee.employee_type === "Driver" ? "Driver Pay Item" : "Helper Pay Item", numeric(lineTotals.get(employee.employee_type === "Driver" ? "Driver Pay Item" : "Helper Pay Item")) + amount);
     }
   }
+  const projectRows = [];
+  for (const work of projectEntries) {
+    const helperCount = Math.max(0, numeric(work.helper_count));
+    const role = work.project_role === "Primary" ? "primary" : "helper";
+    const baseAmount = projectEmployeeBasePay(work, role, helperCount);
+    gross += baseAmount;
+    projectRows.push({ ...work, payroll_amount: baseAmount });
+    const type = role === "primary" ? "Primary" : "Helper";
+    const items = await payrollProjectItems(env, work.id, type);
+    for (const item of items) {
+      const amount = role === "helper" ? (helperCount ? numeric(item.amount) / helperCount : 0) : numeric(item.amount);
+      if (amount > 0) lineTotals.set(item.label, numeric(lineTotals.get(item.label)) + amount);
+    }
+  }
   const additionalLines = [...lineTotals.entries()].map(([label, amount], index) => ({ employee_type: employee.employee_type, label, amount, sort_order: index + 1 }));
   const additionalPay = additionalLines.reduce((sum, line) => sum + numeric(line.amount), 0);
   const valePlan = await payrollAdvancePlan(env, "vale_records", employee.id);
@@ -1643,8 +1703,9 @@ async function payrollPreview(env, employeeId, periodFrom, periodTo) {
   const valeDeduction = valePlan.reduce((sum, row) => sum + Math.min(numeric(row.balance), numeric(row.installment_amount) || numeric(row.balance)), 0);
   const cashDeduction = cashPlan.reduce((sum, row) => sum + numeric(row.balance), 0);
   let unitDescription = "Manual payroll entry";
-  if (employee.employee_type === "Driver") unitDescription = `${trips.length} trip(s)`;
-  else if (employee.employee_type === "Helper") unitDescription = `${trips.length} helper trip(s)`;
+  if (employee.employee_type === "Driver") unitDescription = `${trips.length} trip(s), ${projectEntries.length} project work entr${projectEntries.length === 1 ? "y" : "ies"}`;
+  else if (employee.employee_type === "Helper") unitDescription = `${trips.length} helper trip(s), ${projectEntries.length} project work entr${projectEntries.length === 1 ? "y" : "ies"}`;
+  else if (projectEntries.length) unitDescription = `${projectEntries.length} project work entr${projectEntries.length === 1 ? "y" : "ies"}`;
   else if (employee.employee_type === "Operator" || employee.payroll_basis === "Per Day") unitDescription = "Enter days worked manually or override amount";
   return {
     employee,
@@ -1655,7 +1716,9 @@ async function payrollPreview(env, employeeId, periodFrom, periodTo) {
     unit_description: unitDescription,
     trips,
     tripRows,
-    trips_count: trips.length,
+    projectEntries,
+    projectRows,
+    trips_count: trips.length + projectEntries.length,
     gross_pay: gross,
     additional_pay: additionalPay,
     driver_trip_additional_pay: employee.employee_type === "Driver" ? additionalPay : 0,
@@ -1671,6 +1734,11 @@ async function payrollPreview(env, employeeId, periodFrom, periodTo) {
 function payrollTripTable(preview) {
   const rows = (preview?.tripRows || []).map((row) => `<tr><td>${esc(row.trip_date)}</td><td><a href="/trips/${row.id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.origin || "")} → ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
   return table(["Date", "Trip Ticket / Waybill", "Unit", "Route", "Item / Job", "Base Pay"], rows, { empty: "No eligible trip rows. Enter Per-Day or Manual earnings above." });
+}
+
+function payrollProjectTable(preview) {
+  const rows = (preview?.projectRows || []).map((row) => `<tr><td>${esc(row.work_date)}</td><td><a href="/projects/${row.project_id}">${esc(row.project_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.billing_quantity)} ${esc(row.billing_unit)}</td><td>${esc(row.project_role)}</td><td>${esc(row.job_description_snapshot || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
+  return table(["Date", "Project No.", "Unit", "Quantity", "Role", "Item / Job", "Base Pay"], rows, { empty: "No eligible completed project work entries." });
 }
 
 function payrollFormContent(employees, selection, preview, values = {}, errors = []) {
@@ -1693,7 +1761,7 @@ function payrollFormContent(employees, selection, preview, values = {}, errors =
     remarks: "",
     ...values,
   };
-  const hidden = `<input type="hidden" name="employee" value="${esc(preview.employee.id)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify(preview.trips.map((trip) => trip.id)))}">`;
+  const hidden = `<input type="hidden" name="employee" value="${esc(preview.employee.id)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify(preview.trips.map((trip) => trip.id)))}"><input type="hidden" name="expected_project_entry_ids" value="${esc(JSON.stringify(preview.projectEntries.map((entry) => entry.id)))}">`;
   const fields = [
     textInput("pay_date", "Pay date", formValues.pay_date, 'type="date" required'),
     textInput("unit_description", "Unit description", formValues.unit_description),
@@ -1710,9 +1778,9 @@ function payrollFormContent(employees, selection, preview, values = {}, errors =
     numberInput("other_deduction", "Other deduction", formValues.other_deduction),
     textareaInput("remarks", "Remarks", formValues.remarks, 'rows="3"'),
   ];
-  const previewSummary = `<section class="panel">${cards([["Employee", preview.employee.full_name], ["Type / Basis", `${preview.employee_type} / ${preview.payroll_basis}`], ["Eligible Trips", String(preview.trips_count)], ["Preview Gross", peso(preview.gross_pay)]])}<dl class="payroll-limits"><dt>Remaining Vale</dt><dd>${esc(peso(preview.vale_deduction))}</dd><dt>Remaining Cash Advance</dt><dd>${esc(peso(preview.cash_advance_deduction))}</dd></dl></section>`;
+  const previewSummary = `<section class="panel">${cards([["Employee", preview.employee.full_name], ["Type / Basis", `${preview.employee_type} / ${preview.payroll_basis}`], ["Eligible Work", String(preview.trips_count)], ["Preview Gross", peso(preview.gross_pay)]])}<dl class="payroll-limits"><dt>Remaining Vale</dt><dd>${esc(peso(preview.vale_deduction))}</dd><dt>Remaining Cash Advance</dt><dd>${esc(peso(preview.cash_advance_deduction))}</dd></dl></section>`;
   const additional = preview.additionalLines.length ? `<section class="panel"><h3>Trip Pay Items</h3>${preview.additionalLines.map((line) => `<div class="detail-pay-row"><span>${esc(line.label)}</span><strong>${esc(peso(line.amount))}</strong></div>`).join("")}</section>` : "";
-  return `${errorBox}${selector}${previewSummary}<form method="post" action="/payroll/new" class="panel">${hidden}<div class="grid">${fields.join("")}</div><p><button>Save Payroll</button> <a class="button secondary" href="/payroll">Cancel</a></p></form><section class="panel payroll-preview-table"><h3>Eligible Trip Earnings</h3></section>${payrollTripTable(preview)}${additional}`;
+  return `${errorBox}${selector}${previewSummary}<form method="post" action="/payroll/new" class="panel">${hidden}<div class="grid">${fields.join("")}</div><p><button>Save Payroll</button> <a class="button secondary" href="/payroll">Cancel</a></p></form><section class="panel payroll-preview-table"><h3>Eligible Trip Earnings</h3></section>${payrollTripTable(preview)}<section class="panel payroll-preview-table"><h3>Eligible Project Work Earnings</h3></section>${payrollProjectTable(preview)}${additional}`;
 }
 
 function payrollCleaned(data, preview) {
@@ -1730,6 +1798,7 @@ function payrollCleaned(data, preview) {
     deductions,
     remarks: (data.remarks || "").trim(),
     expected_trip_ids: parseExpectedIds(data.expected_trip_ids),
+    expected_project_entry_ids: parseExpectedIds(data.expected_project_entry_ids),
   };
 }
 
@@ -1746,6 +1815,8 @@ function validatePayroll(cleaned, preview) {
     if (numeric(cleaned.deductions.cash_advance_deduction) > numeric(preview.cash_advance_deduction)) errors.push("Deduction cannot exceed the remaining Cash Advance balance.");
     const freshIds = preview.trips.map((trip) => Number(trip.id));
     if (JSON.stringify(freshIds) !== JSON.stringify(cleaned.expected_trip_ids)) errors.push("Payroll eligibility changed. Preview the period again before saving.");
+    const freshProjectIds = preview.projectEntries.map((entry) => Number(entry.id));
+    if (JSON.stringify(freshProjectIds) !== JSON.stringify(cleaned.expected_project_entry_ids)) errors.push("Project work eligibility changed. Preview the period again before saving.");
   }
   return errors;
 }
@@ -1780,7 +1851,7 @@ async function savePayroll(env, cleaned, preview) {
     employee_type: preview.employee_type,
     payroll_basis: preview.payroll_basis,
     unit_description: cleaned.unit_description || preview.unit_description,
-    trips_count: String(preview.trips.length),
+    trips_count: String(preview.trips.length + preview.projectEntries.length),
     days_count: cleaned.days_count,
     gross_pay: cleaned.gross_pay,
     additional_pay: cleaned.additional_pay,
@@ -1794,6 +1865,18 @@ async function savePayroll(env, cleaned, preview) {
   const result = await run(env, `INSERT INTO payroll_entries (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
   const payrollId = result?.meta?.last_row_id || await createdPayrollId(env, values);
   for (const trip of preview.trips) await run(env, "INSERT INTO payroll_trips (payroll_id, trip_id, employee_id) VALUES (?,?,?)", [payrollId, trip.id, cleaned.employee_id]);
+  for (const work of preview.projectEntries) {
+    await run(env, "INSERT INTO payroll_project_entries (payroll_id,work_entry_id,employee_id,employee_role,pay_basis,pay_quantity,pay_rate,base_amount) VALUES (?,?,?,?,?,?,?,?)", [
+      payrollId,
+      work.id,
+      cleaned.employee_id,
+      work.project_role,
+      work.project_role === "Primary" ? work.primary_pay_basis : work.helper_pay_basis,
+      work.project_role === "Primary" ? work.primary_pay_quantity : work.helper_pay_quantity,
+      work.project_role === "Primary" ? work.primary_pay_rate : work.helper_pay_rate,
+      projectEmployeeBasePay(work, work.project_role === "Primary" ? "primary" : "helper", numeric(work.helper_count)),
+    ]);
+  }
   const lines = [...preview.additionalLines];
   if (manualAdditional) lines.push({ employee_type: "Manual", label: "Manual Additional Pay", amount: manualAdditional, sort_order: lines.length + 1 });
   for (const line of lines.filter((line) => numeric(line.amount))) {
@@ -1850,6 +1933,7 @@ async function loadPayrollEntry(env, id) {
   const entry = await first(env, "SELECT p.*, e.full_name, e.employee_code FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id WHERE p.id=?", [id]);
   if (!entry) return null;
   entry.trips = await all(env, `SELECT pt.*, t.trip_date, t.trip_ticket_no, t.origin, t.destination, t.job_description, t.driver_pay_rate, t.helper_pay_rate, t.driver_additional_pay, t.helper_additional_pay, a.asset_code, (SELECT COUNT(*) FROM trip_helpers th WHERE th.trip_id=t.id) AS helper_count FROM payroll_trips pt JOIN trips t ON t.id=pt.trip_id LEFT JOIN assets a ON a.id=t.asset_id WHERE pt.payroll_id=? ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [id]);
+  entry.project_entries = await all(env, `SELECT ppe.*, w.project_id, w.work_date, w.billing_unit, w.billing_quantity, w.job_description_snapshot, w.origin_snapshot, w.destination_snapshot, p.project_no, a.asset_code FROM payroll_project_entries ppe JOIN project_work_entries w ON w.id=ppe.work_entry_id JOIN projects p ON p.id=w.project_id LEFT JOIN assets a ON a.id=w.asset_id_snapshot WHERE ppe.payroll_id=? ORDER BY w.work_date,p.project_no,w.id`, [id]);
   entry.lines = await all(env, "SELECT * FROM payroll_additional_lines WHERE payroll_id=? ORDER BY sort_order, id", [id]);
   entry.remaining_vale = (await all(env, "SELECT balance FROM vale_records WHERE employee_id=? AND balance>0", [entry.employee_id])).reduce((sum, row) => sum + numeric(row.balance), 0);
   entry.remaining_cash = (await all(env, "SELECT balance FROM cash_advances WHERE employee_id=? AND balance>0", [entry.employee_id])).reduce((sum, row) => sum + numeric(row.balance), 0);
@@ -1869,16 +1953,19 @@ function payrollDetailContent(entry, user, print = false, settings = DEFAULT_SET
     ["Withholding Tax", entry.withholding_tax], ["Change Deduction", entry.change_deduction], ["Other Deduction", entry.other_deduction],
   ];
   const tripRows = (entry.trips || []).map((trip) => ({ ...trip, payroll_amount: payrollTripAmount(entry, trip) }));
+  const projectRows = (entry.project_entries || []).map((row) => ({ ...row, payroll_amount: numeric(row.base_amount) }));
   if (print) {
-    const rows = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td class="center">1</td><td class="num">${esc(money(row.payroll_amount))}</td><td>${esc(row.trip_ticket_no)}</td><td>${esc(row.origin || "")} to ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td><td class="num">${esc(money(row.payroll_amount))}</td></tr>`).join("") || `<tr><td colspan="7" class="center">No trip-level payroll detail captured for this entry.</td></tr>`;
+    const rows = [...tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td class="center">1</td><td class="num">${esc(money(row.payroll_amount))}</td><td>${esc(row.trip_ticket_no)}</td><td>${esc(row.origin || "")} to ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td><td class="num">${esc(money(row.payroll_amount))}</td></tr>`), ...projectRows.map((row) => `<tr><td>${esc(row.work_date)}</td><td class="center">${esc(row.pay_quantity)}</td><td class="num">${esc(money(row.pay_rate))}</td><td>${esc(row.project_no)}</td><td>${esc([row.origin_snapshot, row.destination_snapshot].filter(Boolean).join(" to ") || row.pay_basis)}</td><td>${esc(`${row.job_description_snapshot || ""} (${row.billing_quantity} ${row.billing_unit})`)}</td><td class="num">${esc(money(row.payroll_amount))}</td></tr>`)].join("") || `<tr><td colspan="7" class="center">No trip or project-work detail captured for this entry.</td></tr>`;
     return `<!doctype html><html><head><meta charset="utf-8"><title>Payroll #${esc(entry.id)}</title><style>@page{size:A5 landscape;margin:8mm}body{font:12px Arial,sans-serif;color:#111;margin:0}.sheet{padding:2mm 4mm 24mm}.print-button{margin-bottom:8px}.top{display:flex;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0 0 5px}.top h2{font-size:16px;margin:0;text-align:right}.company h1{font-size:18px;margin:0}.company-lines{margin:3px 0 6px;line-height:1.25}.meta{font-size:14px;margin:3px 0}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #222;padding:5px 6px;vertical-align:top}th{background:#f0f0f0}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.center{text-align:center}.summary{display:grid;grid-template-columns:1fr 1.1fr 1.05fr;gap:10px;align-items:start}.net{text-align:right;font-size:18px;font-weight:bold;margin-top:8px}.remarks-box{min-height:78px;white-space:pre-wrap}.remaining-balances{margin-top:8px}.signature{position:fixed;right:12mm;bottom:8mm;width:240px;border-top:1px solid #111;text-align:center;padding-top:6px;background:#fff}@media print{.print-button{display:none}}</style></head><body><div class="sheet"><button class="print-button" onclick="window.print()">Print</button><div class="top"><div><div class="company">${companyHeader(settings, "", { logo: false })}</div><h1>Payroll for ${esc(entry.period_from)} to ${esc(entry.period_to)}</h1><div class="meta"><strong>Payroll ID:</strong> ${esc(entry.id)}</div><div class="meta"><strong>Name of ${esc(entry.employee_type)}:</strong> ${esc(entry.full_name || "")}</div><div class="meta"><strong>Work:</strong> ${esc(entry.unit_description || "")}</div></div><h2>${esc(entry.pay_date)}</h2></div><table><thead><tr><th>Date</th><th>Trips</th><th>Rate</th><th>Trip Ticket / Waybill</th><th>Origin-Destination</th><th>Item / Job</th><th>Amount</th></tr></thead><tbody>${rows}<tr><td></td><td class="center"><strong>${esc(entry.trips_count)}</strong></td><td colspan="4" class="num"><strong>Gross Pay</strong></td><td class="num"><strong>${esc(peso(entry.gross_pay))}</strong></td></tr></tbody></table><div class="summary"><table><tr><th colspan="2">Payroll Summary</th></tr><tr><td>Days Count</td><td>${esc(entry.days_count)}</td></tr><tr><td>Additional Pay</td><td class="num">${esc(peso(entry.additional_pay))}</td></tr></table><div><table><tr><th>Remarks</th></tr><tr><td class="remarks-box">${esc(entry.remarks || "")}</td></tr></table><table class="remaining-balances"><tr><td>Remaining Vale</td><td class="num">${esc(peso(entry.remaining_vale))}</td></tr><tr><td>Remaining Cash Advance</td><td class="num">${esc(peso(entry.remaining_cash))}</td></tr></table></div><div><table><tr><th colspan="2">Deductions</th></tr>${deductions.map(([label, amount]) => `<tr><td>${esc(label)}</td><td class="num">${numeric(amount) ? esc(peso(amount)) : ""}</td></tr>`).join("")}</table><div class="net">Net Pay: ${esc(peso(entry.net_pay))}</div></div></div><div class="signature">Received by: / Employee Signature</div></div></body></html>`;
   }
   const tripBody = tripRows.map((row) => `<tr><td>${esc(row.trip_date)}</td><td><a href="/trips/${row.trip_id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.origin || "")} → ${esc(row.destination || "")}</td><td>${esc(row.job_description || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
+  const projectBody = projectRows.map((row) => `<tr><td>${esc(row.work_date)}</td><td><a href="/projects/${row.project_id}">${esc(row.project_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(`${row.pay_basis} · ${row.pay_quantity}`)}</td><td>${esc(`${row.job_description_snapshot || ""} (${row.billing_quantity} ${row.billing_unit})`)}</td>${moneyCell(row.payroll_amount)}</tr>`);
   const lines = (entry.lines || []).map((line) => `<div class="detail-pay-row"><span>${esc(line.label)} <small>${esc(line.employee_type)}</small></span><strong>${esc(peso(line.amount))}</strong></div>`).join("") || `<p class="muted">No additional lines.</p>`;
   const main = `<section class="panel detail-hero"><div><span class="dialog-kicker">Payroll #${esc(entry.id)}</span><h3>${esc(entry.full_name || "")}</h3><p>${esc(entry.period_from)} – ${esc(entry.period_to)} · ${esc(entry.employee_type)} / ${esc(entry.payroll_basis)}</p></div><strong>${esc(peso(entry.net_pay))}</strong></section><div class="detail-grid"><section class="panel"><h3>Payroll Summary</h3><dl class="detail-list"><dt>Pay Date</dt><dd>${esc(entry.pay_date)}</dd><dt>Work</dt><dd>${esc(entry.unit_description)}</dd><dt>Trips</dt><dd>${esc(entry.trips_count)}</dd><dt>Gross</dt><dd>${esc(peso(entry.gross_pay))}</dd><dt>Additional</dt><dd>${esc(peso(entry.additional_pay))}</dd><dt>Deductions</dt><dd>${esc(peso(deductionTotal(entry)))}</dd><dt class="detail-total">Net Pay</dt><dd class="detail-total">${esc(peso(entry.net_pay))}</dd></dl></section><section class="panel"><h3>Deductions</h3><dl class="detail-list">${deductions.map(([label, amount]) => `<dt>${esc(label)}</dt><dd>${esc(peso(amount))}</dd>`).join("")}</dl></section><section class="panel"><h3>Remarks</h3><p>${esc(entry.remarks || "")}</p><dl class="detail-list"><dt>Remaining Vale</dt><dd>${esc(peso(entry.remaining_vale))}</dd><dt>Remaining Cash Advance</dt><dd>${esc(peso(entry.remaining_cash))}</dd></dl></section><section class="panel"><h3>Additional Lines</h3>${lines}</section></div><section class="panel"><h3>Claimed Trips</h3></section>${table(["Date", "Trip Ticket / Waybill", "Unit", "Route", "Item / Job", "Amount"], tripBody, { empty: "No trip-level payroll detail captured for this entry." })}`;
   const actions = `<div class="detail-toolbar"><a class="button secondary" href="/payroll">← Payroll List</a><div><a class="button secondary" href="/payroll/${entry.id}/print" target="_blank">Printable Payroll</a></div></div>`;
-  const deleteForm = canEdit(user, "Payroll") ? `<section class="detail-danger"><form method="post" action="/payroll/${entry.id}/delete" onsubmit="return confirm('Delete this payroll? Claimed trips will be released and advance deductions restored.');"><button class="danger-button">Delete and Reverse Payroll</button></form></section>` : "";
-  return `${actions}${main}${deleteForm}`;
+  const projectSection = `<section class="panel"><h3>Claimed Project Work</h3></section>${table(["Date", "Project No.", "Unit", "Pay Basis / Quantity", "Item / Job", "Amount"], projectBody, { empty: "No project-work claims in this payroll." })}`;
+  const deleteForm = canEdit(user, "Payroll") ? `<section class="detail-danger"><form method="post" action="/payroll/${entry.id}/delete" onsubmit="return confirm('Delete this payroll? Claimed trips and project work will be released and advance deductions restored.');"><button class="danger-button">Delete and Reverse Payroll</button></form></section>` : "";
+  return `${actions}${main}${projectSection}${deleteForm}`;
 }
 
 async function payrollDetailPage(request, env, user, path, id, print = false) {
@@ -1965,9 +2052,14 @@ async function billingEligibleTrips(env, clientId, periodFrom, periodTo) {
   return await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id WHERE t.client_id=? AND t.trip_date BETWEEN ? AND ? AND t.status IN ('Completed','Billed','Paid') AND NOT EXISTS (SELECT 1 FROM billing_lines bl WHERE bl.trip_id=t.id) ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [clientId, periodFrom, periodTo]);
 }
 
-function billingTotals(trips, values) {
-  const base = trips.reduce((sum, trip) => sum + numeric(trip.base_trip_rate), 0);
-  const extra = trips.reduce((sum, trip) => sum + tripExtraTotal(trip), 0);
+async function billingEligibleProjectWork(env, clientId, periodFrom, periodTo) {
+  if (!clientId || !periodFrom || !periodTo) return [];
+  return await all(env, `SELECT w.*,p.project_no,a.asset_code FROM project_work_entries w JOIN projects p ON p.id=w.project_id LEFT JOIN assets a ON a.id=w.asset_id_snapshot WHERE w.client_id_snapshot=? AND w.work_date BETWEEN ? AND ? AND w.status IN ('Completed','Billed') AND NOT EXISTS (SELECT 1 FROM billing_project_lines bpl WHERE bpl.work_entry_id=w.id) ORDER BY w.work_date,p.project_no,w.id`, [clientId, periodFrom, periodTo]);
+}
+
+function billingTotals(trips, values, projectEntries = []) {
+  const base = trips.reduce((sum, trip) => sum + numeric(trip.base_trip_rate), 0) + projectEntries.reduce((sum, entry) => sum + numeric(entry.base_charge), 0);
+  const extra = trips.reduce((sum, trip) => sum + tripExtraTotal(trip), 0) + projectEntries.reduce((sum, entry) => sum + numeric(entry.extra_total), 0);
   const gross = base + extra;
   const vat = applyVat(gross, values.vat_enabled);
   const additions = numeric(values.addition_amount);
@@ -1997,10 +2089,11 @@ function billingCleaned(data) {
     deduction_amount: numericText(data.deduction_amount),
     notes: (data.notes || "").trim(),
     expected_trip_ids: parseExpectedIds(data.expected_trip_ids),
+    expected_project_entry_ids: parseExpectedIds(data.expected_project_entry_ids),
   };
 }
 
-function validateBilling(cleaned, trips, totals) {
+function validateBilling(cleaned, trips, projectEntries, totals) {
   const errors = [];
   if (!cleaned.client_id) errors.push("Client is required.");
   if (!cleaned.billing_date) errors.push("Billing date is required.");
@@ -2009,9 +2102,11 @@ function validateBilling(cleaned, trips, totals) {
   if (numeric(cleaned.addition_amount) < 0) errors.push("addition amount cannot be negative.");
   if (numeric(cleaned.deduction_amount) < 0) errors.push("deduction amount cannot be negative.");
   if (totals && totals.grand_total < 0) errors.push("Grand total cannot be negative.");
-  if (!trips?.length) errors.push("At least one eligible trip is required.");
+  if (!(trips?.length || projectEntries?.length)) errors.push("At least one eligible trip or completed project work entry is required.");
   const freshIds = (trips || []).map((trip) => Number(trip.id));
   if (JSON.stringify(freshIds) !== JSON.stringify(cleaned.expected_trip_ids)) errors.push("Billing eligibility changed. Preview the period again before saving.");
+  const freshProjectIds = (projectEntries || []).map((entry) => Number(entry.id));
+  if (JSON.stringify(freshProjectIds) !== JSON.stringify(cleaned.expected_project_entry_ids)) errors.push("Project work billing eligibility changed. Preview the period again before saving.");
   return errors;
 }
 
@@ -2020,16 +2115,21 @@ function billingTripRows(trips) {
   return table(["Date", "Trip Ticket / Waybill", "Item / Job", "Route", "Unit", "Base", "Extras", "Total"], rows, { empty: "No eligible unbilled trips for this client and period." });
 }
 
-function billingFormContent(clients, selection, trips, values = {}, errors = []) {
+function billingProjectRows(entries) {
+  const rows = entries.map((entry) => `<tr><td>${esc(entry.work_date)}</td><td><a href="/projects/${entry.project_id}">${esc(entry.project_no)}</a><small class="cell-detail">Ref. No.: ${esc(entry.reference_no || "—")}</small></td><td>${esc(entry.job_description_snapshot || "")}</td><td>${esc(`${entry.billing_quantity} ${entry.billing_unit}`)}</td><td>${esc(entry.asset_code || "")}</td>${moneyCell(entry.client_unit_rate)}${moneyCell(entry.base_charge)}${moneyCell(entry.extra_total)}${moneyCell(entry.total_charge)}</tr>`);
+  return table(["Work Date", "Project No.", "Item / Job", "Quantity", "Unit", "Rate", "Base", "Extras", "Total"], rows, { empty: "No eligible completed project work for this client and period." });
+}
+
+function billingFormContent(clients, selection, trips, projectEntries = [], values = {}, errors = []) {
   const clientId = selection.client || values.client || values.client_id || "";
   const periodFrom = selection.period_from || values.period_from || `${todayISO().slice(0, 8)}01`;
   const periodTo = selection.period_to || values.period_to || todayISO();
   const cleaned = billingCleaned({ client: clientId, period_from: periodFrom, period_to: periodTo, ...values });
-  const totals = billingTotals(trips || [], cleaned);
+  const totals = billingTotals(trips || [], cleaned, projectEntries || []);
   const selector = `<section class="panel"><h3>1. Select Client & Period</h3><form method="get" class="selector-row">${selectInput("client", "Client", clients, clientId, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required" })}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Billing</button></form></section>`;
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   if (!clientId) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select a client and billing period to preview eligible trips.</p></section>`;
-  const hidden = `<input type="hidden" name="client" value="${esc(clientId)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify((trips || []).map((trip) => trip.id)))}">`;
+  const hidden = `<input type="hidden" name="client" value="${esc(clientId)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify((trips || []).map((trip) => trip.id)))}"><input type="hidden" name="expected_project_entry_ids" value="${esc(JSON.stringify((projectEntries || []).map((entry) => entry.id)))}">`;
   const fields = [
     textInput("billing_date", "Billing date", values.billing_date || todayISO(), 'type="date" required'),
     `<label>VAT<input type="checkbox" name="vat_enabled" value="1"${cleaned.vat_enabled ? " checked" : ""}> Add 12% VAT</label>`,
@@ -2039,8 +2139,8 @@ function billingFormContent(clients, selection, trips, values = {}, errors = [])
     numberInput("deduction_amount", "Deduction amount", values.deduction_amount ?? 0),
     textareaInput("notes", "Notes", values.notes || "", 'rows="3"'),
   ];
-  const summary = `<section class="panel">${cards([["Eligible Trips", String((trips || []).length)], ["Gross", peso(totals.gross_total)], ["VAT", peso(totals.vat_amount)], ["Grand Total", peso(totals.grand_total)]])}</section>`;
-  return `${errorBox}${selector}${summary}<form method="post" action="/billing/new" class="panel">${hidden}<div class="grid">${fields.join("")}</div><p><button>Save Billing</button> <a class="button secondary" href="/billing">Cancel</a></p></form><section class="panel"><h3>Eligible Trips</h3></section>${billingTripRows(trips || [])}`;
+  const summary = `<section class="panel">${cards([["Eligible Trips", String((trips || []).length)], ["Project Work", String((projectEntries || []).length)], ["Gross", peso(totals.gross_total)], ["VAT", peso(totals.vat_amount)], ["Grand Total", peso(totals.grand_total)]])}</section>`;
+  return `${errorBox}${selector}${summary}<form method="post" action="/billing/new" class="panel">${hidden}<div class="grid">${fields.join("")}</div><p><button>Save Billing</button> <a class="button secondary" href="/billing">Cancel</a></p></form><section class="panel"><h3>Eligible Trips</h3></section>${billingTripRows(trips || [])}<section class="panel"><h3>Eligible Project Work</h3></section>${billingProjectRows(projectEntries || [])}`;
 }
 
 async function createdBillingId(env, billingNo) {
@@ -2048,8 +2148,8 @@ async function createdBillingId(env, billingNo) {
   return row?.id;
 }
 
-async function saveBilling(env, cleaned, trips) {
-  const totals = billingTotals(trips, cleaned);
+async function saveBilling(env, cleaned, trips, projectEntries = []) {
+  const totals = billingTotals(trips, cleaned, projectEntries);
   const last = await first(env, "SELECT billing_no FROM billing_statements WHERE billing_no LIKE ? ORDER BY billing_no DESC LIMIT 1", [`BILL-${String(cleaned.billing_date).slice(0, 4)}-%`]);
   const billingNo = nextBillingNoFrom(last, cleaned.billing_date);
   await run(env, "INSERT INTO billing_statements (billing_no, client_id, billing_date, period_from, period_to, base_charges_total, extra_charges_total, gross_total, vat_enabled, vat_amount, additions_total, deductions_total, grand_total, status, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
@@ -2062,6 +2162,10 @@ async function saveBilling(env, cleaned, trips) {
     await run(env, "INSERT INTO billing_lines (billing_id, trip_id, amount_base, amount_extra, amount_total) VALUES (?,?,?,?,?)", [billingId, trip.id, String(numeric(trip.base_trip_rate)), String(tripExtraTotal(trip)), String(tripBillableTotal(trip))]);
     await run(env, "UPDATE trips SET status='Billed' WHERE id=?", [trip.id]);
   }
+  for (const entry of projectEntries) {
+    await run(env, "INSERT INTO billing_project_lines (billing_id,work_entry_id,amount_base,amount_extra,amount_total) VALUES (?,?,?,?,?)", [billingId, entry.id, String(numeric(entry.base_charge)), String(numeric(entry.extra_total)), String(numeric(entry.total_charge))]);
+    await run(env, "UPDATE project_work_entries SET status='Billed' WHERE id=?", [entry.id]);
+  }
   if (numeric(cleaned.addition_amount)) await run(env, "INSERT INTO billing_adjustments (billing_id, line_type, label, amount, sort_order) VALUES (?,?,?,?,?)", [billingId, "Addition", cleaned.addition_label || "Addition", cleaned.addition_amount, 1]);
   if (numeric(cleaned.deduction_amount)) await run(env, "INSERT INTO billing_adjustments (billing_id, line_type, label, amount, sort_order) VALUES (?,?,?,?,?)", [billingId, "Deduction", cleaned.deduction_label || "Deduction", cleaned.deduction_amount, 2]);
   return billingId;
@@ -2071,6 +2175,7 @@ async function loadBillingEntry(env, id) {
   const entry = await first(env, "SELECT b.*, c.client_name, c.client_code, c.billing_address, c.contact_person FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id WHERE b.id=?", [id]);
   if (!entry) return null;
   entry.lines = await all(env, `SELECT bl.*, t.trip_date, t.trip_ticket_no, t.reference_no, t.job_description, t.origin, t.destination, a.asset_code FROM billing_lines bl JOIN trips t ON t.id=bl.trip_id LEFT JOIN assets a ON a.id=t.asset_id WHERE bl.billing_id=? ORDER BY t.trip_date, t.trip_ticket_no, t.id`, [id]);
+  entry.project_lines = await all(env, `SELECT bpl.*,w.project_id,w.work_date,w.reference_no,w.billing_unit,w.billing_quantity,w.client_unit_rate,w.job_description_snapshot,w.origin_snapshot,w.destination_snapshot,p.project_no,a.asset_code FROM billing_project_lines bpl JOIN project_work_entries w ON w.id=bpl.work_entry_id JOIN projects p ON p.id=w.project_id LEFT JOIN assets a ON a.id=w.asset_id_snapshot WHERE bpl.billing_id=? ORDER BY w.work_date,p.project_no,w.id`, [id]);
   entry.adjustments = await all(env, "SELECT * FROM billing_adjustments WHERE billing_id=? ORDER BY sort_order, id", [id]);
   entry.collections = await all(env, "SELECT * FROM collections WHERE billing_id=? ORDER BY collection_date, id", [id]);
   entry.paid_amount = entry.collections.reduce((sum, row) => sum + numeric(row.amount_paid), 0);
@@ -2081,6 +2186,7 @@ async function loadBillingEntry(env, id) {
 
 function billingDetailContent(entry, user, print = false) {
   const lineRows = (entry.lines || []).map((line) => `<tr><td>${esc(line.trip_date)}</td><td>${esc(line.trip_ticket_no)}<small class="cell-detail">Ref. No.: ${esc(line.reference_no || "—")}</small></td><td>${esc(line.job_description || "")}</td><td>${esc(line.origin || "")} → ${esc(line.destination || "")}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`);
+  const projectLineRows = (entry.project_lines || []).map((line) => `<tr><td>${esc(line.work_date)}</td><td><a href="/projects/${line.project_id}">${esc(line.project_no)}</a><small class="cell-detail">Ref. No.: ${esc(line.reference_no || "—")}</small></td><td>${esc(line.job_description_snapshot || "")}</td><td>${esc(`${line.billing_quantity} ${line.billing_unit}`)}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`);
   const adjustmentRows = (entry.adjustments || []).map((row) => `<tr><td>${esc(row.line_type)}</td><td>${esc(row.label)}</td><td class="num">${esc(peso(row.amount))}</td></tr>`);
   const collectionRows = (entry.collections || []).map((row) => `<tr><td>${esc(row.collection_date)}</td><td>${esc(row.reference_no || "")}</td><td>${esc(row.payment_method || "")}</td><td class="num">${esc(peso(row.amount_paid))}</td></tr>`);
   if (print) {
@@ -2089,22 +2195,27 @@ function billingDetailContent(entry, user, print = false) {
   const actions = `<div class="detail-toolbar"><a class="button secondary" href="/billing">← Billing List</a><div><a class="button secondary" href="/billing/${entry.id}/print" target="_blank">Print Billing</a></div></div>`;
   const hero = `<section class="panel detail-hero"><div><span class="dialog-kicker">Billing Statement</span><h3>${esc(entry.billing_no)}</h3><p>${esc(entry.client_name || "")} · ${esc(entry.billing_date)} · ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><strong>${esc(peso(entry.balance))}</strong></section>`;
   const summary = `<section class="panel">${cards([["Gross", peso(entry.gross_total)], ["VAT", peso(entry.vat_amount)], ["Grand Total", peso(entry.grand_total)], ["Paid", peso(entry.paid_amount)], ["Balance", peso(entry.balance)], ["Status", entry.current_status]])}</section>`;
-  const deleteForm = canEdit(user, "Billing") ? `<section class="detail-danger"><form method="post" action="/billing/${entry.id}/delete" onsubmit="return confirm('Delete this billing statement? This is blocked when collections exist.');"><button class="danger-button">Delete Billing</button></form></section>` : "";
+  const projectSection = `<section class="panel"><h3>Project Work</h3></section>${table(["Work Date", "Project No.", "Item / Job", "Quantity", "Unit", "Base", "Extras", "Total"], projectLineRows, { empty: "No project-work billing lines." })}`;
+  const deleteForm = `${projectSection}${canEdit(user, "Billing") ? `<section class="detail-danger"><form method="post" action="/billing/${entry.id}/delete" onsubmit="return confirm('Delete this billing statement? This is blocked when collections exist.');"><button class="danger-button">Delete Billing</button></form></section>` : ""}`;
   return `${actions}${hero}${summary}<section class="panel"><h3>Trips</h3></section>${table(["Date", "Trip Ticket / Waybill", "Item / Job", "Route", "Unit", "Base", "Extras", "Total"], lineRows, { empty: "No billing lines." })}<section class="panel"><h3>Adjustments</h3></section>${table(["Type", "Label", "Amount"], adjustmentRows, { empty: "No adjustments." })}<section class="panel"><h3>Collections</h3></section>${table(["Date", "Reference", "Method", "Amount"], collectionRows, { empty: "No collections recorded." })}${entry.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(entry.notes)}</p></section>` : ""}${deleteForm}`;
 }
 
 function billingPrintable(entry, settings) {
   const lineRows = (entry.lines || []).map((line) => `<tr><td>${esc(line.trip_date)}</td><td>${esc(line.trip_ticket_no)}<br><small>Ref. No.: ${esc(line.reference_no || "—")}</small></td><td>${esc(line.job_description || "")}</td><td>${esc(line.origin || "")} → ${esc(line.destination || "")}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`).join("") || `<tr><td colspan="8">No billing lines.</td></tr>`;
   const adjustmentRows = (entry.adjustments || []).map((row) => `<tr><td>${esc(row.line_type)}</td><td>${esc(row.label)}</td><td class="num">${esc(peso(row.amount))}</td></tr>`).join("");
-  const footer = settings.billing_footer_note ? `<p class="footer-note">${esc(settings.billing_footer_note)}</p>` : "";
+  const printableProjectRows = (entry.project_lines || []).map((line) => `<tr><td>${esc(line.work_date)}</td><td>${esc(line.project_no)}</td><td>${esc(line.reference_no || "—")}</td><td>${esc(line.job_description_snapshot || "")}</td><td>${esc(`${line.billing_quantity} ${line.billing_unit}`)}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`).join("");
+  const printableProjectTable = printableProjectRows ? `<h3>Equipment Project Work</h3><table><thead><tr><th>Work Date</th><th>Project No.</th><th>Ref. No.</th><th>Item / Job</th><th>Quantity</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${printableProjectRows}</tbody></table>` : "";
+  const footer = `${printableProjectTable}${settings.billing_footer_note ? `<p class="footer-note">${esc(settings.billing_footer_note)}</p>` : ""}`;
   return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(entry.billing_no)} · Billing</title><style>@page{size:A4 portrait;margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111}.top{display:flex;justify-content:space-between;gap:24px}h1,h2{margin:0 0 6px}.company-lines{margin:4px 0 0;line-height:1.35}.muted{color:#555}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:320px}.footer-note{margin-top:18px;white-space:pre-wrap}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:60px;margin-top:48px}.sig{border-top:1px solid #111;text-align:center;padding-top:6px}.print-button{margin-bottom:10px}@media print{.print-button{display:none}}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="top"><div>${companyHeader(settings, "Billing Statement")}<p><strong>Client:</strong> ${esc(entry.client_name || "")}<br><strong>Address:</strong> ${esc(entry.billing_address || "")}<br><strong>Period:</strong> ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><div><h2>${esc(entry.billing_no)}</h2><p><strong>Date:</strong> ${esc(entry.billing_date)}<br><strong>Status:</strong> ${esc(entry.current_status)}</p></div></div><table><thead><tr><th>Date</th><th>Trip Ticket / Waybill</th><th>Item / Job</th><th>Route</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${lineRows}</tbody></table>${adjustmentRows ? `<table><thead><tr><th>Type</th><th>Adjustment</th><th>Amount</th></tr></thead><tbody>${adjustmentRows}</tbody></table>` : ""}<table class="totals"><tr><td>Gross</td><td class="num">${esc(peso(entry.gross_total))}</td></tr><tr><td>VAT</td><td class="num">${esc(peso(entry.vat_amount))}</td></tr><tr><td>Additions</td><td class="num">${esc(peso(entry.additions_total))}</td></tr><tr><td>Deductions</td><td class="num">${esc(peso(entry.deductions_total))}</td></tr><tr><th>Grand Total</th><th class="num">${esc(peso(entry.grand_total))}</th></tr><tr><td>Payments</td><td class="num">${esc(peso(entry.paid_amount))}</td></tr><tr><th>Balance</th><th class="num">${esc(peso(entry.balance))}</th></tr></table>${footer}<div class="signatures"><div class="sig">${signatureLabel(settings.prepared_by_default, "Prepared by")}</div><div class="sig">Received by / Conforme</div></div></body></html>`;
 }
 
 function billingPrintableDocument(entry, settings) {
   const lineRows = (entry.lines || []).map((line) => `<tr><td>${esc(line.trip_date)}</td><td>${esc(line.trip_ticket_no)}</td><td>${esc(line.reference_no || "—")}</td><td>${esc(line.job_description || "")}</td><td>${esc(line.origin || "")} → ${esc(line.destination || "")}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`).join("") || `<tr><td colspan="9">No billing lines.</td></tr>`;
   const adjustmentRows = (entry.adjustments || []).map((row) => `<tr><td>${esc(row.line_type)}</td><td>${esc(row.label)}</td><td class="num">${esc(peso(row.amount))}</td></tr>`).join("");
+  const printableProjectRows = (entry.project_lines || []).map((line) => `<tr><td>${esc(line.work_date)}</td><td>${esc(line.project_no)}</td><td>${esc(line.reference_no || "—")}</td><td>${esc(line.job_description_snapshot || "")}</td><td>${esc(`${line.billing_quantity} ${line.billing_unit}`)}</td><td>${esc(line.asset_code || "")}</td><td class="num">${esc(peso(line.amount_base))}</td><td class="num">${esc(peso(line.amount_extra))}</td><td class="num">${esc(peso(line.amount_total))}</td></tr>`).join("");
+  const printableProjectTable = printableProjectRows ? `<h3>Equipment Project Work</h3><table><thead><tr><th>Work Date</th><th>Project No.</th><th>Ref. No.</th><th>Item / Job</th><th>Quantity</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${printableProjectRows}</tbody></table>` : "";
   const footer = settings.billing_footer_note ? `<p class="footer-note">${esc(settings.billing_footer_note)}</p>` : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(entry.billing_no)} · Billing</title><style>${customerPrintStyles("A4 portrait")}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="document-sheet"><div class="document-header"><div>${companyHeader(settings, "Billing Statement")}<p><strong>Client:</strong> ${esc(entry.client_name || "")}<br><strong>Address:</strong> ${esc(entry.billing_address || "")}<br><strong>Period:</strong> ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><div class="document-meta"><h2>${esc(entry.billing_no)}</h2><p><strong>Date:</strong> ${esc(entry.billing_date)}<br><strong>Status:</strong> ${esc(entry.current_status)}</p></div></div><table><thead><tr><th>Date</th><th>Trip Ticket / Waybill</th><th>Ref. No.</th><th>Item / Job</th><th>Route</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${lineRows}</tbody></table>${adjustmentRows ? `<table><thead><tr><th>Type</th><th>Adjustment</th><th>Amount</th></tr></thead><tbody>${adjustmentRows}</tbody></table>` : ""}<table class="totals"><tr><td>Gross</td><td class="num">${esc(peso(entry.gross_total))}</td></tr><tr><td>VAT</td><td class="num">${esc(peso(entry.vat_amount))}</td></tr><tr><td>Additions</td><td class="num">${esc(peso(entry.additions_total))}</td></tr><tr><td>Deductions</td><td class="num">${esc(peso(entry.deductions_total))}</td></tr><tr><th>Grand Total</th><th class="num">${esc(peso(entry.grand_total))}</th></tr><tr><td>Payments</td><td class="num">${esc(peso(entry.paid_amount))}</td></tr><tr><th>Balance</th><th class="num">${esc(peso(entry.balance))}</th></tr></table>${footer}<div class="signatures two"><div>${signatureLabel(settings.prepared_by_default, "Prepared by")}</div><div>Received by / Conforme</div></div></div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(entry.billing_no)} · Billing</title><style>${customerPrintStyles("A4 portrait")}</style></head><body><button class="print-button" onclick="window.print()">Print</button><div class="document-sheet"><div class="document-header"><div>${companyHeader(settings, "Billing Statement")}<p><strong>Client:</strong> ${esc(entry.client_name || "")}<br><strong>Address:</strong> ${esc(entry.billing_address || "")}<br><strong>Period:</strong> ${esc(entry.period_from || "")} to ${esc(entry.period_to || "")}</p></div><div class="document-meta"><h2>${esc(entry.billing_no)}</h2><p><strong>Date:</strong> ${esc(entry.billing_date)}<br><strong>Status:</strong> ${esc(entry.current_status)}</p></div></div><table><thead><tr><th>Date</th><th>Trip Ticket / Waybill</th><th>Ref. No.</th><th>Item / Job</th><th>Route</th><th>Unit</th><th>Base</th><th>Extras</th><th>Total</th></tr></thead><tbody>${lineRows}</tbody></table>${printableProjectTable}${adjustmentRows ? `<table><thead><tr><th>Type</th><th>Adjustment</th><th>Amount</th></tr></thead><tbody>${adjustmentRows}</tbody></table>` : ""}<table class="totals"><tr><td>Gross</td><td class="num">${esc(peso(entry.gross_total))}</td></tr><tr><td>VAT</td><td class="num">${esc(peso(entry.vat_amount))}</td></tr><tr><td>Additions</td><td class="num">${esc(peso(entry.additions_total))}</td></tr><tr><td>Deductions</td><td class="num">${esc(peso(entry.deductions_total))}</td></tr><tr><th>Grand Total</th><th class="num">${esc(peso(entry.grand_total))}</th></tr><tr><td>Payments</td><td class="num">${esc(peso(entry.paid_amount))}</td></tr><tr><th>Balance</th><th class="num">${esc(peso(entry.balance))}</th></tr></table>${footer}<div class="signatures two"><div>${signatureLabel(settings.prepared_by_default, "Prepared by")}</div><div>Received by / Conforme</div></div></div></body></html>`;
 }
 
 async function billingListPage(request, env, user, path) {
@@ -2137,16 +2248,17 @@ async function billingNewPage(request, env, user, path) {
   const source = request.method === "POST" ? await parseForm(request) : Object.fromEntries(new URL(request.url).searchParams.entries());
   const selection = { client: source.client || "", period_from: source.period_from || `${todayISO().slice(0, 8)}01`, period_to: source.period_to || todayISO() };
   const trips = selection.client ? await billingEligibleTrips(env, selection.client, selection.period_from, selection.period_to) : [];
+  const projectEntries = selection.client ? await billingEligibleProjectWork(env, selection.client, selection.period_from, selection.period_to) : [];
   const initialValues = request.method === "POST" ? source : { vat_enabled: settings.default_vat_enabled === "1" ? "1" : "" };
   if (request.method === "POST") {
     const cleaned = billingCleaned(source);
-    const totals = billingTotals(trips, cleaned);
-    const errors = validateBilling(cleaned, trips, totals);
-    if (errors.length) return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips, source, errors) }), 400);
-    const id = await saveBilling(env, cleaned, trips);
-    return redirect(`/billing/${id}?ok=${encodeURIComponent("Billing statement saved and trips marked as billed.")}`);
+    const totals = billingTotals(trips, cleaned, projectEntries);
+    const errors = validateBilling(cleaned, trips, projectEntries, totals);
+    if (errors.length) return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips, projectEntries, source, errors) }), 400);
+    const id = await saveBilling(env, cleaned, trips, projectEntries);
+    return redirect(`/billing/${id}?ok=${encodeURIComponent("Billing statement saved; trips and project work were marked billed.")}`);
   }
-  return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips, initialValues) }));
+  return html(layout({ title: "New Billing", user, path, content: billingFormContent(clients, selection, trips, projectEntries, initialValues) }));
 }
 
 async function billingDetailPage(request, env, user, path, id, print = false) {
@@ -2166,8 +2278,10 @@ async function billingDeletePage(request, env, user, path, id) {
   if (Number(collections?.total || 0)) return redirect(`/billing/${id}?error=${encodeURIComponent("Billing has collections and cannot be deleted.")}`);
   const lines = await all(env, "SELECT trip_id FROM billing_lines WHERE billing_id=?", [id]);
   for (const line of lines) await run(env, "UPDATE trips SET status='Completed' WHERE id=?", [line.trip_id]);
+  const projectLines = await all(env, "SELECT work_entry_id FROM billing_project_lines WHERE billing_id=?", [id]);
+  for (const line of projectLines) await run(env, "UPDATE project_work_entries SET status='Completed' WHERE id=?", [line.work_entry_id]);
   await run(env, "DELETE FROM billing_statements WHERE id=?", [id]);
-  return redirect(`/billing?ok=${encodeURIComponent("Billing deleted and trips restored to Completed.")}`);
+  return redirect(`/billing?ok=${encodeURIComponent("Billing deleted; trips and project work were restored to Completed.")}`);
 }
 
 async function billingExportPage(request, env, user, path) {
@@ -2427,11 +2541,12 @@ const REPORTS = [
   ["cash_advance_balance", "Cash Advance Balance Report", "Cash advances and their remaining payroll balances."],
   ["payroll_summary", "Payroll Summary", "Saved employee payroll totals."],
   ["repair_summary", "Repair / Maintenance Summary", "Repair and maintenance costs by unit."],
+  ["equipment_project_work_summary", "Equipment Project Work Summary", "Completed and billed equipment-project work by date, unit, quantity, and charge."],
   ["fleet_utilization", "Fleet Utilization", "Trip volume and charges grouped by fleet unit."],
 ];
 const REPORT_LABELS = Object.fromEntries(REPORTS.map(([slug, label]) => [slug, label]));
 const REPORT_DESCRIPTIONS = Object.fromEntries(REPORTS.map(([slug, , description]) => [slug, description]));
-const REPORT_STATUSES = ["Planned", "Ongoing", "Completed", "Cancelled", "Billed", "Paid", "Open", "Partially Paid", "Closed", "Settled", "Partial"];
+const REPORT_STATUSES = ["Draft", "Active", "Planned", "Ongoing", "Completed", "Cancelled", "Billed", "Paid", "Open", "Partially Paid", "Closed", "Settled", "Partial"];
 
 function reportFilters(url) {
   return {
@@ -2567,13 +2682,23 @@ async function buildReport(env, filters) {
     return reportResult(slug, [["Date", "date"], ["Asset", "text"], ["Description", "text"], ["Total Cost", "money"], ["Status", "text"]], rows.map((row) => [row.repair_date, row.asset_code || "", row.repair_description, row.total_cost, row.status]));
   }
 
+  if (slug === "equipment_project_work_summary") {
+    const rows = (await all(env, "SELECT w.*,p.project_no,c.client_name,a.asset_code FROM project_work_entries w JOIN projects p ON p.id=w.project_id LEFT JOIN clients c ON c.id=w.client_id_snapshot LEFT JOIN assets a ON a.id=w.asset_id_snapshot ORDER BY w.work_date DESC,w.id"))
+      .filter((row) => matchDate(row, "work_date", filters))
+      .filter((row) => matchText(row, filters.q, ["project_no", "reference_no", "client_name", "asset_code", "job_description_snapshot", "project_location_snapshot"]))
+      .filter((row) => !filters.status || row.status === filters.status);
+    return reportResult(slug, [["Project No.", "text"], ["Work Date", "date"], ["Client", "text"], ["Asset", "text"], ["Unit", "text"], ["Quantity", "number"], ["Base", "money"], ["Extras", "money"], ["Total", "money"], ["Status", "text"]], rows.map((row) => [row.project_no, row.work_date, row.client_name || "", row.asset_code || "", row.billing_unit, row.billing_quantity, row.base_charge, row.extra_total, row.total_charge, row.status]));
+  }
+
   const trips = (await all(env, "SELECT * FROM trips")).filter((row) => matchDate(row, "trip_date", filters)).filter((row) => !filters.status || row.status === filters.status);
+  const projectWork = (await all(env, "SELECT * FROM project_work_entries")).filter((row) => matchDate(row, "work_date", filters)).filter((row) => !filters.status || row.status === filters.status);
   const assets = (await all(env, "SELECT * FROM assets ORDER BY asset_code, id")).filter((row) => matchText(row, filters.q, ["asset_code", "asset_type", "plate_no", "make_model"]));
   const rows = assets.map((asset) => {
     const assetTrips = trips.filter((trip) => Number(trip.asset_id) === Number(asset.id));
-    return [asset.asset_code, asset.asset_type, assetTrips.length, assetTrips.reduce((sum, trip) => sum + numeric(trip.base_trip_rate), 0), assetTrips.reduce((sum, trip) => sum + tripExtraTotal(trip), 0)];
+    const assetProjectWork = projectWork.filter((work) => Number(work.asset_id_snapshot) === Number(asset.id));
+    return [asset.asset_code, asset.asset_type, assetTrips.length, assetProjectWork.length, assetTrips.reduce((sum, trip) => sum + numeric(trip.base_trip_rate), 0) + assetProjectWork.reduce((sum, work) => sum + numeric(work.base_charge), 0), assetTrips.reduce((sum, trip) => sum + tripExtraTotal(trip), 0) + assetProjectWork.reduce((sum, work) => sum + numeric(work.extra_total), 0)];
   });
-  return reportResult(slug, [["Asset", "text"], ["Type", "text"], ["Trips", "number"], ["Base Charges", "money"], ["Extra Charges", "money"]], rows);
+  return reportResult(slug, [["Asset", "text"], ["Type", "text"], ["Trips", "number"], ["Project Entries", "number"], ["Base Charges", "money"], ["Extra Charges", "money"]], rows);
 }
 
 function reportForm(filters) {
@@ -2661,6 +2786,14 @@ const DATA_EXPORT_TABLES = [
   { table: "trips", label: "Trips", order: "id", columns: ["id", "trip_ticket_no", "reference_no", "trip_type", "recurring_master_id", "trip_date", "client_id", "job_description", "origin", "destination", "asset_id", "driver_id", "dispatch_time", "arrival_time", "status", "base_trip_rate", "driver_pay_rate", "helper_pay_rate", "driver_additional_pay", "helper_additional_pay", "fuel_surcharge", "loading_fee", "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges", "notes"] },
   { table: "trip_helpers", label: "Trip Helpers", order: "id", columns: ["id", "trip_id", "employee_id", "helper_order"] },
   { table: "trip_employee_pay_items", label: "Trip Pay Items", order: "id", columns: ["id", "trip_id", "employee_type", "label", "amount", "sort_order"] },
+  { table: "projects", label: "Projects", order: "id", columns: ["id", "project_no", "reference_no", "start_date", "end_date", "client_id", "job_description", "origin", "destination", "project_location", "asset_id", "primary_employee_id", "billing_basis", "default_billing_quantity", "client_unit_rate", "primary_pay_basis", "primary_pay_rate", "helper_pay_basis", "helper_pay_rate", "fuel_surcharge", "loading_fee", "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges", "status", "notes", "created_at"] },
+  { table: "project_helpers", label: "Project Helpers", order: "id", columns: ["id", "project_id", "employee_id", "helper_order"] },
+  { table: "project_pay_item_defaults", label: "Project Pay Defaults", order: "id", columns: ["id", "project_id", "employee_type", "label", "amount", "sort_order"] },
+  { table: "project_work_entries", label: "Project Work Entries", order: "id", columns: ["id", "work_no", "project_id", "work_date", "reference_no", "billing_unit", "billing_quantity", "client_unit_rate", "base_charge", "primary_employee_id", "primary_pay_basis", "primary_pay_quantity", "primary_pay_rate", "primary_manual_pay", "helper_pay_basis", "helper_pay_quantity", "helper_pay_rate", "helper_manual_pay", "client_id_snapshot", "asset_id_snapshot", "job_description_snapshot", "origin_snapshot", "destination_snapshot", "project_location_snapshot", "start_time", "end_time", "meter_start", "meter_end", "fuel_surcharge", "loading_fee", "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges", "extra_total", "total_charge", "status", "notes", "created_at"] },
+  { table: "project_work_helpers", label: "Project Work Helpers", order: "id", columns: ["id", "work_entry_id", "employee_id", "helper_order"] },
+  { table: "project_work_pay_items", label: "Project Work Pay Items", order: "id", columns: ["id", "work_entry_id", "employee_type", "label", "amount", "sort_order"] },
+  { table: "billing_project_lines", label: "Billing Project Lines", order: "id", columns: ["id", "billing_id", "work_entry_id", "amount_base", "amount_extra", "amount_total"] },
+  { table: "payroll_project_entries", label: "Payroll Project Entries", order: "id", columns: ["id", "payroll_id", "work_entry_id", "employee_id", "employee_role", "pay_basis", "pay_quantity", "pay_rate", "base_amount"] },
   { table: "repairs", label: "Repairs", order: "id", columns: ["id", "repair_date", "asset_id", "repair_description", "meter_value", "supplier_id", "parts_cost", "labor_cost", "other_cost", "total_cost", "status", "notes", "auto_generate_payable"] },
   { table: "payables", label: "Payables", order: "id", columns: ["id", "payable_date", "supplier_id", "source_type", "reference_no", "description", "amount", "due_date", "status", "notes", "linked_repair_id"] },
   { table: "vale_records", label: "Vale", order: "id", columns: ["id", "employee_id", "date_granted", "amount", "installment_amount", "balance", "status", "notes"] },
@@ -2694,6 +2827,18 @@ const RELATIONSHIP_CHECKS = [
   ["billing_lines_missing_statements", "Billing lines with missing billing statements", "SELECT COUNT(*) AS total FROM billing_lines bl LEFT JOIN billing_statements b ON b.id=bl.billing_id WHERE b.id IS NULL"],
   ["billing_lines_missing_trips", "Billing lines with missing trips", "SELECT COUNT(*) AS total FROM billing_lines bl LEFT JOIN trips t ON t.id=bl.trip_id WHERE t.id IS NULL"],
   ["billing_adjustments_missing_statements", "Billing adjustments with missing billing statements", "SELECT COUNT(*) AS total FROM billing_adjustments ba LEFT JOIN billing_statements b ON b.id=ba.billing_id WHERE b.id IS NULL"],
+  ["projects_missing_clients", "Projects with missing clients", "SELECT COUNT(*) AS total FROM projects p LEFT JOIN clients c ON c.id=p.client_id WHERE c.id IS NULL"],
+  ["projects_missing_assets", "Projects with missing assets", "SELECT COUNT(*) AS total FROM projects p LEFT JOIN assets a ON a.id=p.asset_id WHERE a.id IS NULL"],
+  ["projects_missing_primary_employees", "Projects with missing primary employees", "SELECT COUNT(*) AS total FROM projects p LEFT JOIN employees e ON e.id=p.primary_employee_id WHERE e.id IS NULL"],
+  ["project_helpers_missing_projects", "Project helpers with missing projects", "SELECT COUNT(*) AS total FROM project_helpers ph LEFT JOIN projects p ON p.id=ph.project_id WHERE p.id IS NULL"],
+  ["project_helpers_missing_employees", "Project helpers with missing employees", "SELECT COUNT(*) AS total FROM project_helpers ph LEFT JOIN employees e ON e.id=ph.employee_id WHERE e.id IS NULL"],
+  ["project_work_missing_projects", "Project work entries with missing projects", "SELECT COUNT(*) AS total FROM project_work_entries w LEFT JOIN projects p ON p.id=w.project_id WHERE p.id IS NULL"],
+  ["project_work_helpers_missing_entries", "Project work helpers with missing work entries", "SELECT COUNT(*) AS total FROM project_work_helpers wh LEFT JOIN project_work_entries w ON w.id=wh.work_entry_id WHERE w.id IS NULL"],
+  ["billing_project_lines_missing_billing", "Project billing lines with missing billing statements", "SELECT COUNT(*) AS total FROM billing_project_lines bpl LEFT JOIN billing_statements b ON b.id=bpl.billing_id WHERE b.id IS NULL"],
+  ["billing_project_lines_missing_work", "Project billing lines with missing work entries", "SELECT COUNT(*) AS total FROM billing_project_lines bpl LEFT JOIN project_work_entries w ON w.id=bpl.work_entry_id WHERE w.id IS NULL"],
+  ["payroll_project_entries_missing_payroll", "Project payroll claims with missing payroll entries", "SELECT COUNT(*) AS total FROM payroll_project_entries ppe LEFT JOIN payroll_entries p ON p.id=ppe.payroll_id WHERE p.id IS NULL"],
+  ["payroll_project_entries_missing_work", "Project payroll claims with missing work entries", "SELECT COUNT(*) AS total FROM payroll_project_entries ppe LEFT JOIN project_work_entries w ON w.id=ppe.work_entry_id WHERE w.id IS NULL"],
+  ["payroll_project_entries_missing_employees", "Project payroll claims with missing employees", "SELECT COUNT(*) AS total FROM payroll_project_entries ppe LEFT JOIN employees e ON e.id=ppe.employee_id WHERE e.id IS NULL"],
   ["collections_missing_billing", "Collections with missing billing statements", "SELECT COUNT(*) AS total FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id WHERE co.billing_id IS NOT NULL AND b.id IS NULL"],
   ["collections_missing_clients", "Collections with missing clients", "SELECT COUNT(*) AS total FROM collections co LEFT JOIN clients c ON c.id=co.client_id WHERE co.client_id IS NOT NULL AND c.id IS NULL"],
 ];
@@ -2707,8 +2852,9 @@ async function dataCounts(env) {
 }
 
 async function dataControlTotals(env) {
-  const [trips, payroll, billing, collections, payables, vale, cash] = await Promise.all([
+  const [trips, projects, payroll, billing, collections, payables, vale, cash] = await Promise.all([
     first(env, "SELECT COUNT(*) AS count, COALESCE(SUM(base_trip_rate),0) AS base_total, COALESCE(SUM(fuel_surcharge + loading_fee + unloading_fee + waiting_fee + tolls + additional_stop_charge + special_handling_fee + other_charges),0) AS extra_total, COALESCE(SUM(base_trip_rate + fuel_surcharge + loading_fee + unloading_fee + waiting_fee + tolls + additional_stop_charge + special_handling_fee + other_charges),0) AS billable_total FROM trips"),
+    first(env, "SELECT COUNT(*) AS count, COALESCE(SUM(base_charge),0) AS base_total, COALESCE(SUM(extra_total),0) AS extra_total, COALESCE(SUM(total_charge),0) AS billable_total FROM project_work_entries"),
     first(env, "SELECT COALESCE(SUM(gross_pay),0) AS gross_total, COALESCE(SUM(additional_pay),0) AS additional_total, COALESCE(SUM(vale_deduction + cash_advance_deduction + sss + philhealth + pagibig + withholding_tax + change_deduction + other_deduction),0) AS deduction_total, COALESCE(SUM(net_pay),0) AS net_total FROM payroll_entries"),
     first(env, "SELECT COALESCE(SUM(grand_total),0) AS grand_total FROM billing_statements"),
     first(env, "SELECT COALESCE(SUM(amount_paid),0) AS paid_total FROM collections"),
@@ -2724,6 +2870,12 @@ async function dataControlTotals(env) {
       base_total: numeric(trips?.base_total),
       extra_total: numeric(trips?.extra_total),
       billable_total: numeric(trips?.billable_total),
+    },
+    project_work: {
+      count: Number(projects?.count || 0),
+      base_total: numeric(projects?.base_total),
+      extra_total: numeric(projects?.extra_total),
+      billable_total: numeric(projects?.billable_total),
     },
     payroll: {
       gross_total: numeric(payroll?.gross_total),
@@ -2796,6 +2948,9 @@ function moneySummaryRows(controls) {
     ["Trips base total", controls.trips.base_total],
     ["Trips extra total", controls.trips.extra_total],
     ["Trips billable total", controls.trips.billable_total],
+    ["Project work base total", controls.project_work.base_total],
+    ["Project work extra total", controls.project_work.extra_total],
+    ["Project work billable total", controls.project_work.billable_total],
     ["Payroll gross", controls.payroll.gross_total],
     ["Payroll deductions", controls.payroll.deduction_total],
     ["Payroll net", controls.payroll.net_total],
@@ -3135,6 +3290,10 @@ async function handleApplicationRequest(request, env) {
     if (path === `${base}/export.csv`) return masterExport(request, env, user, base, spec);
   }
   let match;
+  if (path === "/projects" || path.startsWith("/projects/")) {
+    const response = await handleProjects({ request, env, user, path });
+    if (response) return response;
+  }
   if (path === "/recurring-trips") return recurringListPage(request, env, user, path);
   if (path === "/recurring-trips/new") return recurringFormPage(request, env, user, path);
   match = path.match(/^\/recurring-trips\/(\d+)\/edit$/);

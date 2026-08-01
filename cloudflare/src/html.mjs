@@ -3,7 +3,7 @@ import { esc, peso } from "./utils.mjs";
 
 const nav = [
   ["Overview", [["Dashboard", "/"]]],
-  ["Operations", [["Trips", "/trips"], ["Recurring Trips", "/recurring-trips"], ["Vale / Cash Advance", "/advances"]]],
+  ["Operations", [["Trips", "/trips"], ["Projects", "/projects"], ["Recurring Trips", "/recurring-trips"], ["Vale / Cash Advance", "/advances"]]],
   ["Maintenance", [["Repairs", "/repairs"]]],
   ["Master Data", [["Employees", "/employees"], ["Fleet / Equipment", "/fleet"], ["Clients", "/clients"], ["Suppliers", "/suppliers"]]],
   ["Finance", [["Payroll", "/payroll"], ["Billing", "/billing"], ["Collections", "/collections"], ["Payables", "/payables"], ["Reports", "/reports"]]],
@@ -15,8 +15,13 @@ export function layout({ title, user, path = "/", content, appName = "GMT Trucki
   const menu = nav.map(([group, items]) => {
     const links = items.filter(([page]) => canView(user, page)).map(([page, href]) => {
       const active = path === href || (href !== "/" && path.startsWith(href));
-      const extras = canEdit(user, page) && page === "Trips" ? `<a class="nav-sub" href="/trips/new">New Trip Details</a>` : "";
-      return `<a class="nav-link${active ? " active" : ""}" href="${href}">${esc(page === "Trips" ? "Trips List" : page)}</a>${extras}`;
+      const extras = canEdit(user, page) && page === "Trips"
+        ? `<a class="nav-sub" href="/trips/new">New Trip Details</a>`
+        : canEdit(user, page) && page === "Projects"
+          ? `<a class="nav-sub" href="/projects/new">New Project Details</a>`
+          : "";
+      const label = page === "Trips" ? "Trips List" : page === "Projects" ? "Projects List" : page;
+      return `<a class="nav-link${active ? " active" : ""}" href="${href}">${esc(label)}</a>${extras}`;
     }).join("");
     return links ? `<section class="nav-group"><h2>${esc(group)}</h2>${links}</section>` : "";
   }).join("");

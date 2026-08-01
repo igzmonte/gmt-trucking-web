@@ -41,6 +41,14 @@ npx wrangler d1 execute gmt-trucking --file=./migrations/0001_initial.sql
 npx wrangler d1 execute gmt-trucking --file=./migrations/0002_seed_preview.sql
 ```
 
+5. Apply later schema migrations in filename order. Existing deployments must
+   apply the Equipment Projects migration before opening `/projects`:
+
+```bash
+npx wrangler d1 execute gmt-trucking --remote --file=./migrations/0003_fix_preview_password_hashes.sql
+npx wrangler d1 execute gmt-trucking --remote --file=./migrations/0004_equipment_projects.sql
+```
+
 Preview login:
 
 ```text
@@ -113,7 +121,8 @@ Data Tools counts/control totals with the manifest before allowing live entry.
 ## Current implementation status
 
 The Cloudflare app now includes authentication/RBAC, master data, recurring
-trips, trips, maintenance, advances, payroll, billing, collections, SOA,
-reports, user management, settings, Data Tools, and printable documents.
+trips, one-time trips, multi-day equipment projects with daily work entries,
+maintenance, advances, payroll, billing, collections, SOA, reports, user
+management, settings, Data Tools, and printable documents.
 Django remains the parity reference until a dedicated production-cutover
 rehearsal proves the imported data and outputs match.
