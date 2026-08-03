@@ -57,11 +57,15 @@ export function textareaInput(name, label, value = "", attrs = "") {
   return `<label>${esc(label)}<textarea name="${esc(name)}" ${attrs}>${esc(value)}</textarea></label>`;
 }
 
-export function selectInput(name, label, rows, selected = "", labeler = (row) => row.name, blank = "---------", { searchable = false, attrs = "" } = {}) {
+export function selectInput(name, label, rows, selected = "", labeler = (row) => row.name, blank = "---------", { searchable = false, attrs = "", quickCreate = null } = {}) {
   const options = `<option value="">${esc(blank)}</option>${rows.map((row) => `<option value="${esc(row.id)}"${String(selected) === String(row.id) ? " selected" : ""}>${esc(labeler(row))}</option>`).join("")}`;
   if (!searchable) return `<label>${esc(label)}<select name="${esc(name)}"${attrs ? ` ${attrs}` : ""}>${options}</select></label>`;
   const selectedRow = rows.find((row) => String(row.id) === String(selected));
   const selectedLabel = selectedRow ? labeler(selectedRow) : "";
+  if (quickCreate) {
+    const quick = `<span class="quick-create-slot" data-quick-create data-quick-create-kind="${esc(quickCreate.kind)}" data-quick-create-context="${esc(quickCreate.context || "")}" data-quick-create-label="${esc(quickCreate.label || label)}" data-quick-create-empty="${rows.length ? "0" : "1"}"></span>`;
+    return `<label class="combobox-field">${esc(label)}<span class="combobox-row"><span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" title="${esc(selectedLabel)}" placeholder="Search or select" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>v</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span>${quick}</span></label>`;
+  }
   return `<label class="combobox-field">${esc(label)}<span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" title="${esc(selectedLabel)}" placeholder="Search or select…" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>▾</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span></label>`;
 }
 

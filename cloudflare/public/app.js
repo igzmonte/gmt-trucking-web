@@ -19,8 +19,10 @@
     }
   }
 
-  function setupComboboxes() {
-    document.querySelectorAll("[data-combobox]").forEach((box) => {
+  function setupComboboxes(root = document) {
+    root.querySelectorAll("[data-combobox]").forEach((box) => {
+      if (box.dataset.comboboxReady) return;
+      box.dataset.comboboxReady = "1";
       const input = box.querySelector("[data-combobox-input]");
       const toggle = box.querySelector("[data-combobox-toggle]");
       const list = box.querySelector("[data-combobox-options]");
@@ -93,6 +95,80 @@
     document.querySelector("[data-dialog-backdrop]")?.addEventListener("click", () => location.assign(href));
     document.addEventListener("keydown", (event) => { if (event.key === "Escape") location.assign(href); });
     requestAnimationFrame(() => dialog.querySelector("input:not([type=hidden]),select,textarea,button")?.focus());
+  }
+
+  function setupQuickCreate() {
+    const roleText = document.querySelector(".sidebar-brand p")?.textContent?.toLowerCase() || "";
+    if (!roleText.includes("admin") && !roleText.includes("encoder")) return;
+    function formError(overlay, message) {
+      let box = overlay.querySelector(".quick-create-errors");
+      if (!box) { box = document.createElement("section"); box.className = "quick-create-errors"; overlay.querySelector(".dialog-body")?.prepend(box); }
+      box.textContent = message;
+    }
+    function mount(markup, trigger) {
+      const holder = document.createElement("div"); holder.innerHTML = markup;
+      const overlay = holder.firstElementChild;
+      if (!overlay) return;
+      document.body.append(overlay);
+      setupComboboxes(overlay);
+      const close = () => { overlay.remove(); trigger?.focus(); };
+      overlay.querySelectorAll("[data-quick-create-close]").forEach((button) => button.addEventListener("click", close));
+      overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
+      const keydown = (event) => { if (event.key === "Escape") { event.preventDefault(); document.removeEventListener("keydown", keydown); close(); } };
+      document.addEventListener("keydown", keydown);
+      const form = overlay.querySelector("[data-quick-create-form]");
+      form?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submit = form.querySelector('button[type="submit"], button:not([type])');
+        if (submit) submit.disabled = true;
+        try {
+          const response = await fetch(form.action, { method: "POST", body: new FormData(form), headers: { Accept: "application/json" } });
+          const payload = await response.json();
+          if (!payload.ok) {
+            if (payload.dialog) { document.removeEventListener("keydown", keydown); overlay.remove(); mount(payload.dialog, trigger); }
+            else formError(overlay, payload.error || "Could not create the record.");
+            return;
+          }
+          const slot = trigger.closest("[data-quick-create]");
+          const select = slot?.closest("label")?.querySelector("select[data-searchable-select]");
+          if (!select) throw new Error("The related selection could not be updated.");
+          const old = [...select.options].find((option) => String(option.value) === String(payload.record.id));
+          if (old) old.textContent = payload.record.label;
+          else select.add(new Option(payload.record.label, payload.record.id));
+          select.value = String(payload.record.id);
+          if (payload.record.kind === "recurring" && payload.record.autofill) {
+            const dataNode = document.getElementById("trip-form-data");
+            if (dataNode) {
+              const data = JSON.parse(dataNode.textContent || "{}");
+              data.masters = [...(data.masters || []).filter((item) => String(item.id) !== String(payload.record.id)), payload.record.autofill];
+              dataNode.textContent = JSON.stringify(data);
+            }
+          }
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+          document.removeEventListener("keydown", keydown); close();
+        } catch (error) {
+          formError(overlay, error?.message || "Network error. Your current form is still unchanged.");
+        } finally { if (submit) submit.disabled = false; }
+      });
+      requestAnimationFrame(() => overlay.querySelector("input:not([type=hidden]), select, textarea, button")?.focus());
+    }
+    document.querySelectorAll("[data-quick-create]").forEach((slot) => {
+      const label = slot.dataset.quickCreateLabel || slot.closest("label")?.firstChild?.textContent || "record";
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "quick-create-button";
+      button.textContent = slot.dataset.quickCreateEmpty === "1" ? `+ Add ${label} (no records yet)` : `+ Add ${label}`;
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const params = new URLSearchParams(); if (slot.dataset.quickCreateContext) params.set("context", slot.dataset.quickCreateContext);
+          const response = await fetch(`/quick-create/${encodeURIComponent(slot.dataset.quickCreateKind)}${params.toString() ? `?${params}` : ""}`, { headers: { Accept: "text/html" } });
+          if (!response.ok) throw new Error("Quick create is not available.");
+          mount(await response.text(), button);
+        } catch (error) { button.insertAdjacentText("afterend", ` ${error?.message || "Could not open quick create."}`); }
+        finally { button.disabled = false; }
+      });
+      slot.append(button);
+    });
   }
 
   function setupPayItems(form) {
@@ -201,5 +277,5 @@
     update();
   }
 
-  setupComboboxes(); setupTabs(); setupDialogs(); setupTripForm(); setupProjectForms(); setupRepairTotal();
+  setupComboboxes(); setupTabs(); setupDialogs(); setupQuickCreate(); setupTripForm(); setupProjectForms(); setupRepairTotal();
 })();

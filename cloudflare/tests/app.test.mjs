@@ -319,7 +319,7 @@ function envWithRows(rows = {}) {
           },
           async run() {
             rows.runs?.push({ sql: state.sql, params: state.params });
-            return { success: true };
+            return rows.lastRowId ? { success: true, meta: { last_row_id: rows.lastRowId } } : { success: true };
           },
         };
       },
@@ -2912,4 +2912,43 @@ test("project summary print shows completed quantity, charges, logo, and signatu
   assert.match(body, /data:image\/png;base64,LOGO/);
   assert.match(body, /Prepared by/);
   assert.match(body, /Client \/ Conforme/);
+});
+
+test("quick create shows supported controls, preserves role restrictions, and creates related records", async () => {
+  const tripForm = await handleRequest(await authedRequest("https://example.test/trips/new", "admin"), envWithRows({
+    clients: [], assets: [], drivers: [], helpers: [], recurring: [],
+  }));
+  const tripBody = await tripForm.text();
+  assert.match(tripBody, /data-quick-create-kind="client"/);
+  assert.match(tripBody, /data-quick-create-kind="recurring"/);
+  assert.match(tripBody, /data-quick-create-kind="employee" data-quick-create-context="driver"/);
+
+  let response = await handleRequest(await authedRequest("https://example.test/quick-create/employee?context=driver", "admin"), envWithRows());
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Add Driver/);
+  assert.match(await (await handleRequest(await authedRequest("https://example.test/quick-create/client", "viewer"), envWithRows())).text(), /not have permission/i);
+
+  response = await handleRequest(await authedRequest("https://example.test/quick-create/client", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ client_name: "" }),
+  }), envWithRows());
+  assert.equal(response.status, 422);
+  const invalid = await response.json();
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.dialog, /client name is required/i);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/quick-create/client", "admin", {
+    method: "POST",
+    body: new URLSearchParams({ client_code: "CLI-099", client_name: "New Client", terms_days: "30" }),
+  }), envWithRows({ clients: [{ id: 999, client_code: "CLI-099", client_name: "New Client", active: 1 }], runs, lastRowId: 999 }));
+  assert.equal(response.status, 201);
+  const created = await response.json();
+  assert.equal(created.record.id, 999);
+  assert.match(created.record.label, /CLI-099, New Client/);
+  assert.ok(runs.some((row) => row.sql.includes("INSERT INTO clients")));
+
+  const browser = fs.readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(browser, /\+ Add \$\{label\}/);
+  assert.match(browser, /Your current form is still unchanged/);
 });

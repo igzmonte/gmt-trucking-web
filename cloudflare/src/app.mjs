@@ -122,6 +122,10 @@ MASTER["/fleet"].filters = {
 
 const SEARCHABLE_SELECT = { searchable: true };
 
+function quickSelect(kind, context = "", label = "") {
+  return { searchable: true, quickCreate: { kind, context, label } };
+}
+
 function errorResponse(error, user, path = "/") {
   if (error?.redirect) return redirect(error.redirect);
   return html(layout({ title: "Forbidden", user, path, content: `<section class="panel"><p class="error">${esc(error?.message || "Forbidden")}</p></section>` }), error?.status || 403);
@@ -1012,6 +1016,115 @@ async function validateRecurring(env, values, id = null) {
   return errors;
 }
 
+const QUICK_CREATE_PAGES = {
+  client: "Clients",
+  employee: "Employees",
+  asset: "Fleet / Equipment",
+  supplier: "Suppliers",
+  recurring: "Recurring Trips",
+};
+
+function quickCreateAccess(user) {
+  if (!user) return { redirect: "/login" };
+  if (!["admin", "encoder"].includes(user.role)) return { status: 403, message: "You do not have permission to create related records." };
+  return null;
+}
+
+function quickCreateError(error) {
+  if (error?.redirect) return redirect(error.redirect);
+  return json({ ok: false, error: error?.message || "Quick create is not available." }, error?.status || 403);
+}
+
+function quickEmployeeType(context, data = {}) {
+  if (context === "driver") return "Driver";
+  if (context === "helper") return "Helper";
+  if (context === "primary") return ["Driver", "Operator"].includes(data.employee_type) ? data.employee_type : "Driver";
+  return ["Driver", "Helper", "Operator", "Mechanic"].includes(data.employee_type) ? data.employee_type : "Driver";
+}
+
+function quickCreateValues(kind, data, context = "") {
+  if (kind === "recurring") return recurringValues(data);
+  const path = { client: "/clients", employee: "/employees", asset: "/fleet", supplier: "/suppliers" }[kind];
+  const spec = MASTER[path];
+  const values = masterValues(spec, data);
+  if (kind === "employee") {
+    values.employee_type = quickEmployeeType(context, data);
+    values.employment_status = data.employment_status === "Inactive" ? "Inactive" : "Active";
+    values.payroll_basis = ["Per Trip", "Per Day", "Manual"].includes(data.payroll_basis) ? data.payroll_basis : "Per Trip";
+    values.active = data.active === "0" ? "0" : "1";
+  }
+  if (kind === "asset") values.status = data.status || "Available";
+  if (kind === "client") values.active = "1";
+  return values;
+}
+
+async function quickCreateChoices(env) {
+  const [clients, assets, drivers] = await Promise.all([
+    all(env, "SELECT * FROM clients WHERE active=1 ORDER BY client_name, id"),
+    all(env, "SELECT * FROM assets ORDER BY asset_code, id"),
+    all(env, "SELECT * FROM employees WHERE active=1 AND employee_type='Driver' ORDER BY full_name, id"),
+  ]);
+  return { clients, assets, drivers };
+}
+
+function quickCreateDialog(kind, context = "", values = {}, errors = [], choices = {}) {
+  const title = { client: "Add Client", employee: `Add ${context === "driver" ? "Driver" : context === "helper" ? "Helper" : context === "primary" ? "Primary Employee" : "Employee"}`, asset: "Add Fleet / Equipment", supplier: "Add Supplier", recurring: "Add Recurring Trip Template" }[kind] || "Add Record";
+  const errorBox = errors.length ? `<section class="quick-create-errors"><ul>${errors.map((error) => `<li>${esc(error)}</li>`).join("")}</ul></section>` : "";
+  const employeeType = quickEmployeeType(context, values);
+  let fields = "";
+  if (kind === "client") fields = `${textInput("client_code", "Client code", values.client_code || "")} ${textInput("client_name", "Client name", values.client_name || "", "required")} ${textareaInput("billing_address", "Billing address", values.billing_address || "", 'rows="2"')} ${textInput("contact_person", "Contact person", values.contact_person || "")} ${textInput("contact_no", "Contact no.", values.contact_no || "")} ${numberInput("terms_days", "Terms days", values.terms_days ?? 30)}`;
+  if (kind === "employee") {
+    const typeControl = ["driver", "helper"].includes(context)
+      ? `${textInput("employee_type_display", "Position / designation", employeeType, "readonly")}<input type="hidden" name="employee_type" value="${esc(employeeType)}">`
+      : selectInput("employee_type", "Position / designation", (context === "primary" ? ["Driver", "Operator"] : ["Driver", "Helper", "Operator", "Mechanic"]).map((name) => ({ id: name, name })), employeeType, (row) => row.name, "");
+    fields = `${textInput("employee_code", "Employee code", values.employee_code || "")} ${textInput("full_name", "Full name", values.full_name || "", "required")} ${typeControl} ${selectInput("payroll_basis", "Payroll basis", ["Per Trip", "Per Day", "Manual"].map((name) => ({ id: name, name })), values.payroll_basis || "Per Trip", (row) => row.name, "")} ${numberInput("trip_rate", "Trip / hourly rate", values.trip_rate ?? 0)} ${numberInput("daily_rate", "Daily rate", values.daily_rate ?? 0)} ${selectInput("employment_status", "Employment status", ["Active", "Inactive"].map((name) => ({ id: name, name })), values.employment_status || "Active", (row) => row.name, "")}`;
+  }
+  if (kind === "asset") fields = `${textInput("asset_code", "Asset code", values.asset_code || "", "required")} ${textInput("asset_type", "Asset type", values.asset_type || "", "required")} ${textInput("plate_no", "Plate no.", values.plate_no || "")} ${textInput("make_model", "Make / model", values.make_model || "")} ${selectInput("status", "Status", ["Available", "In Use", "Under Maintenance", "Inactive"].map((name) => ({ id: name, name })), values.status || "Available", (row) => row.name, "")}`;
+  if (kind === "supplier") fields = `${textInput("supplier_name", "Supplier name", values.supplier_name || "", "required")} ${textInput("contact_person", "Contact person", values.contact_person || "")} ${textInput("contact_no", "Contact no.", values.contact_no || "")}`;
+  if (kind === "recurring") fields = `${textInput("master_code", "Template code", values.master_code || "", "required")} ${selectInput("client_id", "Client", choices.clients || [], values.client_id || "", (row) => choiceLabel("client", row), "---------", SEARCHABLE_SELECT)} ${textareaInput("job_description", "Item / Job", values.job_description || "", 'rows="2"')} ${textInput("origin", "Origin", values.origin || "")} ${textInput("destination", "Destination", values.destination || "")} ${selectInput("default_asset_id", "Default asset", choices.assets || [], values.default_asset_id || "", (row) => choiceLabel("asset", row), "---------", SEARCHABLE_SELECT)} ${selectInput("default_driver_id", "Default driver", choices.drivers || [], values.default_driver_id || "", (row) => choiceLabel("employee", row), "---------", SEARCHABLE_SELECT)} ${numberInput("default_helper_count", "Helper count", values.default_helper_count ?? 0)} ${numberInput("standard_base_rate", "Base rate", values.standard_base_rate ?? 0)} ${numberInput("driver_pay_rate", "Driver pay", values.driver_pay_rate ?? 0)} ${numberInput("helper_pay_rate", "Helper pay", values.helper_pay_rate ?? 0)} ${selectInput("active", "Active", [{ id: "1", name: "Active" }, { id: "0", name: "Inactive" }], values.active ?? "1", (row) => row.name, "")}`;
+  return `<div class="quick-create-overlay" data-quick-create-overlay><dialog class="app-dialog app-dialog-wide quick-create-dialog" open data-quick-create-dialog aria-modal="true"><div class="dialog-header"><div><span class="dialog-kicker">Quick create</span><h2>${esc(title)}</h2></div><button class="dialog-close" type="button" data-quick-create-close aria-label="Close">×</button></div><div class="dialog-body">${errorBox}<form method="post" action="/quick-create/${esc(kind)}${context ? `?context=${encodeURIComponent(context)}` : ""}" class="app-form quick-create-form" data-quick-create-form><input type="hidden" name="context" value="${esc(context)}"><div class="form-grid quick-create-grid">${fields}</div><div class="form-actions"><button>Create and use</button><button type="button" class="button secondary" data-quick-create-close>Cancel</button></div></form></div></dialog></div>`;
+}
+
+async function quickCreatePage(request, env, user, kind, context = "") {
+  const access = quickCreateAccess(user);
+  if (access) return quickCreateError(access);
+  if (!QUICK_CREATE_PAGES[kind]) return json({ ok: false, error: "Unsupported quick-create record." }, 404);
+  const normalizedContext = ["driver", "helper", "primary", "employee"].includes(context) ? context : "";
+  const choices = kind === "recurring" ? await quickCreateChoices(env) : {};
+  if (request.method === "GET") return html(quickCreateDialog(kind, normalizedContext, {}, [], choices));
+  if (request.method !== "POST") return json({ ok: false, error: "Quick create requires POST." }, 405);
+  const data = await parseForm(request);
+  const values = quickCreateValues(kind, data, normalizedContext);
+  const errors = kind === "recurring"
+    ? await validateRecurring(env, values)
+    : await validateMaster(env, MASTER[{ client: "/clients", employee: "/employees", asset: "/fleet", supplier: "/suppliers" }[kind]], values);
+  if (errors.length) return json({ ok: false, dialog: quickCreateDialog(kind, normalizedContext, values, errors, choices) }, 422);
+  try {
+    let result;
+    let tableName;
+    if (kind === "recurring") {
+      const fields = Object.keys(values);
+      result = await run(env, `INSERT INTO recurring_trip_masters (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
+      tableName = "recurring_trip_masters";
+    } else {
+      const spec = MASTER[{ client: "/clients", employee: "/employees", asset: "/fleet", supplier: "/suppliers" }[kind]];
+      const fields = spec.fields.map(([name]) => name);
+      if (kind === "client") fields.push("active");
+      result = await run(env, `INSERT INTO ${spec.table} (${fields.join(", ")}) VALUES (${fields.map(() => "?").join(", ")})`, fields.map((field) => values[field]));
+      tableName = spec.table;
+    }
+    const id = result?.meta?.last_row_id;
+    if (!id) throw new Error("The record was saved, but its new ID was not returned.");
+    const record = await first(env, `SELECT * FROM ${tableName} WHERE id=?`, [id]);
+    const label = choiceLabel(kind === "recurring" ? "recurring" : kind === "asset" ? "asset" : kind, record || { ...values, id });
+    const payload = { id, label, kind };
+    if (kind === "recurring") payload.autofill = { id, client_id: values.client_id || "", job_description: values.job_description || "", origin: values.origin || "", destination: values.destination || "", asset_id: values.default_asset_id || "", driver_id: values.default_driver_id || "", helper_count: Number(values.default_helper_count || 0), base_trip_rate: values.standard_base_rate || 0, driver_pay_rate: values.driver_pay_rate || 0, helper_pay_rate: values.helper_pay_rate || 0, default_extra_note: values.default_extra_note || "", remarks: values.remarks || "" };
+    return json({ ok: true, record: payload }, 201);
+  } catch (error) {
+    return json({ ok: false, dialog: quickCreateDialog(kind, normalizedContext, values, [`Could not create record: ${error.message || error}`], choices) }, 400);
+  }
+}
+
 async function recurringChoices(env) {
   return await Promise.all([
     all(env, "SELECT * FROM clients WHERE active=1 ORDER BY client_name"),
@@ -1024,12 +1137,12 @@ async function renderRecurringForm(env, row = {}, id = null, errors = []) {
   const [clients, assets, drivers] = await recurringChoices(env);
   const fields = [
     textInput("master_code", "Code", row.master_code || "", "required"),
-    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT),
+    selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", quickSelect("client")),
     textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'),
     textInput("origin", "Origin", row.origin || ""),
     textInput("destination", "Destination", row.destination || ""),
-    selectInput("default_asset_id", "Default asset", assets, row.default_asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
-    selectInput("default_driver_id", "Default driver", drivers, row.default_driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    selectInput("default_asset_id", "Default asset", assets, row.default_asset_id || "", (r) => choiceLabel("asset", r), "---------", quickSelect("asset")),
+    selectInput("default_driver_id", "Default driver", drivers, row.default_driver_id || "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "driver")),
     numberInput("default_helper_count", "Default helper count", row.default_helper_count ?? 0),
     numberInput("standard_base_rate", "Base rate", row.standard_base_rate ?? 0),
     numberInput("driver_pay_rate", "Driver pay", row.driver_pay_rate ?? 0),
@@ -1163,13 +1276,13 @@ async function tripForm(request, env, user, path) {
     textInput("reference_no", "Ref. No."),
     textInput("trip_date", "Trip date", todayISO(), 'type="date" required'),
     selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], "Spot Trip", (r) => r.name),
-    selectInput("recurring_master_id", "Recurring master", masters, "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT),
-    selectInput("client_id", "Client", clients, "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT),
+    selectInput("recurring_master_id", "Recurring master", masters, "", (r) => choiceLabel("recurring", r), "---------", quickSelect("recurring")),
+    selectInput("client_id", "Client", clients, "", (r) => choiceLabel("client", r), "---------", quickSelect("client")),
     textInput("job_description", "Item / Job"),
     textInput("origin", "Origin"),
     textInput("destination", "Destination"),
-    selectInput("asset_id", "Asset", assets, "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT),
-    selectInput("driver_id", "Driver", drivers, "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    selectInput("asset_id", "Asset", assets, "", (r) => choiceLabel("asset", r), "---------", quickSelect("asset")),
+    selectInput("driver_id", "Driver", drivers, "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "driver")),
     textInput("status", "Status", "Planned"),
     numberInput("base_trip_rate", "Base trip rate"),
     numberInput("driver_pay_rate", "Driver pay rate"),
@@ -1413,11 +1526,11 @@ async function renderTripForm(env, row = {}, id = null, errors = [], statusLock 
     `<div>${textInput("reference_no", "Ref. No.", row.reference_no || "")}</div>`,
     `<div>${textInput("trip_date", "Trip date", row.trip_date || todayISO(), 'type="date" required')}</div>`,
     `<div>${selectInput("trip_type", "Trip type", [{ id: "Spot Trip", name: "Spot Trip" }, { id: "Recurring Trip", name: "Recurring Trip" }], row.trip_type || "Spot Trip", (r) => r.name, "")}</div>`,
-    `<div class="field-span-2 trip-recurring-field">${selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r), "---------", SEARCHABLE_SELECT)}</div>`,
+    `<div class="field-span-2 trip-recurring-field">${selectInput("recurring_master_id", "Recurring master", masters, row.recurring_master_id || "", (r) => choiceLabel("recurring", r), "---------", quickSelect("recurring"))}</div>`,
     `<div class="field-span-2 trip-status-field">${statusControl}</div>`,
   ];
-  const route = [selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", SEARCHABLE_SELECT), textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'), textInput("origin", "Origin", row.origin || ""), textInput("destination", "Destination", row.destination || ""), textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'), textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'), textareaInput("notes", "Notes", row.notes || "", 'rows="2"')];
-  const crew = [selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT), selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT), selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT)];
+  const route = [selectInput("client_id", "Client", clients, row.client_id || "", (r) => choiceLabel("client", r), "---------", quickSelect("client")), textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2"'), textInput("origin", "Origin", row.origin || ""), textInput("destination", "Destination", row.destination || ""), textInput("dispatch_time", "Dispatch time", row.dispatch_time || "", 'type="time"'), textInput("arrival_time", "Arrival time", row.arrival_time || "", 'type="time"'), textareaInput("notes", "Notes", row.notes || "", 'rows="2"')];
+  const crew = [selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", quickSelect("asset")), selectInput("driver_id", "Driver", drivers, row.driver_id || "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "driver")), selectInput("helper_1", "Helper 1", helpers, existingHelpers[0]?.employee_id || row.helper_1 || "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "helper")), selectInput("helper_2", "Helper 2", helpers, existingHelpers[1]?.employee_id || row.helper_2 || "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "helper")), selectInput("helper_3", "Helper 3", helpers, existingHelpers[2]?.employee_id || row.helper_3 || "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "helper"))];
   const driverJson = row.driver_pay_items ?? payItemsJson(row.pay_items, "Driver");
   const helperJson = row.helper_pay_items ?? payItemsJson(row.pay_items, "Helper");
   const charges = EXTRA_FIELDS.map((field) => numberInput(field, field.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase()), row[field] ?? 0)).join("");
@@ -1722,7 +1835,7 @@ async function renderRepairForm(env, row = {}, id = null, errors = []) {
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   const deleteForm = id ? `<form method="post" action="/repairs/${id}/delete" class="delete-form" onsubmit="return confirm('Delete this repair?');"><button class="danger">Delete</button></form>` : "";
   const action = id ? `/repairs/${id}/edit` : "/repairs/new";
-  return `${errorBox}<form method="post" action="${action}" class="app-form" data-repair-form><div class="workspace-grid repair-layout"><div><section class="workspace-card"><h3>Repair Information</h3><div class="field-grid">${textInput("repair_date", "Repair date", row.repair_date || todayISO(), 'type="date" required')}${textareaInput("repair_description", "Description", row.repair_description || "", 'rows="2" required')}${textInput("meter_value", "Meter value", row.meter_value || "")}${selectInput("status", "Status", REPAIR_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, "")}</div></section><section class="workspace-card"><h3>Supplier / Unit</h3><div class="field-grid">${selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", SEARCHABLE_SELECT)}${selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", SEARCHABLE_SELECT)}</div></section></div><div><section class="workspace-card"><h3>Cost Breakdown</h3><div class="cost-grid">${numberInput("parts_cost", "Parts cost", row.parts_cost ?? 0)}${numberInput("labor_cost", "Labor cost", row.labor_cost ?? 0)}${numberInput("other_cost", "Other cost", row.other_cost ?? 0)}</div><div class="calculated-total"><span>Total Cost</span><strong>₱ <span data-repair-total>0.00</span></strong></div></section><section class="workspace-card"><h3>Payable Options &amp; Notes</h3><div class="field-grid">${selectInput("auto_generate_payable", "Auto-generate payable", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.auto_generate_payable ? "1" : "0", (r) => r.name, "")}${textareaInput("notes", "Notes", row.notes || "", 'rows="3"')}</div></section></div></div><div class="form-actions"><a class="button secondary" href="/repairs">Cancel</a><button>Save Repair</button></div></form>${deleteForm}`;
+  return `${errorBox}<form method="post" action="${action}" class="app-form" data-repair-form><div class="workspace-grid repair-layout"><div><section class="workspace-card"><h3>Repair Information</h3><div class="field-grid">${textInput("repair_date", "Repair date", row.repair_date || todayISO(), 'type="date" required')}${textareaInput("repair_description", "Description", row.repair_description || "", 'rows="2" required')}${textInput("meter_value", "Meter value", row.meter_value || "")}${selectInput("status", "Status", REPAIR_STATUSES.map((status) => ({ id: status, name: status })), row.status || "Open", (r) => r.name, "")}</div></section><section class="workspace-card"><h3>Supplier / Unit</h3><div class="field-grid">${selectInput("asset_id", "Asset", assets, row.asset_id || "", (r) => choiceLabel("asset", r), "---------", quickSelect("asset"))}${selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", quickSelect("supplier"))}</div></section></div><div><section class="workspace-card"><h3>Cost Breakdown</h3><div class="cost-grid">${numberInput("parts_cost", "Parts cost", row.parts_cost ?? 0)}${numberInput("labor_cost", "Labor cost", row.labor_cost ?? 0)}${numberInput("other_cost", "Other cost", row.other_cost ?? 0)}</div><div class="calculated-total"><span>Total Cost</span><strong>₱ <span data-repair-total>0.00</span></strong></div></section><section class="workspace-card"><h3>Payable Options &amp; Notes</h3><div class="field-grid">${selectInput("auto_generate_payable", "Auto-generate payable", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.auto_generate_payable ? "1" : "0", (r) => r.name, "")}${textareaInput("notes", "Notes", row.notes || "", 'rows="3"')}</div></section></div></div><div class="form-actions"><a class="button secondary" href="/repairs">Cancel</a><button>Save Repair</button></div></form>${deleteForm}`;
 }
 
 async function validateRepair(values) {
@@ -1883,7 +1996,7 @@ async function renderPayableForm(env, row = {}, id = null, errors = []) {
   const [suppliers, repairs] = await payableChoices(env);
   const fields = [
     textInput("payable_date", "Payable date", row.payable_date || todayISO(), 'type="date" required'),
-    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", SEARCHABLE_SELECT),
+    selectInput("supplier_id", "Supplier", suppliers, row.supplier_id || "", (r) => choiceLabel("supplier", r), "---------", quickSelect("supplier")),
     textInput("source_type", "Source type", row.source_type || "Manual"),
     textInput("reference_no", "Reference no.", row.reference_no || ""),
     textareaInput("description", "Description", row.description || "", 'rows="2" required'),
@@ -2031,7 +2144,7 @@ function validateAdvance(values, type) {
 async function renderAdvanceForm(env, type, row = {}, id = null, errors = []) {
   const employees = await all(env, "SELECT * FROM employees WHERE active=1 ORDER BY full_name");
   const fields = [
-    selectInput("employee_id", "Employee", employees, row.employee_id || "", (r) => choiceLabel("employee", r), "---------", SEARCHABLE_SELECT),
+    selectInput("employee_id", "Employee", employees, row.employee_id || "", (r) => choiceLabel("employee", r), "---------", quickSelect("employee", "employee")),
     textInput("date_granted", "Date granted", row.date_granted || todayISO(), 'type="date" required'),
     numberInput("amount", "Amount", row.amount ?? 0),
     ...(type === "vale" ? [numberInput("installment_amount", "Installment amount", row.installment_amount ?? 0)] : [selectInput("applied", "Applied", [{ id: "0", name: "No" }, { id: "1", name: "Yes" }], row.applied ? "1" : "0", (r) => r.name, "")]),
@@ -2341,7 +2454,7 @@ function payrollFormContent(employees, selection, preview, values = {}, errors =
   const employeeId = selection.employee || values.employee || "";
   const periodFrom = selection.period_from || values.period_from || periodStartToday();
   const periodTo = selection.period_to || values.period_to || todayISO();
-  const employeeSelect = selectInput("employee", "Employee", employees, employeeId, (employee) => choiceLabel("employee", employee), "Select employee", { searchable: true, attrs: "required" });
+  const employeeSelect = selectInput("employee", "Employee", employees, employeeId, (employee) => choiceLabel("employee", employee), "Select employee", { searchable: true, attrs: "required", quickCreate: { kind: "employee", context: "employee" } });
   const selector = `<section class="panel payroll-selector"><h3>1. Select Employee & Period</h3><form method="get" class="selector-row">${employeeSelect}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Payroll</button></form></section>`;
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   if (!preview) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select an employee and period, then choose <strong>Preview Payroll</strong>.</p></section>`;
@@ -2736,7 +2849,7 @@ function billingFormContent(clients, selection, trips, projectEntries = [], valu
   const periodTo = selection.period_to || values.period_to || todayISO();
   const cleaned = billingCleaned({ client: clientId, period_from: periodFrom, period_to: periodTo, ...values });
   const totals = billingTotals(trips || [], cleaned, projectEntries || []);
-  const selector = `<section class="panel"><h3>1. Select Client & Period</h3><form method="get" class="selector-row">${selectInput("client", "Client", clients, clientId, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required" })}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Billing</button></form></section>`;
+  const selector = `<section class="panel"><h3>1. Select Client & Period</h3><form method="get" class="selector-row">${selectInput("client", "Client", clients, clientId, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required", quickCreate: { kind: "client" } })}<label>Period From<input type="date" name="period_from" value="${esc(periodFrom)}" required></label><label>Period To<input type="date" name="period_to" value="${esc(periodTo)}" required></label><button>Preview Billing</button></form></section>`;
   const errorBox = errors.length ? `<section class="panel"><ul class="error">${errors.map((err) => `<li>${esc(err)}</li>`).join("")}</ul></section>` : "";
   if (!clientId) return `${errorBox}${selector}<section class="panel empty-workspace"><p>Select a client and billing period to preview eligible trips.</p></section>`;
   const hidden = `<input type="hidden" name="client" value="${esc(clientId)}"><input type="hidden" name="period_from" value="${esc(periodFrom)}"><input type="hidden" name="period_to" value="${esc(periodTo)}"><input type="hidden" name="expected_trip_ids" value="${esc(JSON.stringify((trips || []).map((trip) => trip.id)))}"><input type="hidden" name="expected_project_entry_ids" value="${esc(JSON.stringify((projectEntries || []).map((entry) => entry.id)))}">`;
@@ -2977,7 +3090,7 @@ function soaTotals(rows) {
 }
 
 function soaFilterForm(clients, filters) {
-  return `<section class="panel"><h3>Statement of Account</h3><form class="selector-row" method="get" action="/billing/soa">${selectInput("client", "Client", clients, filters.client_id, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required" })}<label>Mode<select name="mode"><option value="outstanding"${filters.mode === "outstanding" ? " selected" : ""}>Outstanding Only</option><option value="all"${filters.mode === "all" ? " selected" : ""}>All Activity</option></select></label><label>As-of date<input type="date" name="as_of" value="${esc(filters.as_of)}" required></label><label>Date from<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date to<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Generate SOA</button></form></section>`;
+  return `<section class="panel"><h3>Statement of Account</h3><form class="selector-row" method="get" action="/billing/soa">${selectInput("client", "Client", clients, filters.client_id, (client) => choiceLabel("client", client), "Select client", { searchable: true, attrs: "required", quickCreate: { kind: "client" } })}<label>Mode<select name="mode"><option value="outstanding"${filters.mode === "outstanding" ? " selected" : ""}>Outstanding Only</option><option value="all"${filters.mode === "all" ? " selected" : ""}>All Activity</option></select></label><label>As-of date<input type="date" name="as_of" value="${esc(filters.as_of)}" required></label><label>Date from<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>Date to<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Generate SOA</button></form></section>`;
 }
 
 function soaRowsTable(rows, { links = true } = {}) {
@@ -3932,9 +4045,13 @@ async function handleApplicationRequest(request, env) {
   if (path === "/login") return login(request, env);
   if (path === "/logout" && request.method === "POST") return redirectWithHeaders("/login", clearSessionHeaders());
 
+  let match;
   const user = await readSession(request, env);
   if (!user) return redirect("/login");
   user.appName = env.GMT_APP_NAME || "GMT Trucking";
+
+  match = path.match(/^\/quick-create\/(client|employee|asset|supplier|recurring)$/);
+  if (match) return quickCreatePage(request, env, user, match[1], url.searchParams.get("context") || "");
 
   if (path === "/") return dashboardPage(request, env, user, path);
   for (const [base, spec] of Object.entries(MASTER)) {
@@ -3946,7 +4063,6 @@ async function handleApplicationRequest(request, env) {
     if (del) return masterDelete(request, env, user, base, spec, Number(del[1]));
     if (path === `${base}/export.csv`) return masterExport(request, env, user, base, spec);
   }
-  let match;
   if (path === "/projects" || path.startsWith("/projects/")) {
     const response = await handleProjects({ request, env, user, path });
     if (response) return response;

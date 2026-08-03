@@ -20,6 +20,9 @@ const WORK_STATUSES = ["Draft", "Completed", "Cancelled"];
 const BASES = ["Trip", "Hour", "Day"];
 const PAY_BASES = ["Per Trip", "Per Hour", "Per Day", "Manual"];
 const SEARCHABLE = { searchable: true };
+function quick(kind, context = "") {
+  return { searchable: true, quickCreate: { kind, context } };
+}
 
 function fail(access, user, path) {
   if (!access) return null;
@@ -323,9 +326,9 @@ async function projectForm(env, row = {}, id = null, errors = []) {
   const [clients, assets, primaryEmployees, helpers] = await choices(env);
   const selectedHelpers = row.helpers || [];
   const overview = `${textInput("project_no", "Project No.", row.project_no || "")}${textInput("reference_no", "Ref. No.", row.reference_no || "")}${textInput("start_date", "Start date", row.start_date || todayISO(), 'type="date" required')}${textInput("end_date", "End date", row.end_date || "", 'type="date"')}${selectChoices("status", "Status", PROJECT_STATUSES, row.status || "Draft")}`;
-  const scope = `${selectInput("client_id", "Client", clients, row.client_id || "", (item) => choiceLabel("client", item), "---------", SEARCHABLE)}${textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2" required')}${textInput("project_location", "Project location", row.project_location || "")}`;
+  const scope = `${selectInput("client_id", "Client", clients, row.client_id || "", (item) => choiceLabel("client", item), "---------", quick("client"))}${textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2" required')}${textInput("project_location", "Project location", row.project_location || "")}`;
   const route = `${textInput("origin", "Origin", row.origin || "")}${textInput("destination", "Destination", row.destination || "")}`;
-  const crew = `${selectInput("asset_id", "Asset", assets, row.asset_id || "", (item) => choiceLabel("asset", item), "---------", SEARCHABLE)}${selectInput("primary_employee_id", "Primary Driver / Operator", primaryEmployees, row.primary_employee_id || "", (item) => choiceLabel("employee", item), "---------", SEARCHABLE)}${[0, 1, 2].map((index) => selectInput(`helper_${index + 1}`, `Helper ${index + 1}`, helpers, selectedHelpers[index]?.employee_id || row[`helper_${index + 1}`] || "", (item) => choiceLabel("employee", item), "---------", SEARCHABLE)).join("")}<p class="trip-crew-guidance muted">Helper allowance follows the selected asset type.</p>`;
+  const crew = `${selectInput("asset_id", "Asset", assets, row.asset_id || "", (item) => choiceLabel("asset", item), "---------", quick("asset"))}${selectInput("primary_employee_id", "Primary Driver / Operator", primaryEmployees, row.primary_employee_id || "", (item) => choiceLabel("employee", item), "---------", quick("employee", "primary"))}${[0, 1, 2].map((index) => selectInput(`helper_${index + 1}`, `Helper ${index + 1}`, helpers, selectedHelpers[index]?.employee_id || row[`helper_${index + 1}`] || "", (item) => choiceLabel("employee", item), "---------", quick("employee", "helper"))).join("")}<p class="trip-crew-guidance muted">Helper allowance follows the selected asset type.</p>`;
   const billing = `${selectChoices("billing_basis", "Billing basis", BASES, row.billing_basis || "Trip")}${numberInput("default_billing_quantity", "Default daily quantity", row.default_billing_quantity ?? 1)}${numberInput("client_unit_rate", "Client unit rate", row.client_unit_rate ?? 0)}`;
   const pay = `${selectChoices("primary_pay_basis", "Primary pay basis", PAY_BASES, row.primary_pay_basis || "Per Trip")}${numberInput("primary_pay_rate", "Primary pay rate", row.primary_pay_rate ?? 0)}${selectChoices("helper_pay_basis", "Helper pay basis", PAY_BASES, row.helper_pay_basis || "Per Trip")}${numberInput("helper_pay_rate", "Helper pay pool rate", row.helper_pay_rate ?? 0)}`;
   const extras = EXTRA_FIELDS.map((field) => numberInput(field, field.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()), row[field] ?? 0)).join("");
