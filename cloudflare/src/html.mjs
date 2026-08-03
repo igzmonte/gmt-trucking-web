@@ -37,7 +37,11 @@ export function cards(items) {
 }
 
 export function table(headers, rows, { empty = "No records found.", bare = false, className = "" } = {}) {
-  const markup = `<div class="table-scroll ${esc(className)}"><table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.length ? rows.join("") : `<tr><td class="empty-state" colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+  const headerMarkup = headers.map((header) => {
+    if (header && typeof header === "object" && "html" in header) return `<th${header.className ? ` class="${esc(header.className)}"` : ""}>${header.html}</th>`;
+    return `<th>${esc(header)}</th>`;
+  }).join("");
+  const markup = `<div class="table-scroll ${esc(className)}"><table><thead><tr>${headerMarkup}</tr></thead><tbody>${rows.length ? rows.join("") : `<tr><td class="empty-state" colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
   return bare ? markup : `<section class="panel table-panel">${markup}</section>`;
 }
 

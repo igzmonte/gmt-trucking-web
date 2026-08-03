@@ -692,6 +692,24 @@ test("master data list supports search, pagination, and edit actions for admins"
   assert.match(text, /\/employees\/export\.csv\?q=Driver/);
 });
 
+test("list pages keep validated sort and contextual filter state in headers, pagination, and CSV", async () => {
+  const env = envWithRows({
+    employees: [{ id: 1, employee_code: "EMP-001", full_name: "Driver One", employee_type: "Driver", payroll_basis: "Per Trip", employment_status: "Active", active: 1 }],
+    employeesCount: 30,
+  });
+  const response = await handleRequest(await authedRequest("https://example.test/employees?q=Driver&employee_type=Driver&sort=full_name&dir=asc&page=2"), env);
+  const body = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(body, /Sort by Name, sorted ascending/);
+  assert.match(body, /sort=full_name&amp;dir=desc/);
+  assert.match(body, /employees\/export\.csv\?q=Driver&employee_type=Driver&sort=full_name&dir=asc/);
+  assert.match(body, /page=1/);
+
+  const invalid = await handleRequest(await authedRequest("https://example.test/employees?sort=DROP_TABLE&dir=sideways"), env);
+  assert.equal(invalid.status, 200);
+  assert.doesNotMatch(await invalid.text(), /DROP_TABLE/);
+});
+
 test("master data CSV export preserves filtered headers and rows for viewer", async () => {
   const env = envWithRows({
     employees: [{ id: 1, employee_code: "EMP-001", full_name: "Driver One", employee_type: "Driver", payroll_basis: "Per Trip", employment_status: "Active" }],

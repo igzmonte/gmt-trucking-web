@@ -18,6 +18,12 @@ const MASTER = {
     required: ["full_name", "employee_type"],
     unique: ["employee_code"],
     numeric: ["daily_rate", "trip_rate", "active"],
+    filters: {
+      employee_type: { sql: "employee_type", label: "Employee type", options: ["Driver", "Helper", "Operator", "Mechanic"] },
+      payroll_basis: { sql: "payroll_basis", label: "Payroll basis", options: ["Per Trip", "Per Day", "Manual"] },
+      employment_status: { sql: "employment_status", label: "Employment status", options: ["Active", "Inactive"] },
+      active: { sql: "active", label: "Record state", options: [{ value: "1", label: "Active" }, { value: "0", label: "Inactive" }] },
+    },
     defaults: { employment_status: "Active", payroll_basis: "Per Trip", daily_rate: 0, trip_rate: 0, active: 1 },
     deleteRefs: [
       ["assets", "assigned_employee_id", "assigned fleet/equipment"],
@@ -107,6 +113,11 @@ const MASTER = {
       ["contact_no", "Contact no"], ["address", "Address"], ["notes", "Notes"],
     ],
   },
+};
+
+MASTER["/fleet"].filters = {
+  asset_type: { sql: "asset_type", label: "Asset type", options: ["Dump Truck", "Backhoe", "Truck", "Trailer", "Other"] },
+  status: { sql: "status", label: "Status", options: ["Available", "In Use", "Under Maintenance", "Inactive"] },
 };
 
 const SEARCHABLE_SELECT = { searchable: true };
@@ -673,6 +684,101 @@ function messagePanel(url) {
   return `<section class="panel"><p class="${error ? "error" : "success"}">${esc(error || ok)}</p></section>`;
 }
 
+function listSort(url, options, fallback, { sortName = "sort", dirName = "dir" } = {}) {
+  const key = String(url.searchParams.get(sortName) || "");
+  const option = options[key];
+  if (!option) return { key: "", dir: "", order: fallback };
+  const requested = String(url.searchParams.get(dirName) || "").toLowerCase();
+  const dir = requested === "asc" || requested === "desc" ? requested : (option.defaultDir || "asc");
+  return { key, dir, order: `${option.sql} ${dir.toUpperCase()}${option.tie ? `, ${option.tie}` : ""}` };
+}
+
+function listParams(url, names, { includePage = false, sort = null, sortName = "sort", dirName = "dir" } = {}) {
+  const params = new URLSearchParams();
+  for (const name of names) {
+    if (name === sortName || name === dirName) continue;
+    const value = String(url.searchParams.get(name) || "").trim();
+    if (value) params.set(name, value);
+  }
+  if (sort?.key) {
+    params.set(sortName, sort.key);
+    params.set(dirName, sort.dir);
+  }
+  if (includePage) {
+    const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+    if (page > 1) params.set("page", String(page));
+  }
+  return params;
+}
+
+function sortableHeaders(columns, sort, params, { sortName = "sort", dirName = "dir" } = {}) {
+  return columns.map((column) => {
+    if (!column.sort) return column.label;
+    const next = new URLSearchParams(params);
+    const selected = sort.key === column.sort;
+    const dir = selected && sort.dir === "asc" ? "desc" : "asc";
+    next.set(sortName, column.sort);
+    next.set(dirName, dir);
+    next.delete("page");
+    const indicator = selected ? (sort.dir === "asc" ? " ▲" : " ▼") : "";
+    const state = selected ? `, sorted ${sort.dir === "asc" ? "ascending" : "descending"}` : "";
+    return { html: `<a class="sort-link${selected ? " is-sorted" : ""}" href="?${esc(next.toString())}" aria-label="Sort by ${esc(column.label)}${state}">${esc(column.label)}<span aria-hidden="true">${indicator}</span></a>` };
+  });
+}
+
+function mergeWhere(where, clauses = [], params = []) {
+  const existing = String(where?.sql || "").replace(/^\s*WHERE\s+/i, "");
+  const allClauses = [...(existing ? [existing] : []), ...clauses.filter(Boolean)];
+  return { sql: allClauses.length ? ` WHERE ${allClauses.join(" AND ")}` : "", params: [...(where?.params || []), ...params] };
+}
+
+function safeId(value) {
+  return /^\d+$/.test(String(value || "")) ? String(Number(value)) : "";
+}
+
+function safeDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) ? String(value) : "";
+}
+
+function enumParam(url, name, values) {
+  const value = String(url.searchParams.get(name) || "").trim();
+  return values.includes(value) ? value : "";
+}
+
+function idParam(url, name) {
+  return safeId(url.searchParams.get(name));
+}
+
+function rangeParams(url, fromName = "date_from", toName = "date_to") {
+  return { from: safeDate(url.searchParams.get(fromName)), to: safeDate(url.searchParams.get(toName)) };
+}
+
+function addEqualityFilters(clauses, params, filters) {
+  for (const [column, value] of filters) {
+    if (value) {
+      clauses.push(`${column}=?`);
+      params.push(value);
+    }
+  }
+}
+
+function addDateRange(clauses, params, column, range) {
+  if (range.from) { clauses.push(`${column}>=?`); params.push(range.from); }
+  if (range.to) { clauses.push(`${column}<=?`); params.push(range.to); }
+}
+
+function selectFilter(name, label, options, selected = "") {
+  return `<label>${esc(label)}<select name="${esc(name)}"><option value="">All</option>${options.map((option) => `<option value="${esc(option.value ?? option.id ?? option)}"${String(option.value ?? option.id ?? option) === String(selected) ? " selected" : ""}>${esc(option.label ?? option.name ?? option)}</option>`).join("")}</select></label>`;
+}
+
+function dateFilter(name, label, value = "") {
+  return `<label>${esc(label)}<input type="date" name="${esc(name)}" value="${esc(value)}"></label>`;
+}
+
+function listToolbar({ query, placeholder, filters = "", clearHref, actions = "" }) {
+  return `<div class="toolbar list-toolbar"><form method="get" class="list-query-form"><div class="list-search-row"><input name="q" value="${esc(query)}" placeholder="${esc(placeholder)}"><button>Search</button></div>${filters ? `<details class="list-filters"><summary>Filters</summary><div class="list-filter-grid">${filters}</div><div class="list-filter-actions"><button>Apply filters</button><a class="button secondary" href="${esc(clearHref)}">Clear</a></div></details>` : ""}</form><div class="toolbar-actions">${actions}</div></div>`;
+}
+
 function pagination(base, query, page, total) {
   const pages = Math.max(1, Math.ceil(total / 25));
   if (pages <= 1) return `<p class="muted">Page 1 of 1</p>`;
@@ -721,6 +827,25 @@ async function validateMaster(env, spec, values, id = null) {
   return errors;
 }
 
+function masterListFilters(url, spec) {
+  const values = {};
+  const clauses = [];
+  const params = [];
+  for (const [key, filter] of Object.entries(spec.filters || {})) {
+    const value = String(url.searchParams.get(key) || "").trim();
+    const allowed = filter.options.map((option) => String(option.value ?? option));
+    if (!allowed.includes(value)) continue;
+    values[key] = value;
+    clauses.push(`${filter.sql}=?`);
+    params.push(value);
+  }
+  return { values, clauses, params };
+}
+
+function masterSortOptions(spec) {
+  return Object.fromEntries(spec.columns.map((column) => [column, { sql: column, defaultDir: spec.order.startsWith(column) ? "asc" : "asc", tie: "id" }]));
+}
+
 function renderMasterForm(user, path, spec, row, id, errors = []) {
   const renderField = ([name, label, kind]) => {
     const value = row[name] ?? spec.defaults?.[name] ?? "";
@@ -751,14 +876,18 @@ async function masterListContent(request, env, user, path, spec) {
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
   const offset = (page - 1) * 25;
-  const where = predicate(spec, query);
+  const filterState = masterListFilters(url, spec);
+  const where = mergeWhere(predicate(spec, query), filterState.clauses, filterState.params);
+  const sort = listSort(url, masterSortOptions(spec), spec.order);
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM ${spec.table}${where.sql}`, where.params);
-  const rows = await all(env, `SELECT * FROM ${spec.table}${where.sql} ORDER BY ${spec.order} LIMIT 25 OFFSET ?`, [...where.params, offset]);
+  const rows = await all(env, `SELECT * FROM ${spec.table}${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, offset]);
   const bodyRows = rows.map((row) => `<tr>${spec.columns.map((col, index) => index === 0 ? `<td>${canEdit(user, spec.page) ? `<a href="${path}/${row.id}/edit">${esc(row[col])}</a>` : esc(row[col])}</td>` : `<td>${esc(row[col])}</td>`).join("")}<td>${canEdit(user, spec.page) ? `<a href="${path}/${row.id}/edit">Edit</a>` : ""}</td></tr>`);
-  const exportParams = new URLSearchParams();
-  if (query) exportParams.set("q", query);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search ${esc(spec.title)}"><button>Search</button></form><div>${canEdit(user, spec.page) ? `<a class="button" href="${path}/new">New Record</a>` : ""} <a class="button secondary" href="${path}/export.csv${exportParams.toString() ? `?${exportParams.toString()}` : ""}">Export CSV</a></div></div>`;
-  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table([...spec.labels, "Actions"], bodyRows, { empty: `No ${spec.title.toLowerCase()} found.` })}${pagination(path, query, page, Number(countRow?.total || 0))}`;
+  const filterNames = Object.keys(spec.filters || {});
+  const params = listParams(url, ["q", ...filterNames], { sort });
+  const filterMarkup = Object.entries(spec.filters || {}).map(([key, filter]) => selectFilter(key, filter.label, filter.options, filterState.values[key] || "")).join("");
+  const toolbar = listToolbar({ query, placeholder: `Search ${spec.title}`, filters: filterMarkup, clearHref: path, actions: `${canEdit(user, spec.page) ? `<a class="button" href="${path}/new">New Record</a>` : ""} <a class="button secondary" href="${path}/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a>` });
+  const headers = [...sortableHeaders(spec.columns.map((column, index) => ({ label: spec.labels[index], sort: column })), sort, params), "Actions"];
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, bodyRows, { empty: `No ${spec.title.toLowerCase()} found.` })}${paginationWithParams(path, params, page, Number(countRow?.total || 0))}`;
 }
 
 async function masterList(request, env, user, path, spec) {
@@ -827,8 +956,10 @@ async function masterExport(request, env, user, path, spec) {
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
-  const where = predicate(spec, query);
-  const rows = await all(env, `SELECT ${spec.columns.join(", ")} FROM ${spec.table}${where.sql} ORDER BY ${spec.order}`, where.params);
+  const filterState = masterListFilters(url, spec);
+  const where = mergeWhere(predicate(spec, query), filterState.clauses, filterState.params);
+  const sort = listSort(url, masterSortOptions(spec), spec.order);
+  const rows = await all(env, `SELECT ${spec.columns.join(", ")} FROM ${spec.table}${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = [spec.labels.join(",")];
   for (const row of rows) lines.push(spec.columns.map((col) => `"${String(row[col] ?? "").replaceAll('"', '""')}"`).join(","));
   return csv(lines.join("\n"), `${spec.table}.csv`);
@@ -918,14 +1049,21 @@ async function recurringListPage(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const where = recurringWhere(query);
+  const filters = { active: enumParam(url, "active", ["0", "1"]), client_id: idParam(url, "client_id"), asset_id: idParam(url, "asset_id"), driver_id: idParam(url, "driver_id") };
+  const clauses = [];
+  const filterParams = [];
+  addEqualityFilters(clauses, filterParams, [["r.active", filters.active], ["r.client_id", filters.client_id], ["r.default_asset_id", filters.asset_id], ["r.default_driver_id", filters.driver_id]]);
+  const where = mergeWhere(recurringWhere(query), clauses, filterParams);
+  const sort = listSort(url, { code: { sql: "r.master_code", tie: "r.id ASC" }, client: { sql: "c.client_name", tie: "r.id ASC" }, route: { sql: "r.origin", tie: "r.id ASC" }, asset: { sql: "a.asset_code", tie: "r.id ASC" }, driver: { sql: "e.full_name", tie: "r.id ASC" }, helpers: { sql: "r.default_helper_count", defaultDir: "desc", tie: "r.id DESC" }, base: { sql: "r.standard_base_rate", defaultDir: "desc", tie: "r.id DESC" }, driver_pay: { sql: "r.driver_pay_rate", defaultDir: "desc", tie: "r.id DESC" }, helper_pay: { sql: "r.helper_pay_rate", defaultDir: "desc", tie: "r.id DESC" } }, "r.master_code, r.id");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY r.master_code, r.id LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((r) => `<tr><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">${esc(r.master_code)}</a>` : esc(r.master_code)}</td><td>${esc(r.client_name || "")}</td><td>${esc(r.origin)} → ${esc(r.destination)}</td><td>${esc(r.asset_code || "")}</td><td>${esc(r.driver_name || "")}</td><td class="num">${esc(r.default_helper_count || 0)}</td><td class="num">${money(r.standard_base_rate)}</td><td class="num">${money(r.driver_pay_rate)}</td><td class="num">${money(r.helper_pay_rate)}</td><td>${canEdit(user, "Recurring Trips") ? `<a href="/recurring-trips/${r.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search recurring trips"><button>Search</button></form><div>${canEdit(user, "Recurring Trips") ? `<a class="button" href="/recurring-trips/new">New Template</a>` : ""} <a class="button secondary" href="/recurring-trips/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Code", "Client", "Route", "Asset", "Driver", "Helpers", "Base Rate", "Driver Pay", "Helper Pay", "Actions"], body, { empty: "No recurring trip templates found." })}${pagination("/recurring-trips", query, page, Number(countRow?.total || 0))}`;
+  const params = listParams(url, ["q", "active", "client_id", "asset_id", "driver_id"], { sort });
+  const [clients, assets, drivers] = await Promise.all([all(env, "SELECT id,client_code,client_name FROM clients ORDER BY client_name"), all(env, "SELECT id,asset_code,plate_no,asset_type FROM assets ORDER BY asset_code"), all(env, "SELECT id,employee_code,full_name,employee_type FROM employees WHERE active=1 ORDER BY full_name")]);
+  const filterMarkup = [selectFilter("active", "Template state", [{ value: "1", label: "Active" }, { value: "0", label: "Inactive" }], filters.active), selectFilter("client_id", "Client", clients.map((row) => ({ value: row.id, label: choiceLabel("client", row) })), filters.client_id), selectFilter("asset_id", "Unit", assets.map((row) => ({ value: row.id, label: choiceLabel("asset", row) })), filters.asset_id), selectFilter("driver_id", "Driver", drivers.map((row) => ({ value: row.id, label: choiceLabel("employee", row) })), filters.driver_id)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search recurring trips", filters: filterMarkup, clearHref: "/recurring-trips", actions: `${canEdit(user, "Recurring Trips") ? `<a class="button" href="/recurring-trips/new">New Template</a>` : ""} <a class="button secondary" href="/recurring-trips/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a>` });
+  const headers = [...sortableHeaders([{ label: "Code", sort: "code" }, { label: "Client", sort: "client" }, { label: "Route", sort: "route" }, { label: "Asset", sort: "asset" }, { label: "Driver", sort: "driver" }, { label: "Helpers", sort: "helpers" }, { label: "Base Rate", sort: "base" }, { label: "Driver Pay", sort: "driver_pay" }, { label: "Helper Pay", sort: "helper_pay" }], sort, params), "Actions"];
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No recurring trip templates found." })}${paginationWithParams("/recurring-trips", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "Recurring Trips", user, path, content }));
 }
 
@@ -969,8 +1107,13 @@ async function recurringExportPage(request, env, user, path) {
   const access = requireView(user, "Recurring Trips");
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
-  const where = recurringWhere((url.searchParams.get("q") || "").trim());
-  const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY r.id`, where.params);
+  const filters = { active: enumParam(url, "active", ["0", "1"]), client_id: idParam(url, "client_id"), asset_id: idParam(url, "asset_id"), driver_id: idParam(url, "driver_id") };
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["r.active", filters.active], ["r.client_id", filters.client_id], ["r.default_asset_id", filters.asset_id], ["r.default_driver_id", filters.driver_id]]);
+  const where = mergeWhere(recurringWhere((url.searchParams.get("q") || "").trim()), clauses, params);
+  const sort = listSort(url, { code: { sql: "r.master_code", tie: "r.id ASC" }, client: { sql: "c.client_name", tie: "r.id ASC" }, route: { sql: "r.origin", tie: "r.id ASC" }, asset: { sql: "a.asset_code", tie: "r.id ASC" }, driver: { sql: "e.full_name", tie: "r.id ASC" }, helpers: { sql: "r.default_helper_count", defaultDir: "desc", tie: "r.id DESC" }, base: { sql: "r.standard_base_rate", defaultDir: "desc", tie: "r.id DESC" }, driver_pay: { sql: "r.driver_pay_rate", defaultDir: "desc", tie: "r.id DESC" }, helper_pay: { sql: "r.helper_pay_rate", defaultDir: "desc", tie: "r.id DESC" } }, "r.master_code, r.id");
+  const rows = await all(env, `SELECT r.*, c.client_name, a.asset_code, e.full_name AS driver_name FROM recurring_trip_masters r LEFT JOIN clients c ON c.id=r.client_id LEFT JOIN assets a ON a.id=r.default_asset_id LEFT JOIN employees e ON e.id=r.default_driver_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["ID,Code,Client,Item / Job,Origin,Destination,Asset,Driver,Helpers,Base Rate,Driver Pay,Helper Pay,Active"];
   for (const row of rows) {
     lines.push([row.id, row.master_code, row.client_name || "", row.job_description || "", row.origin || "", row.destination || "", row.asset_code || "", row.driver_name || "", row.default_helper_count || 0, row.standard_base_rate || 0, row.driver_pay_rate || 0, row.helper_pay_rate || 0, row.active ? "True" : "False"].map((value) => `"${String(value).replaceAll('"', '""')}"`).join(","));
@@ -1104,6 +1247,19 @@ function tripWhere(query, status) {
     params.push(status);
   }
   return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+function tripListFilters(url) {
+  const status = enumParam(url, "status", [...TRIP_STATUSES, ...SYSTEM_TRIP_STATUSES]);
+  const tripType = enumParam(url, "trip_type", ["Spot Trip", "Recurring Trip"]);
+  return {
+    status,
+    trip_type: tripType,
+    client_id: idParam(url, "client_id"),
+    asset_id: idParam(url, "asset_id"),
+    driver_id: idParam(url, "driver_id"),
+    ...rangeParams(url),
+  };
 }
 
 function tripValues(data, preservedStatus = "") {
@@ -1310,25 +1466,44 @@ function tripQuickComplete(trip, user, returnPath) {
 async function tripListContent(request, env, user) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
-  const status = (url.searchParams.get("status") || "").trim();
+  const filters = tripListFilters(url);
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const where = tripWhere(query, status);
+  const filterClauses = [];
+  const filterParams = [];
+  addEqualityFilters(filterClauses, filterParams, [["t.trip_type", filters.trip_type], ["t.client_id", filters.client_id], ["t.asset_id", filters.asset_id], ["t.driver_id", filters.driver_id]]);
+  addDateRange(filterClauses, filterParams, "t.trip_date", filters);
+  const where = mergeWhere(tripWhere(query, filters.status), filterClauses, filterParams);
+  const sort = listSort(url, {
+    ticket: { sql: "t.trip_ticket_no", tie: "t.id ASC" }, reference: { sql: "t.reference_no", tie: "t.id ASC" }, date: { sql: "t.trip_date", defaultDir: "desc", tie: "t.id DESC" }, client: { sql: "c.client_name", tie: "t.id ASC" }, route: { sql: "t.origin", tie: "t.id ASC" }, driver: { sql: "e.full_name", tie: "t.id ASC" }, asset: { sql: "a.asset_code", tie: "t.id ASC" }, status: { sql: "t.status", tie: "t.id ASC" }, base: { sql: "t.base_trip_rate", defaultDir: "desc", tie: "t.id DESC" }, extra: { sql: "(t.fuel_surcharge+t.loading_fee+t.unloading_fee+t.waiting_fee+t.tolls+t.additional_stop_charge+t.special_handling_fee+t.other_charges)", defaultDir: "desc", tie: "t.id DESC" }, total: { sql: "(t.base_trip_rate+t.fuel_surcharge+t.loading_fee+t.unloading_fee+t.waiting_fee+t.tolls+t.additional_stop_charge+t.special_handling_fee+t.other_charges)", defaultDir: "desc", tie: "t.id DESC" },
+  }, "t.trip_date DESC, t.id DESC");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY t.trip_date DESC, t.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  if (status) params.set("status", status);
-  if (page > 1) params.set("page", String(page));
+  const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const params = listParams(url, ["q", "status", "trip_type", "client_id", "asset_id", "driver_id", "date_from", "date_to"], { includePage: true, sort });
   const returnPath = `/trips${params.toString() ? `?${params.toString()}` : ""}`;
   const body = rows.map((t) => `<tr><td><a href="/trips/${t.id}">${esc(t.trip_ticket_no)}</a></td><td>${esc(t.reference_no || "—")}</td><td>${esc(t.trip_date)}</td><td>${esc(t.client_name || "")}</td><td>${esc(t.origin)} → ${esc(t.destination)}</td><td>${esc(t.driver_name || "")}${t.helper_names ? `<small class="cell-detail">${esc(t.helper_names)}</small>` : ""}</td><td>${esc(t.asset_code || "")}</td><td>${tripStatusBadge(t, user, returnPath)}</td>${moneyCell(t.base_trip_rate)}${moneyCell(tripExtraTotal(t))}${moneyCell(tripBillableTotal(t))}<td><a href="/trips/${t.id}">View</a> <a href="/trips/${t.id}/print" target="_blank">Print</a>${canEdit(user, "Trips") ? ` <a href="/trips/${t.id}/edit">Edit</a>` : ""}${tripQuickComplete(t, user, returnPath)}</td></tr>`);
-  const statusOptions = `<select name="status"><option value="">All statuses</option>${[...TRIP_STATUSES, ...SYSTEM_TRIP_STATUSES].map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
+  const [clients, assets, drivers] = await Promise.all([
+    all(env, "SELECT id,client_code,client_name FROM clients ORDER BY client_name"),
+    all(env, "SELECT id,asset_code,plate_no,asset_type FROM assets ORDER BY asset_code"),
+    all(env, "SELECT id,employee_code,full_name,employee_type FROM employees WHERE active=1 ORDER BY full_name"),
+  ]);
+  const filterMarkup = [
+    selectFilter("status", "Status", [...TRIP_STATUSES, ...SYSTEM_TRIP_STATUSES], filters.status),
+    selectFilter("trip_type", "Trip type", ["Spot Trip", "Recurring Trip"], filters.trip_type),
+    selectFilter("client_id", "Client", clients.map((row) => ({ value: row.id, label: choiceLabel("client", row) })), filters.client_id),
+    selectFilter("asset_id", "Unit", assets.map((row) => ({ value: row.id, label: choiceLabel("asset", row) })), filters.asset_id),
+    selectFilter("driver_id", "Driver", drivers.map((row) => ({ value: row.id, label: choiceLabel("employee", row) })), filters.driver_id),
+    dateFilter("date_from", "Date from", filters.from), dateFilter("date_to", "Date to", filters.to),
+  ].join("");
   const exportParams = new URLSearchParams(params);
   exportParams.delete("page");
   const exportHref = `/trips/export.csv${exportParams.toString() ? `?${exportParams.toString()}` : ""}`;
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search trips">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Trips") ? `<a class="button" href="/trips/new">New Trip</a>` : ""} <a class="button secondary" href="${esc(exportHref)}">Export CSV</a></div></div>`;
+  const toolbar = listToolbar({ query, placeholder: "Search trips", filters: filterMarkup, clearHref: "/trips", actions: `${canEdit(user, "Trips") ? `<a class="button" href="/trips/new">New Trip</a>` : ""} <a class="button secondary" href="${esc(exportHref)}">Export CSV</a>` });
   const paginationParams = new URLSearchParams(params);
   paginationParams.delete("page");
-  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Trip Ticket / Waybill", "Ref. No.", "Date", "Client", "Route", "Driver / Helpers", "Unit", "Status", "Base", "Extra", "Total", "Actions"], body, { empty: "No trips found." })}${paginationWithParams("/trips", paginationParams, page, Number(countRow?.total || 0))}`;
+  const headers = [...sortableHeaders([
+    { label: "Trip Ticket / Waybill", sort: "ticket" }, { label: "Ref. No.", sort: "reference" }, { label: "Date", sort: "date" }, { label: "Client", sort: "client" }, { label: "Route", sort: "route" }, { label: "Driver / Helpers", sort: "driver" }, { label: "Unit", sort: "asset" }, { label: "Status", sort: "status" }, { label: "Base", sort: "base" }, { label: "Extra", sort: "extra" }, { label: "Total", sort: "total" },
+  ], sort, paginationParams), "Actions"];
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No trips found." })}${paginationWithParams("/trips", paginationParams, page, Number(countRow?.total || 0))}`;
 }
 
 async function tripListPage(request, env, user, path) {
@@ -1461,8 +1636,14 @@ async function tripExportPage(request, env, user, path) {
   const access = requireView(user, "Trips");
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
-  const where = tripWhere((url.searchParams.get("q") || "").trim(), (url.searchParams.get("status") || "").trim());
-  const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY t.id`, where.params);
+  const filters = tripListFilters(url);
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["t.trip_type", filters.trip_type], ["t.client_id", filters.client_id], ["t.asset_id", filters.asset_id], ["t.driver_id", filters.driver_id]]);
+  addDateRange(clauses, params, "t.trip_date", filters);
+  const where = mergeWhere(tripWhere((url.searchParams.get("q") || "").trim(), filters.status), clauses, params);
+  const sort = listSort(url, { ticket: { sql: "t.trip_ticket_no", tie: "t.id ASC" }, reference: { sql: "t.reference_no", tie: "t.id ASC" }, date: { sql: "t.trip_date", defaultDir: "desc", tie: "t.id DESC" }, client: { sql: "c.client_name", tie: "t.id ASC" }, route: { sql: "t.origin", tie: "t.id ASC" }, driver: { sql: "e.full_name", tie: "t.id ASC" }, asset: { sql: "a.asset_code", tie: "t.id ASC" }, status: { sql: "t.status", tie: "t.id ASC" }, base: { sql: "t.base_trip_rate", defaultDir: "desc", tie: "t.id DESC" }, extra: { sql: "(t.fuel_surcharge+t.loading_fee+t.unloading_fee+t.waiting_fee+t.tolls+t.additional_stop_charge+t.special_handling_fee+t.other_charges)", defaultDir: "desc", tie: "t.id DESC" }, total: { sql: "(t.base_trip_rate+t.fuel_surcharge+t.loading_fee+t.unloading_fee+t.waiting_fee+t.tolls+t.additional_stop_charge+t.special_handling_fee+t.other_charges)", defaultDir: "desc", tie: "t.id DESC" } }, "t.trip_date DESC, t.id DESC");
+  const rows = await all(env, `SELECT t.*, c.client_name, a.asset_code, e.full_name AS driver_name, (SELECT GROUP_CONCAT(full_name, '; ') FROM (SELECT he.full_name FROM trip_helpers th JOIN employees he ON he.id=th.employee_id WHERE th.trip_id=t.id ORDER BY th.helper_order, th.id)) AS helper_names FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id LEFT JOIN employees e ON e.id=t.driver_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["ID,Trip Ticket / Waybill,Ref. No.,Type,Date,Client,Route,Asset,Driver,Helpers,Status,Base Rate,Extra Charges,Billable Total"];
   for (const row of rows) {
     lines.push([row.id, row.trip_ticket_no, row.reference_no || "", row.trip_type, row.trip_date, row.client_name || "", `${row.origin || ""} -> ${row.destination || ""}`, row.asset_code || "", row.driver_name || "", row.helper_names || "", row.status, row.base_trip_rate || 0, tripExtraTotal(row), tripBillableTotal(row)].map((value) => `"${String(value).replaceAll('"', '""')}"`).join(","));
@@ -1597,18 +1778,23 @@ async function repairsPage(request, env, user, path) {
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
-  const status = (url.searchParams.get("status") || "").trim();
+  const filters = { status: enumParam(url, "status", REPAIR_STATUSES), asset_id: idParam(url, "asset_id"), supplier_id: idParam(url, "supplier_id"), ...rangeParams(url) };
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const where = repairWhere(query, status);
+  const clauses = [];
+  const filterParams = [];
+  addEqualityFilters(clauses, filterParams, [["r.asset_id", filters.asset_id], ["r.supplier_id", filters.supplier_id]]);
+  addDateRange(clauses, filterParams, "r.repair_date", filters);
+  const where = mergeWhere(repairWhere(query, filters.status), clauses, filterParams);
+  const sort = listSort(url, { date: { sql: "r.repair_date", defaultDir: "desc", tie: "r.id DESC" }, asset: { sql: "a.asset_code", tie: "r.id ASC" }, description: { sql: "r.repair_description", tie: "r.id ASC" }, supplier: { sql: "s.supplier_name", tie: "r.id ASC" }, meter: { sql: "r.meter_value", defaultDir: "desc", tie: "r.id DESC" }, total: { sql: "r.total_cost", defaultDir: "desc", tie: "r.id DESC" }, status: { sql: "r.status", tie: "r.id ASC" }, payable: { sql: "p.reference_no", tie: "r.id ASC" } }, "r.repair_date DESC, r.id DESC");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT r.*, a.asset_code, a.plate_no, s.supplier_name, p.reference_no AS payable_ref FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id LEFT JOIN payables p ON p.linked_repair_id=r.id${where.sql} ORDER BY r.repair_date DESC, r.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const rows = await all(env, `SELECT r.*, a.asset_code, a.plate_no, s.supplier_name, p.reference_no AS payable_ref FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id LEFT JOIN payables p ON p.linked_repair_id=r.id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((row) => `<tr><td>${esc(row.repair_date)}</td><td>${esc(row.asset_code || "")}<small class="cell-detail">${esc(row.plate_no || "")}</small></td><td>${canEdit(user, "Repairs") ? `<a href="/repairs/${row.id}/edit">${esc(row.repair_description)}</a>` : esc(row.repair_description)}</td><td>${esc(row.supplier_name || "")}</td><td>${esc(row.meter_value || "")}</td>${moneyCell(row.total_cost)}<td><span class="status">${esc(row.status)}</span></td><td>${esc(row.payable_ref || "")}</td><td>${canEdit(user, "Repairs") ? `<a href="/repairs/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  if (status) params.set("status", status);
-  const statusOptions = `<select name="status"><option value="">All statuses</option>${REPAIR_STATUSES.map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search repairs">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Repairs") ? `<a class="button" href="/repairs/new">New Repair</a>` : ""} <a class="button secondary" href="${esc(`/repairs/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Asset", "Description", "Supplier", "Meter", "Total Cost", "Status", "Payable", "Actions"], body, { empty: "No repairs found." })}${paginationWithParams("/repairs", params, page, Number(countRow?.total || 0))}`;
+  const params = listParams(url, ["q", "status", "asset_id", "supplier_id", "date_from", "date_to"], { sort });
+  const [assets, suppliers] = await repairChoices(env);
+  const filterMarkup = [selectFilter("status", "Status", REPAIR_STATUSES, filters.status), selectFilter("asset_id", "Asset", assets.map((row) => ({ value: row.id, label: choiceLabel("asset", row) })), filters.asset_id), selectFilter("supplier_id", "Supplier", suppliers.map((row) => ({ value: row.id, label: choiceLabel("supplier", row) })), filters.supplier_id), dateFilter("date_from", "Repair date from", filters.from), dateFilter("date_to", "Repair date to", filters.to)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search repairs", filters: filterMarkup, clearHref: "/repairs", actions: `${canEdit(user, "Repairs") ? `<a class="button" href="/repairs/new">New Repair</a>` : ""} <a class="button secondary" href="${esc(`/repairs/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a>` });
+  const headers = [...sortableHeaders([{ label: "Date", sort: "date" }, { label: "Asset", sort: "asset" }, { label: "Description", sort: "description" }, { label: "Supplier", sort: "supplier" }, { label: "Meter", sort: "meter" }, { label: "Total Cost", sort: "total" }, { label: "Status", sort: "status" }, { label: "Payable", sort: "payable" }], sort, params), "Actions"];
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No repairs found." })}${paginationWithParams("/repairs", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "Repairs", user, path, content }));
 }
 
@@ -1644,8 +1830,14 @@ async function repairExportPage(request, env, user, path) {
   const access = requireView(user, "Repairs");
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
-  const where = repairWhere((url.searchParams.get("q") || "").trim(), (url.searchParams.get("status") || "").trim());
-  const rows = await all(env, `SELECT r.*, a.asset_code, s.supplier_name, p.reference_no AS payable_ref FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id LEFT JOIN payables p ON p.linked_repair_id=r.id${where.sql} ORDER BY r.id`, where.params);
+  const filters = { status: enumParam(url, "status", REPAIR_STATUSES), asset_id: idParam(url, "asset_id"), supplier_id: idParam(url, "supplier_id"), ...rangeParams(url) };
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["r.asset_id", filters.asset_id], ["r.supplier_id", filters.supplier_id]]);
+  addDateRange(clauses, params, "r.repair_date", filters);
+  const where = mergeWhere(repairWhere((url.searchParams.get("q") || "").trim(), filters.status), clauses, params);
+  const sort = listSort(url, { date: { sql: "r.repair_date", defaultDir: "desc", tie: "r.id DESC" }, asset: { sql: "a.asset_code", tie: "r.id ASC" }, description: { sql: "r.repair_description", tie: "r.id ASC" }, supplier: { sql: "s.supplier_name", tie: "r.id ASC" }, meter: { sql: "r.meter_value", defaultDir: "desc", tie: "r.id DESC" }, total: { sql: "r.total_cost", defaultDir: "desc", tie: "r.id DESC" }, status: { sql: "r.status", tie: "r.id ASC" }, payable: { sql: "p.reference_no", tie: "r.id ASC" } }, "r.repair_date DESC, r.id DESC");
+  const rows = await all(env, `SELECT r.*, a.asset_code, s.supplier_name, p.reference_no AS payable_ref FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id LEFT JOIN payables p ON p.linked_repair_id=r.id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["ID,Date,Asset,Description,Supplier,Meter,Parts,Labor,Other,Total Cost,Status,Payable"];
   for (const row of rows) lines.push(quotedCsvRow([row.id, row.repair_date, row.asset_code || "", row.repair_description, row.supplier_name || "", row.meter_value, row.parts_cost, row.labor_cost, row.other_cost, row.total_cost, row.status, row.payable_ref || ""]));
   return csv(lines.join("\n"), "repairs.csv");
@@ -1719,18 +1911,25 @@ async function payablesPage(request, env, user, path) {
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
-  const status = (url.searchParams.get("status") || "").trim();
+  const filters = { status: enumParam(url, "status", PAYABLE_STATUSES), supplier_id: idParam(url, "supplier_id"), source_type: String(url.searchParams.get("source_type") || "").trim(), ...rangeParams(url, "due_from", "due_to") };
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const where = payableWhere(query, status);
+  const sourceTypes = ["Manual", "Repair"];
+  if (!sourceTypes.includes(filters.source_type)) filters.source_type = "";
+  const clauses = [];
+  const filterParams = [];
+  addEqualityFilters(clauses, filterParams, [["p.supplier_id", filters.supplier_id], ["p.source_type", filters.source_type]]);
+  addDateRange(clauses, filterParams, "p.due_date", filters);
+  const where = mergeWhere(payableWhere(query, filters.status), clauses, filterParams);
+  const sort = listSort(url, { date: { sql: "p.payable_date", defaultDir: "desc", tie: "p.id DESC" }, reference: { sql: "p.reference_no", tie: "p.id ASC" }, supplier: { sql: "s.supplier_name", tie: "p.id ASC" }, source: { sql: "p.source_type", tie: "p.id ASC" }, description: { sql: "p.description", tie: "p.id ASC" }, amount: { sql: "p.amount", defaultDir: "desc", tie: "p.id DESC" }, due: { sql: "p.due_date", defaultDir: "desc", tie: "p.id DESC" }, status: { sql: "p.status", tie: "p.id ASC" } }, "p.payable_date DESC, p.id DESC");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql} ORDER BY p.payable_date DESC, p.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const rows = await all(env, `SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((row) => `<tr><td>${esc(row.payable_date)}</td><td>${canEdit(user, "Payables") ? `<a href="/payables/${row.id}/edit">${esc(row.reference_no || `PAY-${row.id}`)}</a>` : esc(row.reference_no || `PAY-${row.id}`)}</td><td>${esc(row.supplier_name || "")}</td><td>${esc(row.source_type || "")}</td><td>${esc(row.description || "")}</td>${moneyCell(row.amount)}<td>${esc(row.due_date || "")}</td><td><span class="status">${esc(row.status)}</span></td><td>${row.linked_repair_id ? `Repair #${esc(row.linked_repair_id)}` : ""}</td><td>${canEdit(user, "Payables") ? `<a href="/payables/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  if (status) params.set("status", status);
-  const statusOptions = `<select name="status"><option value="">All statuses</option>${PAYABLE_STATUSES.map((item) => `<option value="${esc(item)}"${item === status ? " selected" : ""}>${esc(item)}</option>`).join("")}</select>`;
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search payables">${statusOptions}<button>Search</button></form><div>${canEdit(user, "Payables") ? `<a class="button" href="/payables/new">New Payable</a>` : ""} <a class="button secondary" href="${esc(`/payables/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Ref. No.", "Supplier", "Source", "Description", "Amount", "Due", "Status", "Linked Repair", "Actions"], body, { empty: "No payables found." })}${paginationWithParams("/payables", params, page, Number(countRow?.total || 0))}`;
+  const params = listParams(url, ["q", "status", "supplier_id", "source_type", "due_from", "due_to"], { sort });
+  const [suppliers] = await payableChoices(env);
+  const filterMarkup = [selectFilter("status", "Status", PAYABLE_STATUSES, filters.status), selectFilter("supplier_id", "Supplier", suppliers.map((row) => ({ value: row.id, label: choiceLabel("supplier", row) })), filters.supplier_id), selectFilter("source_type", "Source", sourceTypes, filters.source_type), dateFilter("due_from", "Due from", filters.from), dateFilter("due_to", "Due to", filters.to)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search payables", filters: filterMarkup, clearHref: "/payables", actions: `${canEdit(user, "Payables") ? `<a class="button" href="/payables/new">New Payable</a>` : ""} <a class="button secondary" href="${esc(`/payables/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a>` });
+  const headers = [...sortableHeaders([{ label: "Date", sort: "date" }, { label: "Ref. No.", sort: "reference" }, { label: "Supplier", sort: "supplier" }, { label: "Source", sort: "source" }, { label: "Description", sort: "description" }, { label: "Amount", sort: "amount" }, { label: "Due", sort: "due" }, { label: "Status", sort: "status" }, { label: "Linked Repair" }], sort, params), "Actions"];
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No payables found." })}${paginationWithParams("/payables", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "Payables", user, path, content }));
 }
 
@@ -1769,8 +1968,14 @@ async function payableExportPage(request, env, user, path) {
   const access = requireView(user, "Payables");
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
-  const where = payableWhere((url.searchParams.get("q") || "").trim(), (url.searchParams.get("status") || "").trim());
-  const rows = await all(env, `SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql} ORDER BY p.id`, where.params);
+  const filters = { status: enumParam(url, "status", PAYABLE_STATUSES), supplier_id: idParam(url, "supplier_id"), source_type: enumParam(url, "source_type", ["Manual", "Repair"]), ...rangeParams(url, "due_from", "due_to") };
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["p.supplier_id", filters.supplier_id], ["p.source_type", filters.source_type]]);
+  addDateRange(clauses, params, "p.due_date", filters);
+  const where = mergeWhere(payableWhere((url.searchParams.get("q") || "").trim(), filters.status), clauses, params);
+  const sort = listSort(url, { date: { sql: "p.payable_date", defaultDir: "desc", tie: "p.id DESC" }, reference: { sql: "p.reference_no", tie: "p.id ASC" }, supplier: { sql: "s.supplier_name", tie: "p.id ASC" }, source: { sql: "p.source_type", tie: "p.id ASC" }, description: { sql: "p.description", tie: "p.id ASC" }, amount: { sql: "p.amount", defaultDir: "desc", tie: "p.id DESC" }, due: { sql: "p.due_date", defaultDir: "desc", tie: "p.id DESC" }, status: { sql: "p.status", tie: "p.id ASC" } }, "p.payable_date DESC, p.id DESC");
+  const rows = await all(env, `SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["ID,Date,Supplier,Source,Reference No.,Description,Amount,Due Date,Status,Linked Repair"];
   for (const row of rows) lines.push(quotedCsvRow([row.id, row.payable_date, row.supplier_name || "", row.source_type, row.reference_no, row.description, row.amount, row.due_date || "", row.status, row.linked_repair_id || ""]));
   return csv(lines.join("\n"), "payables.csv");
@@ -1848,25 +2053,41 @@ function advanceWhere(query, alias = "v") {
   };
 }
 
+function advanceListFilters(url) {
+  return { employee_id: idParam(url, "employee_id"), status: enumParam(url, "status", ADVANCE_STATUSES), ...rangeParams(url) };
+}
+
 async function advancesListContent(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
+  const filters = advanceListFilters(url);
   const valePage = Math.max(1, Number(url.searchParams.get("vale_page") || 1) || 1);
   const cashPage = Math.max(1, Number(url.searchParams.get("cash_page") || 1) || 1);
-  const valeWhere = advanceWhere(query, "v");
-  const cashWhere = advanceWhere(query, "c");
+  const filterClauses = [];
+  const filterParams = [];
+  addEqualityFilters(filterClauses, filterParams, [["employee_id", filters.employee_id], ["status", filters.status]]);
+  addDateRange(filterClauses, filterParams, "date_granted", filters);
+  const valeWhere = mergeWhere(advanceWhere(query, "v"), filterClauses.map((clause) => clause.replace(/^(employee_id|status|date_granted)/, "v.$1")), filterParams);
+  const cashWhere = mergeWhere(advanceWhere(query, "c"), filterClauses.map((clause) => clause.replace(/^(employee_id|status|date_granted)/, "c.$1")), filterParams);
+  const valeSort = listSort(url, { employee: { sql: "e.full_name", tie: "v.id ASC" }, date: { sql: "v.date_granted", defaultDir: "desc", tie: "v.id DESC" }, amount: { sql: "v.amount", defaultDir: "desc", tie: "v.id DESC" }, installment: { sql: "v.installment_amount", defaultDir: "desc", tie: "v.id DESC" }, balance: { sql: "v.balance", defaultDir: "desc", tie: "v.id DESC" }, status: { sql: "v.status", tie: "v.id ASC" } }, "v.date_granted DESC, v.id DESC", { sortName: "vale_sort", dirName: "vale_dir" });
+  const cashSort = listSort(url, { employee: { sql: "e.full_name", tie: "c.id ASC" }, date: { sql: "c.date_granted", defaultDir: "desc", tie: "c.id DESC" }, amount: { sql: "c.amount", defaultDir: "desc", tie: "c.id DESC" }, balance: { sql: "c.balance", defaultDir: "desc", tie: "c.id DESC" }, applied: { sql: "c.applied", tie: "c.id ASC" }, status: { sql: "c.status", tie: "c.id ASC" } }, "c.date_granted DESC, c.id DESC", { sortName: "cash_sort", dirName: "cash_dir" });
   const [valeCount, cashCount, valeRows, cashRows] = await Promise.all([
     first(env, `SELECT COUNT(*) AS total FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id${valeWhere.sql}`, valeWhere.params),
     first(env, `SELECT COUNT(*) AS total FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id${cashWhere.sql}`, cashWhere.params),
-    all(env, `SELECT v.*, e.full_name AS employee_name, e.employee_code FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id${valeWhere.sql} ORDER BY v.date_granted DESC, v.id DESC LIMIT 25 OFFSET ?`, [...valeWhere.params, (valePage - 1) * 25]),
-    all(env, `SELECT c.*, e.full_name AS employee_name, e.employee_code FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id${cashWhere.sql} ORDER BY c.date_granted DESC, c.id DESC LIMIT 25 OFFSET ?`, [...cashWhere.params, (cashPage - 1) * 25]),
+    all(env, `SELECT v.*, e.full_name AS employee_name, e.employee_code FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id${valeWhere.sql} ORDER BY ${valeSort.order} LIMIT 25 OFFSET ?`, [...valeWhere.params, (valePage - 1) * 25]),
+    all(env, `SELECT c.*, e.full_name AS employee_name, e.employee_code FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id${cashWhere.sql} ORDER BY ${cashSort.order} LIMIT 25 OFFSET ?`, [...cashWhere.params, (cashPage - 1) * 25]),
   ]);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search advances"><button>Search</button></form><div>${canEdit(user, "Vale / Cash Advance") ? `<a class="button" href="/advances/vale/new">New Vale</a> <a class="button" href="/advances/cash/new">New Cash Advance</a>` : ""}</div></div>`;
+  const params = listParams(url, ["q", "employee_id", "status", "date_from", "date_to"]);
+  if (valeSort.key) { params.set("vale_sort", valeSort.key); params.set("vale_dir", valeSort.dir); }
+  if (cashSort.key) { params.set("cash_sort", cashSort.key); params.set("cash_dir", cashSort.dir); }
+  const employees = await all(env, "SELECT id,employee_code,full_name,employee_type FROM employees WHERE active=1 ORDER BY full_name");
+  const filterMarkup = [selectFilter("employee_id", "Employee", employees.map((row) => ({ value: row.id, label: choiceLabel("employee", row) })), filters.employee_id), selectFilter("status", "Status", ADVANCE_STATUSES, filters.status), dateFilter("date_from", "Date from", filters.from), dateFilter("date_to", "Date to", filters.to)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search advances", filters: filterMarkup, clearHref: "/advances", actions: canEdit(user, "Vale / Cash Advance") ? `<a class="button" href="/advances/vale/new">New Vale</a> <a class="button" href="/advances/cash/new">New Cash Advance</a>` : "" });
   const valeBody = valeRows.map((row) => `<tr><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/vale/${row.id}/edit">${esc(row.employee_name || "")}</a>` : esc(row.employee_name || "")}</td><td>${esc(row.date_granted)}</td>${moneyCell(row.amount)}${moneyCell(row.installment_amount)}${moneyCell(row.balance)}<td><span class="status">${esc(row.status)}</span></td><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/vale/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
   const cashBody = cashRows.map((row) => `<tr><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/cash/${row.id}/edit">${esc(row.employee_name || "")}</a>` : esc(row.employee_name || "")}</td><td>${esc(row.date_granted)}</td>${moneyCell(row.amount)}${moneyCell(row.balance)}<td>${row.applied ? "Yes" : "No"}</td><td><span class="status">${esc(row.status)}</span></td><td>${canEdit(user, "Vale / Cash Advance") ? `<a href="/advances/cash/${row.id}/edit">Edit</a>` : `<span class="muted">Read only</span>`}</td></tr>`);
-  return `${messagePanel(url)}<section class="panel">${toolbar}</section><section class="panel"><div class="toolbar"><h3>Vale</h3><a class="button secondary" href="${esc(`/advances/vale/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Vale CSV</a></div>${table(["Employee", "Date", "Amount", "Installment", "Balance", "Status", "Actions"], valeBody, { empty: "No vale records found.", bare: true })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["cash_page", String(cashPage)]]), "vale_page", valePage, Number(valeCount?.total || 0))}</section><section class="panel"><div class="toolbar"><h3>Cash Advance</h3><a class="button secondary" href="${esc(`/advances/cash/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Cash CSV</a></div>${table(["Employee", "Date", "Amount", "Balance", "Applied", "Status", "Actions"], cashBody, { empty: "No cash advances found.", bare: true })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["vale_page", String(valePage)]]), "cash_page", cashPage, Number(cashCount?.total || 0))}</section>`;
+  const valeHeaders = [...sortableHeaders([{ label: "Employee", sort: "employee" }, { label: "Date", sort: "date" }, { label: "Amount", sort: "amount" }, { label: "Installment", sort: "installment" }, { label: "Balance", sort: "balance" }, { label: "Status", sort: "status" }], valeSort, params, { sortName: "vale_sort", dirName: "vale_dir" }), "Actions"];
+  const cashHeaders = [...sortableHeaders([{ label: "Employee", sort: "employee" }, { label: "Date", sort: "date" }, { label: "Amount", sort: "amount" }, { label: "Balance", sort: "balance" }, { label: "Applied", sort: "applied" }, { label: "Status", sort: "status" }], cashSort, params, { sortName: "cash_sort", dirName: "cash_dir" }), "Actions"];
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section><section class="panel"><div class="toolbar"><h3>Vale</h3><a class="button secondary" href="${esc(`/advances/vale/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Vale CSV</a></div>${table(valeHeaders, valeBody, { empty: "No vale records found.", bare: true })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["cash_page", String(cashPage)]]), "vale_page", valePage, Number(valeCount?.total || 0))}</section><section class="panel"><div class="toolbar"><h3>Cash Advance</h3><a class="button secondary" href="${esc(`/advances/cash/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export Cash CSV</a></div>${table(cashHeaders, cashBody, { empty: "No cash advances found.", bare: true })}${paginationWithPageParam("/advances", new URLSearchParams([...params, ["vale_page", String(valePage)]]), "cash_page", cashPage, Number(cashCount?.total || 0))}</section>`;
 }
 
 async function advancesPage(request, env, user, path) {
@@ -1915,8 +2136,14 @@ async function advanceExportPage(request, env, user, path, type) {
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
   const alias = type === "vale" ? "v" : "c";
-  const where = advanceWhere((url.searchParams.get("q") || "").trim(), alias);
-  const rows = await all(env, `SELECT ${alias}.*, e.full_name AS employee_name, e.employee_code FROM ${spec.table} ${alias} LEFT JOIN employees e ON e.id=${alias}.employee_id${where.sql} ORDER BY ${alias}.id`, where.params);
+  const filters = advanceListFilters(url);
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [[`${alias}.employee_id`, filters.employee_id], [`${alias}.status`, filters.status]]);
+  addDateRange(clauses, params, `${alias}.date_granted`, filters);
+  const where = mergeWhere(advanceWhere((url.searchParams.get("q") || "").trim(), alias), clauses, params);
+  const sort = listSort(url, type === "vale" ? { employee: { sql: "e.full_name", tie: "v.id ASC" }, date: { sql: "v.date_granted", defaultDir: "desc", tie: "v.id DESC" }, amount: { sql: "v.amount", defaultDir: "desc", tie: "v.id DESC" }, installment: { sql: "v.installment_amount", defaultDir: "desc", tie: "v.id DESC" }, balance: { sql: "v.balance", defaultDir: "desc", tie: "v.id DESC" }, status: { sql: "v.status", tie: "v.id ASC" } } : { employee: { sql: "e.full_name", tie: "c.id ASC" }, date: { sql: "c.date_granted", defaultDir: "desc", tie: "c.id DESC" }, amount: { sql: "c.amount", defaultDir: "desc", tie: "c.id DESC" }, balance: { sql: "c.balance", defaultDir: "desc", tie: "c.id DESC" }, applied: { sql: "c.applied", tie: "c.id ASC" }, status: { sql: "c.status", tie: "c.id ASC" } }, `${alias}.date_granted DESC, ${alias}.id DESC`, { sortName: type === "vale" ? "vale_sort" : "cash_sort", dirName: type === "vale" ? "vale_dir" : "cash_dir" });
+  const rows = await all(env, `SELECT ${alias}.*, e.full_name AS employee_name, e.employee_code FROM ${spec.table} ${alias} LEFT JOIN employees e ON e.id=${alias}.employee_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = [type === "vale" ? "ID,Employee,Date,Amount,Installment Amount,Balance,Status" : "ID,Employee,Date,Amount,Balance,Applied,Status"];
   for (const row of rows) {
     lines.push(type === "vale"
@@ -2262,14 +2489,22 @@ async function payrollListPage(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const where = payrollWhere(query);
+  const filters = { employee_id: idParam(url, "employee_id"), employee_type: enumParam(url, "employee_type", ["Driver", "Helper", "Operator", "Mechanic"]), payroll_basis: enumParam(url, "payroll_basis", ["Per Trip", "Per Day", "Manual"]), ...rangeParams(url) };
+  const clauses = [];
+  const filterParams = [];
+  addEqualityFilters(clauses, filterParams, [["p.employee_id", filters.employee_id], ["p.employee_type", filters.employee_type], ["p.payroll_basis", filters.payroll_basis]]);
+  addDateRange(clauses, filterParams, "p.pay_date", filters);
+  const where = mergeWhere(payrollWhere(query), clauses, filterParams);
+  const sort = listSort(url, { date: { sql: "p.pay_date", defaultDir: "desc", tie: "p.id DESC" }, employee: { sql: "e.full_name", tie: "p.id ASC" }, type: { sql: "p.employee_type", tie: "p.id ASC" }, trips: { sql: "p.trips_count", defaultDir: "desc", tie: "p.id DESC" }, days: { sql: "p.days_count", defaultDir: "desc", tie: "p.id DESC" }, gross: { sql: "p.gross_pay", defaultDir: "desc", tie: "p.id DESC" }, additional: { sql: "p.additional_pay", defaultDir: "desc", tie: "p.id DESC" }, deductions: { sql: "(p.vale_deduction+p.cash_advance_deduction+p.sss+p.philhealth+p.pagibig+p.withholding_tax+p.change_deduction+p.other_deduction)", defaultDir: "desc", tie: "p.id DESC" }, net: { sql: "p.net_pay", defaultDir: "desc", tie: "p.id DESC" } }, "p.pay_date DESC, p.id DESC");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT p.*, e.full_name, e.employee_code FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql} ORDER BY p.pay_date DESC, p.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const rows = await all(env, `SELECT p.*, e.full_name, e.employee_code FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((row) => `<tr><td>${esc(row.pay_date)}</td><td>${esc(row.period_from)} – ${esc(row.period_to)}</td><td><a href="/payroll/${row.id}">${esc(row.full_name || "")}</a><small class="cell-detail">${esc(row.employee_code || "")}</small></td><td>${esc(row.employee_type)}<small class="cell-detail">${esc(row.payroll_basis)}</small></td><td>${esc(row.trips_count)}</td><td>${esc(row.days_count)}</td>${moneyCell(row.gross_pay)}${moneyCell(row.additional_pay)}${moneyCell(deductionTotal(row))}<td class="num"><strong>${esc(peso(row.net_pay))}</strong></td><td><a href="/payroll/${row.id}">View</a> <a href="/payroll/${row.id}/print" target="_blank">Print</a></td></tr>`);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search employee, type, or remarks"><button>Search</button></form><div>${canEdit(user, "Payroll") ? `<a class="button" href="/payroll/new">New Payroll</a>` : ""} <a class="button secondary" href="${esc(`/payroll/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Pay Date", "Period", "Employee", "Type / Basis", "Trips", "Days", "Gross", "Additional", "Deductions", "Net", "Actions"], body, { empty: "No payroll entries found." })}${paginationWithParams("/payroll", params, page, Number(countRow?.total || 0))}`;
+  const params = listParams(url, ["q", "employee_id", "employee_type", "payroll_basis", "date_from", "date_to"], { sort });
+  const employees = await payrollEmployees(env);
+  const filterMarkup = [selectFilter("employee_id", "Employee", employees.map((row) => ({ value: row.id, label: choiceLabel("employee", row) })), filters.employee_id), selectFilter("employee_type", "Employee type", ["Driver", "Helper", "Operator", "Mechanic"], filters.employee_type), selectFilter("payroll_basis", "Payroll basis", ["Per Trip", "Per Day", "Manual"], filters.payroll_basis), dateFilter("date_from", "Pay date from", filters.from), dateFilter("date_to", "Pay date to", filters.to)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search employee, type, or remarks", filters: filterMarkup, clearHref: "/payroll", actions: `${canEdit(user, "Payroll") ? `<a class="button" href="/payroll/new">New Payroll</a>` : ""} <a class="button secondary" href="${esc(`/payroll/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a>` });
+  const headers = [...sortableHeaders([{ label: "Pay Date", sort: "date" }, { label: "Period" }, { label: "Employee", sort: "employee" }, { label: "Type / Basis", sort: "type" }, { label: "Trips", sort: "trips" }, { label: "Days", sort: "days" }, { label: "Gross", sort: "gross" }, { label: "Additional", sort: "additional" }, { label: "Deductions", sort: "deductions" }, { label: "Net", sort: "net" }], sort, params), "Actions"];
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No payroll entries found." })}${paginationWithParams("/payroll", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "Payroll", user, path, content }));
 }
 
@@ -2378,8 +2613,14 @@ async function payrollExportPage(request, env, user, path) {
   const access = requireView(user, "Payroll");
   if (access) return errorResponse(access, user, path);
   const url = new URL(request.url);
-  const where = payrollWhere((url.searchParams.get("q") || "").trim());
-  const rows = await all(env, `SELECT p.*, e.employee_code, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql} ORDER BY p.pay_date DESC, p.id DESC`, where.params);
+  const filters = { employee_id: idParam(url, "employee_id"), employee_type: enumParam(url, "employee_type", ["Driver", "Helper", "Operator", "Mechanic"]), payroll_basis: enumParam(url, "payroll_basis", ["Per Trip", "Per Day", "Manual"]), ...rangeParams(url) };
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["p.employee_id", filters.employee_id], ["p.employee_type", filters.employee_type], ["p.payroll_basis", filters.payroll_basis]]);
+  addDateRange(clauses, params, "p.pay_date", filters);
+  const where = mergeWhere(payrollWhere((url.searchParams.get("q") || "").trim()), clauses, params);
+  const sort = listSort(url, { date: { sql: "p.pay_date", defaultDir: "desc", tie: "p.id DESC" }, employee: { sql: "e.full_name", tie: "p.id ASC" }, type: { sql: "p.employee_type", tie: "p.id ASC" }, trips: { sql: "p.trips_count", defaultDir: "desc", tie: "p.id DESC" }, days: { sql: "p.days_count", defaultDir: "desc", tie: "p.id DESC" }, gross: { sql: "p.gross_pay", defaultDir: "desc", tie: "p.id DESC" }, additional: { sql: "p.additional_pay", defaultDir: "desc", tie: "p.id DESC" }, deductions: { sql: "(p.vale_deduction+p.cash_advance_deduction+p.sss+p.philhealth+p.pagibig+p.withholding_tax+p.change_deduction+p.other_deduction)", defaultDir: "desc", tie: "p.id DESC" }, net: { sql: "p.net_pay", defaultDir: "desc", tie: "p.id DESC" } }, "p.pay_date DESC, p.id DESC");
+  const rows = await all(env, `SELECT p.*, e.employee_code, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["Payroll ID,Pay Date,Period From,Period To,Employee Code,Employee Name,Employee Type,Gross Pay,Additional Pay,Deductions,Net Pay,Remarks"];
   for (const row of rows) lines.push(quotedCsvRow([row.id, row.pay_date, row.period_from, row.period_to, row.employee_code || "", row.full_name || "", row.employee_type, row.gross_pay, row.additional_pay, deductionTotal(row), row.net_pay, row.remarks || ""]));
   return csv(lines.join("\n"), "payroll.csv");
@@ -2593,19 +2834,27 @@ async function billingListPage(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  const where = billingWhere(query);
+  const filters = { client_id: idParam(url, "client_id"), status: enumParam(url, "status", ["Open", "Partially Paid", "Paid"]), ...rangeParams(url) };
+  const clauses = [];
+  const filterParams = [];
+  addEqualityFilters(clauses, filterParams, [["b.client_id", filters.client_id], ["b.status", filters.status]]);
+  addDateRange(clauses, filterParams, "b.billing_date", filters);
+  const where = mergeWhere(billingWhere(query), clauses, filterParams);
+  const sort = listSort(url, { billing: { sql: "b.billing_no", tie: "b.id ASC" }, date: { sql: "b.billing_date", defaultDir: "desc", tie: "b.id DESC" }, client: { sql: "c.client_name", tie: "b.id ASC" }, total: { sql: "b.grand_total", defaultDir: "desc", tie: "b.id DESC" }, paid: { sql: "paid_amount", defaultDir: "desc", tie: "b.id DESC" }, balance: { sql: "(b.grand_total-COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0)", defaultDir: "desc", tie: "b.id DESC" }, status: { sql: "b.status", tie: "b.id ASC" } }, "b.billing_date DESC, b.id DESC");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql} ORDER BY b.billing_date DESC, b.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const rows = await all(env, `SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((row) => {
     const paid = numeric(row.paid_amount);
     const balance = outstandingBalance(row.grand_total, paid);
     const status = billingStatus(row.grand_total, paid);
     return `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.billing_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.period_from || "")} – ${esc(row.period_to || "")}</td>${moneyCell(row.grand_total)}${moneyCell(paid)}${moneyCell(balance)}<td><span class="status">${esc(status)}</span></td><td><a href="/billing/${row.id}">View</a> <a href="/billing/${row.id}/print" target="_blank">Print</a></td></tr>`;
   });
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search billing"><button>Search</button></form><div><a class="button secondary" href="/billing/soa">Statement of Account</a> ${canEdit(user, "Billing") ? `<a class="button" href="/billing/new">New Billing</a>` : ""} <a class="button secondary" href="${esc(`/billing/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Billing No.", "Date", "Client", "Period", "Grand Total", "Paid", "Balance", "Status", "Actions"], body, { empty: "No billing statements found." })}${paginationWithParams("/billing", params, page, Number(countRow?.total || 0))}`;
+  const params = listParams(url, ["q", "client_id", "status", "date_from", "date_to"], { sort });
+  const clients = await billingClients(env);
+  const filterMarkup = [selectFilter("client_id", "Client", clients.map((row) => ({ value: row.id, label: choiceLabel("client", row) })), filters.client_id), selectFilter("status", "Status", ["Open", "Partially Paid", "Paid"], filters.status), dateFilter("date_from", "Billing date from", filters.from), dateFilter("date_to", "Billing date to", filters.to)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search billing", filters: filterMarkup, clearHref: "/billing", actions: `<a class="button secondary" href="/billing/soa">Statement of Account</a> ${canEdit(user, "Billing") ? `<a class="button" href="/billing/new">New Billing</a>` : ""} <a class="button secondary" href="${esc(`/billing/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a>` });
+  const headers = [...sortableHeaders([{ label: "Billing No.", sort: "billing" }, { label: "Date", sort: "date" }, { label: "Client", sort: "client" }, { label: "Period" }, { label: "Grand Total", sort: "total" }, { label: "Paid", sort: "paid" }, { label: "Balance", sort: "balance" }, { label: "Status", sort: "status" }], sort, params), "Actions"];
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No billing statements found." })}${paginationWithParams("/billing", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "Billing", user, path, content }));
 }
 
@@ -2656,8 +2905,15 @@ async function billingDeletePage(request, env, user, path, id) {
 async function billingExportPage(request, env, user, path) {
   const access = requireView(user, "Billing");
   if (access) return errorResponse(access, user, path);
-  const where = billingWhere((new URL(request.url).searchParams.get("q") || "").trim());
-  const rows = await all(env, `SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql} ORDER BY b.billing_date DESC, b.id DESC`, where.params);
+  const url = new URL(request.url);
+  const filters = { client_id: idParam(url, "client_id"), status: enumParam(url, "status", ["Open", "Partially Paid", "Paid"]), ...rangeParams(url) };
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["b.client_id", filters.client_id], ["b.status", filters.status]]);
+  addDateRange(clauses, params, "b.billing_date", filters);
+  const where = mergeWhere(billingWhere((url.searchParams.get("q") || "").trim()), clauses, params);
+  const sort = listSort(url, { billing: { sql: "b.billing_no", tie: "b.id ASC" }, date: { sql: "b.billing_date", defaultDir: "desc", tie: "b.id DESC" }, client: { sql: "c.client_name", tie: "b.id ASC" }, total: { sql: "b.grand_total", defaultDir: "desc", tie: "b.id DESC" }, paid: { sql: "paid_amount", defaultDir: "desc", tie: "b.id DESC" }, balance: { sql: "(b.grand_total-COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0)", defaultDir: "desc", tie: "b.id DESC" }, status: { sql: "b.status", tie: "b.id ASC" } }, "b.billing_date DESC, b.id DESC");
+  const rows = await all(env, `SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["Billing No.,Billing Date,Client,Period From,Period To,Gross,VAT,Additions,Deductions,Grand Total,Paid,Balance,Status,Notes"];
   for (const row of rows) {
     const paid = numeric(row.paid_amount);
@@ -2840,14 +3096,24 @@ async function collectionsListContent(request, env, user, path) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
-  const params = new URLSearchParams();
-  if (query) params.set("q", query);
-  const where = collectionWhere(query);
+  const filters = { client_id: idParam(url, "client_id"), billing_id: idParam(url, "billing_id"), payment_method: String(url.searchParams.get("payment_method") || "").trim(), ...rangeParams(url) };
+  const methods = ["Cash", "Check", "Bank Transfer", "Online Transfer", "Other"];
+  if (!methods.includes(filters.payment_method)) filters.payment_method = "";
+  const clauses = [];
+  const filterParams = [];
+  addEqualityFilters(clauses, filterParams, [["co.client_id", filters.client_id], ["co.billing_id", filters.billing_id], ["co.payment_method", filters.payment_method]]);
+  addDateRange(clauses, filterParams, "co.collection_date", filters);
+  const where = mergeWhere(collectionWhere(query), clauses, filterParams);
+  const sort = listSort(url, { date: { sql: "co.collection_date", defaultDir: "desc", tie: "co.id DESC" }, billing: { sql: "b.billing_no", tie: "co.id ASC" }, client: { sql: "c.client_name", tie: "co.id ASC" }, amount: { sql: "co.amount_paid", defaultDir: "desc", tie: "co.id DESC" }, reference: { sql: "co.reference_no", tie: "co.id ASC" }, method: { sql: "co.payment_method", tie: "co.id ASC" } }, "co.collection_date DESC, co.id DESC");
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql}`, where.params);
-  const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY co.collection_date DESC, co.id DESC LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY ${sort.order} LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
   const body = rows.map((row) => `<tr><td>${esc(row.collection_date)}</td><td><a href="/billing/${row.billing_id}">${esc(row.billing_no || "")}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.amount_paid)}<td>${esc(row.reference_no || "")}</td><td>${esc(row.payment_method || "")}</td><td>${canEdit(user, "Collections") ? `<a href="/collections/${row.id}/edit">Edit</a>` : "—"}</td></tr>`);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(query)}" placeholder="Search collections"><button>Search</button></form><div>${canEdit(user, "Collections") ? `<a class="button" href="/collections/new">New Collection</a>` : ""} <a class="button secondary" href="${esc(`/collections/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a></div></div>`;
-  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Date", "Billing No.", "Client", "Amount", "Reference", "Method", "Actions"], body, { empty: "No collections found." })}${paginationWithParams("/collections", params, page, Number(countRow?.total || 0))}`;
+  const params = listParams(url, ["q", "client_id", "billing_id", "payment_method", "date_from", "date_to"], { sort });
+  const [clients, billings] = await Promise.all([billingClients(env), billingChoices(env)]);
+  const filterMarkup = [selectFilter("client_id", "Client", clients.map((row) => ({ value: row.id, label: choiceLabel("client", row) })), filters.client_id), selectFilter("billing_id", "Billing", billings.map((row) => ({ value: row.id, label: choiceLabel("billing", row) })), filters.billing_id), selectFilter("payment_method", "Method", methods, filters.payment_method), dateFilter("date_from", "Date from", filters.from), dateFilter("date_to", "Date to", filters.to)].join("");
+  const toolbar = listToolbar({ query, placeholder: "Search collections", filters: filterMarkup, clearHref: "/collections", actions: `${canEdit(user, "Collections") ? `<a class="button" href="/collections/new">New Collection</a>` : ""} <a class="button secondary" href="${esc(`/collections/export.csv${params.toString() ? `?${params.toString()}` : ""}`)}">Export CSV</a>` });
+  const headers = [...sortableHeaders([{ label: "Date", sort: "date" }, { label: "Billing No.", sort: "billing" }, { label: "Client", sort: "client" }, { label: "Amount", sort: "amount" }, { label: "Reference", sort: "reference" }, { label: "Method", sort: "method" }], sort, params), "Actions"];
+  return `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No collections found." })}${paginationWithParams("/collections", params, page, Number(countRow?.total || 0))}`;
 }
 
 async function collectionsPage(request, env, user, path) {
@@ -2891,8 +3157,15 @@ async function collectionDeletePage(request, env, user, path, id) {
 async function collectionExportPage(request, env, user, path) {
   const access = requireView(user, "Collections");
   if (access) return errorResponse(access, user, path);
-  const where = collectionWhere((new URL(request.url).searchParams.get("q") || "").trim());
-  const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY co.collection_date DESC, co.id DESC`, where.params);
+  const url = new URL(request.url);
+  const filters = { client_id: idParam(url, "client_id"), billing_id: idParam(url, "billing_id"), payment_method: enumParam(url, "payment_method", ["Cash", "Check", "Bank Transfer", "Online Transfer", "Other"]), ...rangeParams(url) };
+  const clauses = [];
+  const params = [];
+  addEqualityFilters(clauses, params, [["co.client_id", filters.client_id], ["co.billing_id", filters.billing_id], ["co.payment_method", filters.payment_method]]);
+  addDateRange(clauses, params, "co.collection_date", filters);
+  const where = mergeWhere(collectionWhere((url.searchParams.get("q") || "").trim()), clauses, params);
+  const sort = listSort(url, { date: { sql: "co.collection_date", defaultDir: "desc", tie: "co.id DESC" }, billing: { sql: "b.billing_no", tie: "co.id ASC" }, client: { sql: "c.client_name", tie: "co.id ASC" }, amount: { sql: "co.amount_paid", defaultDir: "desc", tie: "co.id DESC" }, reference: { sql: "co.reference_no", tie: "co.id ASC" }, method: { sql: "co.payment_method", tie: "co.id ASC" } }, "co.collection_date DESC, co.id DESC");
+  const rows = await all(env, `SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id${where.sql} ORDER BY ${sort.order}`, where.params);
   const lines = ["Collection ID,Collection Date,Billing No.,Client,Amount Paid,Reference No.,Payment Method,Notes"];
   for (const row of rows) lines.push(quotedCsvRow([row.id, row.collection_date, row.billing_no || "", row.client_name || "", row.amount_paid, row.reference_no || "", row.payment_method || "", row.notes || ""]));
   return csv(lines.join("\n"), "collections.csv");
@@ -3466,13 +3739,23 @@ function userWhere(filters) {
   return { sql: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", params };
 }
 
-function userParams(filters) {
+function userParams(filters, sort = null) {
   const params = new URLSearchParams();
   if (filters.q) params.set("q", filters.q);
   if (filters.role) params.set("role", filters.role);
   if (filters.active) params.set("active", filters.active);
+  if (sort?.key) params.set("sort", sort.key);
+  if (sort?.dir) params.set("dir", sort.dir);
   return params;
 }
+
+const USER_SORTS = {
+  username: { sql: "username", label: "Username" },
+  name: { sql: "last_name, first_name", label: "Name" },
+  email: { sql: "email", label: "Email" },
+  role: { sql: "role", label: "Role" },
+  active: { sql: "active", label: "Status" },
+};
 
 function userFormValues(data, row = {}) {
   const role = USER_ROLE_LABELS[data.role] ? data.role : (row.role || "viewer");
@@ -3536,14 +3819,18 @@ async function usersPage(request, env, user, path) {
   const filters = userFilters(url);
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
   const where = userWhere(filters);
+  const sort = listSort(url, USER_SORTS, "username", { sortName: "sort", dirName: "dir" });
   const countRow = await first(env, `SELECT COUNT(*) AS total FROM users${where.sql}`, where.params);
-  const rows = await all(env, `SELECT id, username, first_name, last_name, email, role, active, created_at FROM users${where.sql} ORDER BY username, id LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
-  const params = userParams(filters);
+  const rows = await all(env, `SELECT id, username, first_name, last_name, email, role, active, created_at FROM users${where.sql} ORDER BY ${sort.order}, id LIMIT 25 OFFSET ?`, [...where.params, (page - 1) * 25]);
+  const params = userParams(filters, sort);
   const roleOptions = `<option value="">All roles</option>${USER_ROLES.map(([value, label]) => `<option value="${esc(value)}"${filters.role === value ? " selected" : ""}>${esc(label)}</option>`).join("")}`;
   const activeOptions = `<option value="">All users</option><option value="active"${filters.active === "active" ? " selected" : ""}>Active</option><option value="inactive"${filters.active === "inactive" ? " selected" : ""}>Inactive</option>`;
   const body = rows.map((row) => `<tr><td><a href="/users/${row.id}/edit">${esc(row.username)}</a></td><td>${esc(`${row.first_name || ""} ${row.last_name || ""}`.trim())}</td><td>${esc(row.email || "")}</td><td>${esc(USER_ROLE_LABELS[row.role] || row.role)}</td><td>${Number(row.active) ? "Active" : "Inactive"}</td><td><a href="/users/${row.id}/edit">Edit</a> <a href="/users/${row.id}/password">Password</a></td></tr>`);
-  const toolbar = `<div class="toolbar"><form><input name="q" value="${esc(filters.q)}" placeholder="Search users"><select name="role">${roleOptions}</select><select name="active">${activeOptions}</select><button>Search</button></form><div><a class="button" href="/users/new">New User</a> <a class="button secondary" href="/users/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a></div></div>`;
-  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(["Username", "Name", "Email", "Role", "Status", "Actions"], body, { empty: "No users found." })}${paginationWithParams("/users", params, page, Number(countRow?.total || 0))}`;
+  const toolbar = `<div class="toolbar list-toolbar"><form method="get" class="list-query-form"><div class="list-search-row"><input name="q" value="${esc(filters.q)}" placeholder="Search users"><button>Apply</button><a class="button secondary" href="/users">Clear</a></div><details class="list-filters" open><summary>Filters</summary><div class="list-filter-grid"><label>Role<select name="role">${roleOptions}</select></label><label>Status<select name="active">${activeOptions}</select></label></div></details></form><div><a class="button" href="/users/new">New User</a> <a class="button secondary" href="/users/export.csv${params.toString() ? `?${params.toString()}` : ""}">Export CSV</a></div></div>`;
+  const headers = sortableHeaders([
+    { key: "username", label: "Username" }, { key: "name", label: "Name" }, { key: "email", label: "Email" }, { key: "role", label: "Role" }, { key: "active", label: "Status" }, { label: "Actions" },
+  ], sort, params);
+  const content = `${messagePanel(url)}<section class="panel">${toolbar}</section>${table(headers, body, { empty: "No users found." })}${paginationWithParams("/users", params, page, Number(countRow?.total || 0))}`;
   return html(layout({ title: "User Management", user, path, content }));
 }
 
@@ -3612,7 +3899,8 @@ async function usersExportPage(request, env, user, path) {
   if (access) return errorResponse(access, user, path);
   const filters = userFilters(new URL(request.url));
   const where = userWhere(filters);
-  const rows = await all(env, `SELECT username, first_name, last_name, email, role, active FROM users${where.sql} ORDER BY username, id`, where.params);
+  const sort = listSort(new URL(request.url), USER_SORTS, "username");
+  const rows = await all(env, `SELECT username, first_name, last_name, email, role, active FROM users${where.sql} ORDER BY ${sort.order}, id`, where.params);
   const lines = [quotedCsvRow(["Username", "First Name", "Last Name", "Email", "Role", "Active"])];
   for (const row of rows) lines.push(quotedCsvRow([row.username, row.first_name, row.last_name, row.email, USER_ROLE_LABELS[row.role] || row.role, Number(row.active) ? "Active" : "Inactive"]));
   return csv(lines.join("\n"), "users.csv");

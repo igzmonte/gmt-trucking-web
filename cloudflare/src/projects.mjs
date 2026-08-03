@@ -75,6 +75,45 @@ function pagination(base, params, page, total) {
   return `<nav class="pagination">${page > 1 ? make(page - 1, "Previous") : ""}<span>Page ${page} of ${pages}</span>${page < pages ? make(page + 1, "Next") : ""}</nav>`;
 }
 
+function listSort(url, options, fallback) {
+  const requested = url.searchParams.get("sort");
+  const key = options[requested] ? requested : fallback;
+  const dir = url.searchParams.get("dir") === "asc" ? "asc" : "desc";
+  return { key, dir, order: `${options[key].sql} ${dir.toUpperCase()}` };
+}
+
+function listParams(url, names, sort) {
+  const params = new URLSearchParams();
+  for (const name of names) {
+    const value = url.searchParams.get(name);
+    if (value) params.set(name, value);
+  }
+  if (sort?.key) params.set("sort", sort.key);
+  if (sort?.dir) params.set("dir", sort.dir);
+  return params;
+}
+
+function sortableHeaders(columns, sort, params) {
+  return columns.map((column) => {
+    if (!column.key) return column.label;
+    const next = new URLSearchParams(params);
+    const current = sort.key === column.key;
+    next.set("sort", column.key);
+    next.set("dir", current && sort.dir === "asc" ? "desc" : "asc");
+    next.delete("page");
+    const indicator = current ? ` <span class="sort-indicator" aria-hidden="true">${sort.dir === "asc" ? "▲" : "▼"}</span>` : "";
+    return { html: `<a class="sort-link${current ? " is-sorted" : ""}" href="?${next.toString()}" aria-label="Sort by ${esc(column.label)}${current ? `, currently ${sort.dir === "asc" ? "ascending" : "descending"}` : ""}">${esc(column.label)}${indicator}</a>` };
+  });
+}
+
+function selectFilter(name, label, options, selected) {
+  return `<label>${esc(label)}<select name="${esc(name)}"><option value="">All</option>${options.map(([value, text]) => `<option value="${esc(value)}"${String(value) === String(selected) ? " selected" : ""}>${esc(text)}</option>`).join("")}</select></label>`;
+}
+
+function dateFilter(name, label, value) {
+  return `<label>${esc(label)}<input type="date" name="${esc(name)}" value="${esc(value || "")}"></label>`;
+}
+
 function browserJson(value) {
   return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e").replaceAll("&", "\\u0026");
 }
@@ -341,7 +380,12 @@ async function projectList(request, env, user, path) {
   if (access) return fail(access, user, path);
   const url = new URL(request.url);
   const query = String(url.searchParams.get("q") || "").trim();
-  const status = String(url.searchParams.get("status") || "").trim();
+  const status = PROJECT_STATUSES.includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "";
+  const clientId = Number(url.searchParams.get("client_id")) || 0;
+  const assetId = Number(url.searchParams.get("asset_id")) || 0;
+  const billingBasis = BASES.includes(url.searchParams.get("billing_basis")) ? url.searchParams.get("billing_basis") : "";
+  const dateFrom = String(url.searchParams.get("start_date_from") || "");
+  const dateTo = String(url.searchParams.get("start_date_to") || "");
   const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
   const clauses = [];
   const params = [];
@@ -353,15 +397,27 @@ async function projectList(request, env, user, path) {
     clauses.push("p.status=?");
     params.push(status);
   }
+  if (clientId) { clauses.push("p.client_id=?"); params.push(clientId); }
+  if (assetId) { clauses.push("p.asset_id=?"); params.push(assetId); }
+  if (billingBasis) { clauses.push("p.billing_basis=?"); params.push(billingBasis); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) { clauses.push("p.start_date>=?"); params.push(dateFrom); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) { clauses.push("p.start_date<=?"); params.push(dateTo); }
   const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+  const sorts = {
+    project_no: { sql: "p.project_no", label: "Project No." }, client: { sql: "c.client_name", label: "Client" },
+    item_job: { sql: "p.job_description", label: "Item / Job" }, start_date: { sql: "p.start_date", label: "Dates" },
+    asset: { sql: "a.asset_code", label: "Asset" }, primary: { sql: "e.full_name", label: "Primary" },
+    billing_basis: { sql: "p.billing_basis", label: "Default Work" }, entries: { sql: "work_count", label: "Entries" }, status: { sql: "p.status", label: "Status" },
+  };
+  const sort = listSort(url, sorts, "start_date");
   const count = await first(env, `SELECT COUNT(*) AS total FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id LEFT JOIN employees e ON e.id=p.primary_employee_id${where}`, params);
-  const rows = await all(env, `SELECT p.*, c.client_name, a.asset_code, e.full_name AS primary_name, (SELECT COUNT(*) FROM project_work_entries w WHERE w.project_id=p.id) AS work_count FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id LEFT JOIN employees e ON e.id=p.primary_employee_id${where} ORDER BY p.start_date DESC,p.id DESC LIMIT 25 OFFSET ?`, [...params, (page - 1) * 25]);
-  const searchParams = new URLSearchParams();
-  if (query) searchParams.set("q", query);
-  if (status) searchParams.set("status", status);
+  const rows = await all(env, `SELECT p.*, c.client_name, a.asset_code, e.full_name AS primary_name, (SELECT COUNT(*) FROM project_work_entries w WHERE w.project_id=p.id) AS work_count FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id LEFT JOIN employees e ON e.id=p.primary_employee_id${where} ORDER BY ${sort.order},p.id DESC LIMIT 25 OFFSET ?`, [...params, (page - 1) * 25]);
+  const searchParams = listParams(url, ["q", "status", "client_id", "asset_id", "billing_basis", "start_date_from", "start_date_to"], sort);
+  const [clients, assets] = await choices(env);
   const listRows = rows.map((row) => `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.client_name || "")}</td><td>${esc(row.job_description)}</td><td>${esc(row.start_date)}${row.end_date ? ` – ${esc(row.end_date)}` : ""}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.primary_name || "")}</td><td>${esc(`${row.default_billing_quantity} ${row.billing_basis}${Number(row.default_billing_quantity) === 1 ? "" : "s"}`)}</td><td>${esc(row.work_count || 0)}</td><td>${badge(row.status)}</td><td><a href="/projects/${row.id}">View</a>${canEdit(user, PAGE) ? ` <a href="/projects/${row.id}/edit">Edit</a>` : ""}</td></tr>`);
-  const controls = `<section class="panel toolbar"><form method="get"><input name="q" value="${esc(query)}" placeholder="Search projects"><select name="status"><option value="">All statuses</option>${PROJECT_STATUSES.map((item) => `<option${status === item ? " selected" : ""}>${esc(item)}</option>`).join("")}</select><button>Search</button></form><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button" href="/projects/new">New Project</a>` : ""}<a class="button secondary" href="/projects/export.csv${searchParams.toString() ? `?${searchParams}` : ""}">Export CSV</a></div></section>`;
-  return html(layout({ title: "Projects List", user, path, content: `${messages(url)}${controls}${table(["Project No.", "Client", "Item / Job", "Dates", "Asset", "Primary", "Default Work", "Entries", "Status", "Actions"], listRows, { empty: "No projects found." })}${pagination("/projects", searchParams, page, count?.total)}` }));
+  const controls = `<section class="panel toolbar list-toolbar"><form method="get" class="list-query-form"><div class="list-search-row"><input name="q" value="${esc(query)}" placeholder="Search projects"><button>Apply</button><a class="button secondary" href="/projects">Clear</a></div><details class="list-filters" open><summary>Filters</summary><div class="list-filter-grid">${selectFilter("status", "Status", PROJECT_STATUSES.map((value) => [value, value]), status)}${selectFilter("client_id", "Client", clients.map((row) => [row.id, `${row.client_code || ""}, ${row.client_name}`]), clientId)}${selectFilter("asset_id", "Asset", assets.map((row) => [row.id, `${row.asset_code || ""}, ${row.plate_no || row.asset_type || ""}`]), assetId)}${selectFilter("billing_basis", "Billing basis", BASES.map((value) => [value, value]), billingBasis)}${dateFilter("start_date_from", "Start from", dateFrom)}${dateFilter("start_date_to", "Start to", dateTo)}</div></details></form><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button" href="/projects/new">New Project</a>` : ""}<a class="button secondary" href="/projects/export.csv${searchParams.toString() ? `?${searchParams}` : ""}">Export CSV</a></div></section>`;
+  const headers = sortableHeaders([{ key: "project_no", label: "Project No." }, { key: "client", label: "Client" }, { key: "item_job", label: "Item / Job" }, { key: "start_date", label: "Dates" }, { key: "asset", label: "Asset" }, { key: "primary", label: "Primary" }, { key: "billing_basis", label: "Default Work" }, { key: "entries", label: "Entries" }, { key: "status", label: "Status" }, { label: "Actions" }], sort, searchParams);
+  return html(layout({ title: "Projects List", user, path, content: `${messages(url)}${controls}${table(headers, listRows, { empty: "No projects found." })}${pagination("/projects", searchParams, page, count?.total)}` }));
 }
 
 async function projectFormPage(request, env, user, path, id = null) {
@@ -627,7 +683,12 @@ async function projectExport(request, env, user, path) {
   if (access) return fail(access, user, path);
   const url = new URL(request.url);
   const query = String(url.searchParams.get("q") || "").trim();
-  const status = String(url.searchParams.get("status") || "").trim();
+  const status = PROJECT_STATUSES.includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "";
+  const clientId = Number(url.searchParams.get("client_id")) || 0;
+  const assetId = Number(url.searchParams.get("asset_id")) || 0;
+  const billingBasis = BASES.includes(url.searchParams.get("billing_basis")) ? url.searchParams.get("billing_basis") : "";
+  const dateFrom = String(url.searchParams.get("start_date_from") || "");
+  const dateTo = String(url.searchParams.get("start_date_to") || "");
   const clauses = [];
   const params = [];
   if (query) {
@@ -638,8 +699,15 @@ async function projectExport(request, env, user, path) {
     clauses.push("p.status=?");
     params.push(status);
   }
+  if (clientId) { clauses.push("p.client_id=?"); params.push(clientId); }
+  if (assetId) { clauses.push("p.asset_id=?"); params.push(assetId); }
+  if (billingBasis) { clauses.push("p.billing_basis=?"); params.push(billingBasis); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) { clauses.push("p.start_date>=?"); params.push(dateFrom); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) { clauses.push("p.start_date<=?"); params.push(dateTo); }
   const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
-  const rows = await all(env, `SELECT p.*,c.client_name,a.asset_code,e.full_name AS primary_name,(SELECT COUNT(*) FROM project_work_entries w WHERE w.project_id=p.id) AS work_count,(SELECT COALESCE(SUM(w.total_charge),0) FROM project_work_entries w WHERE w.project_id=p.id AND w.status IN ('Completed','Billed')) AS completed_total FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id LEFT JOIN employees e ON e.id=p.primary_employee_id${where} ORDER BY p.start_date,p.id`, params);
+  const sorts = { project_no: { sql: "p.project_no" }, client: { sql: "c.client_name" }, item_job: { sql: "p.job_description" }, start_date: { sql: "p.start_date" }, asset: { sql: "a.asset_code" }, primary: { sql: "e.full_name" }, billing_basis: { sql: "p.billing_basis" }, entries: { sql: "work_count" }, status: { sql: "p.status" } };
+  const sort = listSort(url, sorts, "start_date");
+  const rows = await all(env, `SELECT p.*,c.client_name,a.asset_code,e.full_name AS primary_name,(SELECT COUNT(*) FROM project_work_entries w WHERE w.project_id=p.id) AS work_count,(SELECT COALESCE(SUM(w.total_charge),0) FROM project_work_entries w WHERE w.project_id=p.id AND w.status IN ('Completed','Billed')) AS completed_total FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id LEFT JOIN employees e ON e.id=p.primary_employee_id${where} ORDER BY ${sort.order},p.id DESC`, params);
   const lines = [csvRow(["ID", "Project No.", "Ref. No.", "Start Date", "End Date", "Client", "Item / Job", "Route / Location", "Asset", "Primary Employee", "Billing Basis", "Default Quantity", "Client Rate", "Status", "Work Entries", "Completed Work Total"])];
   for (const row of rows) lines.push(csvRow([row.id, row.project_no, row.reference_no, row.start_date, row.end_date, row.client_name, row.job_description, row.project_location || `${row.origin || ""} -> ${row.destination || ""}`, row.asset_code, row.primary_name, row.billing_basis, row.default_billing_quantity, row.client_unit_rate, row.status, row.work_count, row.completed_total]));
   return csv(lines.join("\n"), "projects.csv");
