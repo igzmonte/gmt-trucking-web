@@ -1908,7 +1908,7 @@ test("SOA permissions allow finance viewers and block encoder", async () => {
   assert.equal(response.status, 403);
 });
 
-test("dashboard shows operational metrics and hides finance-heavy sections by role", async () => {
+test("departmental dashboard defaults by role, preserves dates, and hides unauthorized data", async () => {
   const env = envWithRows({
     employees: [{ id: 3, employee_code: "EMP-003", full_name: "Driver One", active: 1 }],
     trips: [
@@ -1925,31 +1925,55 @@ test("dashboard shows operational metrics and hides finance-heavy sections by ro
     projects: [projectFixture({ status: "Active" })],
   });
 
-  let response = await handleRequest(await authedRequest("https://example.test/", "admin"), env);
+  const dashboardUrl = "https://example.test/?date_from=2026-07-01&date_to=2026-07-31";
+  let response = await handleRequest(await authedRequest(dashboardUrl, "admin"), env);
   assert.equal(response.status, 200);
   let text = await response.text();
+  assert.match(text, /Department Dashboard/);
+  assert.match(text, /Overview/);
+  assert.match(text, />Operations</);
+  assert.match(text, />Finance</);
+  assert.match(text, />Maintenance</);
+  assert.match(text, />Workforce</);
+  assert.match(text, /date_from=2026-07-01/);
   assert.match(text, /Ongoing Trips/);
-  assert.match(text, /Completed Trips/);
+  assert.match(text, /Completed Work/);
   assert.match(text, /Receivables/);
   assert.match(text, /Open Advances/);
   assert.match(text, /Open Payables/);
   assert.match(text, /Active Projects/);
-  assert.match(text, /PRJ-2026-000001/);
+  assert.match(text, /Work Activity/);
+  assert.match(text, /Work Status/);
   assert.match(text, /Recent Activity/);
-  assert.match(text, /data-tab="billing"/);
-  assert.match(text, /data-tab="collections"/);
-  assert.match(text, /data-tab="payroll"/);
+  assert.match(text, /Attention Needed/);
   assert.match(text, /TT-ONGOING/);
   assert.match(text, /BILL-DASH/);
-  assert.match(text, /RCPT-DASH/);
 
-  response = await handleRequest(await authedRequest("https://example.test/", "encoder"), env);
+  response = await handleRequest(await authedRequest(dashboardUrl, "encoder"), env);
   assert.equal(response.status, 200);
   text = await response.text();
+  assert.match(text, /<h2>Operations<\/h2>/);
+  assert.match(text, /Top Clients/);
   assert.doesNotMatch(text, /Receivables/);
-  assert.doesNotMatch(text, /data-tab="billing"/);
-  assert.doesNotMatch(text, /data-tab="payroll"/);
+  assert.doesNotMatch(text, /dashboard-tab[^>]*>Finance</);
+
+  response = await handleRequest(await authedRequest(`${dashboardUrl}&tab=maintenance`, "encoder"), env);
+  text = await response.text();
+  assert.match(text, /<h2>Maintenance<\/h2>/);
   assert.match(text, /Open Repairs/);
+
+  response = await handleRequest(await authedRequest(dashboardUrl, "accounting"), env);
+  assert.equal(response.status, 200);
+  text = await response.text();
+  assert.match(text, /<h2>Finance<\/h2>/);
+  assert.match(text, /Billed vs Collected/);
+  assert.match(text, /Receivables by Client/);
+  assert.doesNotMatch(text, /Open Advances/);
+
+  response = await handleRequest(await authedRequest(`${dashboardUrl}&tab=finance`, "encoder"), env);
+  text = await response.text();
+  assert.match(text, /<h2>Operations<\/h2>/);
+  assert.doesNotMatch(text, /Receivables/);
 });
 
 test("reports permissions, selector, invalid date validation, and all report slugs render", async () => {

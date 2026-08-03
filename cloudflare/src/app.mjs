@@ -1,6 +1,6 @@
 import { canEdit, canView, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, hashPassword, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
-import { all, dashboard, first, run } from "./db.mjs";
+import { all, first, run } from "./db.mjs";
 import { cards, dialogShell, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
 import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, projectEmployeeBasePay, projectExtraTotal, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { handleProjects } from "./projects.mjs";
@@ -244,38 +244,407 @@ function customerPrintStyles(page = "A4 portrait") {
   return `@page{size:${page};margin:12mm}body{font-family:Arial,sans-serif;font-size:12px;color:#111;margin:0}.print-button{margin-bottom:10px}.document-sheet{padding:0}.document-header{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:8px;margin-bottom:12px}.company-header{display:flex;gap:10px;align-items:flex-start}.company-logo{max-width:76px;max-height:54px;object-fit:contain;flex:0 0 auto}.company-text h1,h1{margin:0 0 3px;font-size:22px}.company-text h2,h2{margin:2px 0 4px;font-size:15px}.company-lines{margin:4px 0 0;line-height:1.35}.document-meta{text-align:right;line-height:1.45}.muted{color:#555}.footer-note{margin-top:18px;white-space:pre-wrap}table{width:100%;border-collapse:collapse;margin-top:10px}td,th{border:1px solid #222;padding:6px;vertical-align:top}th{background:#f1f1f1}.label{font-weight:bold;width:22%;background:#f3f3f3}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.totals{margin-left:auto;width:330px}.signatures{display:grid;gap:48px;margin-top:52px}.signatures.two{grid-template-columns:1fr 1fr}.signatures.three{grid-template-columns:repeat(3,1fr)}.sig,.signatures div{border-top:1px solid #111;text-align:center;padding-top:6px}@media print{.print-button{display:none}}`;
 }
 
-async function dashboardPage(env, user, path) {
-  const data = await dashboard(env);
-  const [repairs, payables, vale, cash, activeProjects, recentTrips, recentProjects, recentBillings, recentCollections, recentPayroll] = await Promise.all([
-    first(env, "SELECT COUNT(*) AS total FROM repairs WHERE status='Open'"),
-    first(env, "SELECT COALESCE(SUM(amount),0) AS total FROM payables WHERE status IN ('Open','Partial')"),
-    first(env, "SELECT COALESCE(SUM(balance),0) AS total FROM vale_records WHERE status='Open'"),
-    first(env, "SELECT COALESCE(SUM(balance),0) AS total FROM cash_advances WHERE status='Open'"),
-    first(env, "SELECT COUNT(*) AS total FROM projects WHERE status='Active'"),
-    all(env, "SELECT t.*, c.client_name FROM trips t LEFT JOIN clients c ON c.id=t.client_id ORDER BY t.trip_date DESC, t.id DESC LIMIT 5"),
-    all(env, "SELECT p.*,c.client_name,a.asset_code FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id ORDER BY p.start_date DESC,p.id DESC LIMIT 5"),
-    all(env, "SELECT b.*, c.client_name, COALESCE((SELECT SUM(amount_paid) FROM collections co WHERE co.billing_id=b.id),0) AS paid_amount FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id ORDER BY b.billing_date DESC, b.id DESC LIMIT 5"),
-    all(env, "SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id ORDER BY co.collection_date DESC, co.id DESC LIMIT 5"),
-    all(env, "SELECT p.*, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id ORDER BY p.pay_date DESC, p.id DESC LIMIT 5"),
+const DASHBOARD_DEPARTMENTS = [
+  { key: "overview", label: "Overview", roles: ["admin", "viewer"] },
+  { key: "operations", label: "Operations", roles: ["admin", "encoder", "viewer"] },
+  { key: "finance", label: "Finance", roles: ["admin", "accounting", "viewer"] },
+  { key: "maintenance", label: "Maintenance", roles: ["admin", "encoder", "viewer"] },
+  { key: "workforce", label: "Workforce", roles: ["admin", "encoder", "accounting", "viewer"] },
+];
+
+function dashboardFilters(url) {
+  const current = currentMonthBounds();
+  const dateFrom = url.searchParams.get("date_from") || current.start;
+  const dateTo = url.searchParams.get("date_to") || current.end;
+  const invalidDateRange = dateFrom > dateTo;
+  return {
+    date_from: invalidDateRange ? current.start : dateFrom,
+    date_to: invalidDateRange ? current.end : dateTo,
+    requested_tab: url.searchParams.get("tab") || "",
+    invalidDateRange,
+  };
+}
+
+function dashboardDepartmentsFor(user) {
+  return DASHBOARD_DEPARTMENTS.filter((department) => department.roles.includes(user.role));
+}
+
+function dashboardDefaultDepartment(user) {
+  if (user.role === "encoder") return "operations";
+  if (user.role === "accounting") return "finance";
+  return "overview";
+}
+
+function dashboardDepartment(user, filters) {
+  const permitted = new Set(dashboardDepartmentsFor(user).map((department) => department.key));
+  return permitted.has(filters.requested_tab) ? filters.requested_tab : dashboardDefaultDepartment(user);
+}
+
+function dashboardParams(filters, tab = filters.requested_tab) {
+  const params = new URLSearchParams({ date_from: filters.date_from, date_to: filters.date_to });
+  if (tab) params.set("tab", tab);
+  return params;
+}
+
+function dashboardHref(filters, tab) {
+  return `/?${dashboardParams(filters, tab).toString()}`;
+}
+
+function dashboardRange(rows, field, filters) {
+  return (rows || []).filter((row) => {
+    const value = String(row[field] || "").slice(0, 10);
+    return value && value >= filters.date_from && value <= filters.date_to;
+  });
+}
+
+function dashboardCurrent(rows, status = "Open") {
+  return (rows || []).filter((row) => String(row.status || "") === status);
+}
+
+function dashboardSum(rows, field) {
+  return (rows || []).reduce((total, row) => total + numeric(row[field]), 0);
+}
+
+function dashboardCountBy(rows, key, fallback = "Unspecified") {
+  const counts = new Map();
+  for (const row of rows || []) {
+    const label = String(row[key] || fallback);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  return [...counts.entries()].map(([label, value]) => ({ label, value }));
+}
+
+function dashboardMoneyBy(rows, key, amount, fallback = "Unspecified") {
+  const totals = new Map();
+  for (const row of rows || []) {
+    const label = String(row[key] || fallback);
+    totals.set(label, (totals.get(label) || 0) + numeric(row[amount]));
+  }
+  return [...totals.entries()].map(([label, value]) => ({ label, value }));
+}
+
+function dashboardKpis(items) {
+  return `<section class="dashboard-kpis" aria-label="Key performance indicators">${items.map((item) => {
+    const content = `<span class="dashboard-kpi-label">${esc(item.label)}</span><strong>${esc(item.value)}</strong>${item.detail ? `<small>${esc(item.detail)}</small>` : ""}`;
+    return item.href
+      ? `<a class="dashboard-kpi dashboard-kpi-${esc(item.tone || "blue")}" href="${esc(item.href)}">${content}</a>`
+      : `<article class="dashboard-kpi dashboard-kpi-${esc(item.tone || "blue")}">${content}</article>`;
+  }).join("")}</section>`;
+}
+
+function dashboardVisual(title, subtitle, body, className = "") {
+  return `<section class="dashboard-visual ${esc(className)}"><header><div><h2>${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ""}</div></header>${body}</section>`;
+}
+
+function dashboardTrend(title, subtitle, series, href = "") {
+  const points = new Map();
+  for (const item of series) {
+    for (const point of item.points) points.set(point.label, true);
+  }
+  const labels = [...points.keys()].sort().slice(-31);
+  const max = Math.max(1, ...labels.flatMap((label) => series.map((item) => numeric(item.points.find((point) => point.label === label)?.value))));
+  const body = labels.length
+    ? `<div class="trend-legend">${series.map((item) => `<span><i class="legend-dot ${esc(item.color)}"></i>${esc(item.label)}</span>`).join("")}</div><div class="trend-chart" role="img" aria-label="${esc(`${title}: ${subtitle}`)}">${labels.map((label) => {
+      const bars = series.map((item) => {
+        const value = numeric(item.points.find((point) => point.label === label)?.value);
+        const height = value ? Math.max(5, Math.round((value / max) * 100)) : 0;
+        return `<i class="trend-bar ${esc(item.color)}" style="height:${height}%" title="${esc(`${item.label}: ${value}`)}"></i>`;
+      }).join("");
+      const labelText = label.length > 7 ? label.slice(5) : label;
+      const column = `<span class="trend-bars">${bars}</span><small>${esc(labelText)}</small>`;
+      return href ? `<a class="trend-column" href="${esc(href)}" aria-label="${esc(`${label}: open details`)}">${column}</a>` : `<span class="trend-column">${column}</span>`;
+    }).join("")}</div>`
+    : `<p class="dashboard-empty">No activity in this period.</p>`;
+  return dashboardVisual(title, subtitle, body, "dashboard-visual-primary");
+}
+
+function dashboardStatusChart(title, subtitle, entries, hrefFor = () => "") {
+  const visible = entries.filter((entry) => numeric(entry.value) > 0);
+  const total = visible.reduce((sum, entry) => sum + numeric(entry.value), 0);
+  const colors = ["blue", "green", "gold", "purple", "slate", "red"];
+  const body = total
+    ? `<div class="status-stack" role="img" aria-label="${esc(`${title}: ${visible.map((entry) => `${entry.label} ${entry.value}`).join(", ")}`)}">${visible.map((entry, index) => {
+      const href = hrefFor(entry.label);
+      const segment = `<span class="status-segment ${colors[index % colors.length]}" style="flex:${numeric(entry.value)}" title="${esc(`${entry.label}: ${entry.value}`)}"></span>`;
+      return href ? `<a href="${esc(href)}" aria-label="${esc(`${entry.label}: ${entry.value}. Open details.`)}">${segment}</a>` : segment;
+    }).join("")}</div><div class="status-legend">${visible.map((entry, index) => {
+      const href = hrefFor(entry.label);
+      const content = `<i class="legend-dot ${colors[index % colors.length]}"></i><span>${esc(entry.label)}</span><strong>${esc(entry.value)}</strong>`;
+      return href ? `<a href="${esc(href)}">${content}</a>` : `<span>${content}</span>`;
+    }).join("")}</div>`
+    : `<p class="dashboard-empty">No records in this period.</p>`;
+  return dashboardVisual(title, subtitle, body);
+}
+
+function dashboardBarChart(title, subtitle, entries, { moneyValues = false, hrefFor = () => "" } = {}) {
+  const visible = [...entries].filter((entry) => numeric(entry.value) > 0).sort((a, b) => numeric(b.value) - numeric(a.value)).slice(0, 6);
+  const max = Math.max(1, ...visible.map((entry) => numeric(entry.value)));
+  const body = visible.length
+    ? `<div class="ranked-bars">${visible.map((entry) => {
+      const href = hrefFor(entry);
+      const content = `<span>${esc(entry.label)}</span><i><b style="width:${Math.max(3, Math.round((numeric(entry.value) / max) * 100))}%"></b></i><strong>${esc(moneyValues ? peso(entry.value) : entry.value)}</strong>`;
+      return href ? `<a href="${esc(href)}">${content}</a>` : `<div>${content}</div>`;
+    }).join("")}</div>`
+    : `<p class="dashboard-empty">No records in this period.</p>`;
+  return dashboardVisual(title, subtitle, body);
+}
+
+function dashboardAttention(title, items) {
+  const body = items.length
+    ? `<ul class="dashboard-alerts">${items.slice(0, 6).map((item) => `<li class="${esc(item.tone || "warning")}"><a href="${esc(item.href)}"><span>${esc(item.label)}</span><strong>${esc(item.value)}</strong><small>${esc(item.detail || "")}</small></a></li>`).join("")}</ul>`
+    : `<p class="dashboard-empty">Nothing needs attention right now.</p>`;
+  return dashboardVisual(title, "Items that need a follow-up", body, "dashboard-attention");
+}
+
+function dashboardRecentActivity(items) {
+  const rows = [...items].sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 7)
+    .map((item) => `<tr><td>${esc(item.date)}</td><td><span class="activity-type">${esc(item.type)}</span></td><td><a href="${esc(item.href)}">${esc(item.reference)}</a><span class="cell-detail">${esc(item.detail)}</span></td><td><span class="status">${esc(item.status || "")}</span></td></tr>`);
+  return dashboardVisual("Recent Activity", "Most recent permitted records", table(["Date", "Area", "Record", "Status"], rows, { empty: "No recent activity in this period.", bare: true }), "dashboard-recent");
+}
+
+function dashboardWorkPoints(rows, field, amount = () => 1) {
+  const values = new Map();
+  for (const row of rows || []) {
+    const label = String(row[field] || "").slice(0, 10);
+    if (label) values.set(label, (values.get(label) || 0) + numeric(amount(row)));
+  }
+  return [...values.entries()].map(([label, value]) => ({ label, value }));
+}
+
+async function dashboardData(env, filters) {
+  const [trips, allTrips, projectWork, projects, assets, employees, repairs, payables, vale, cash, billings, collections, payroll, billingLines, billingProjectLines] = await Promise.all([
+    all(env, "SELECT t.*, c.client_name, a.asset_code FROM trips t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN assets a ON a.id=t.asset_id WHERE t.trip_date>=? AND t.trip_date<=? ORDER BY t.trip_date DESC, t.id DESC", [filters.date_from, filters.date_to]),
+    all(env, "SELECT id, trip_date, status FROM trips"),
+    all(env, "SELECT w.*, p.project_no, c.client_name, a.asset_code FROM project_work_entries w JOIN projects p ON p.id=w.project_id LEFT JOIN clients c ON c.id=w.client_id_snapshot LEFT JOIN assets a ON a.id=w.asset_id_snapshot WHERE w.work_date>=? AND w.work_date<=? ORDER BY w.work_date DESC, w.id DESC", [filters.date_from, filters.date_to]),
+    all(env, "SELECT p.*, c.client_name, a.asset_code FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id ORDER BY p.start_date DESC, p.id DESC"),
+    all(env, "SELECT * FROM assets ORDER BY asset_code, id"),
+    all(env, "SELECT * FROM employees ORDER BY full_name, id"),
+    all(env, "SELECT r.*, a.asset_code, s.supplier_name FROM repairs r LEFT JOIN assets a ON a.id=r.asset_id LEFT JOIN suppliers s ON s.id=r.supplier_id ORDER BY r.repair_date DESC, r.id DESC"),
+    all(env, "SELECT p.*, s.supplier_name FROM payables p LEFT JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.payable_date DESC, p.id DESC"),
+    all(env, "SELECT v.*, e.full_name, e.employee_code FROM vale_records v LEFT JOIN employees e ON e.id=v.employee_id ORDER BY v.date_granted DESC, v.id DESC"),
+    all(env, "SELECT c.*, e.full_name, e.employee_code FROM cash_advances c LEFT JOIN employees e ON e.id=c.employee_id ORDER BY c.date_granted DESC, c.id DESC"),
+    all(env, "SELECT b.*, c.client_name FROM billing_statements b LEFT JOIN clients c ON c.id=b.client_id ORDER BY b.billing_date DESC, b.id DESC"),
+    all(env, "SELECT co.*, b.billing_no, c.client_name FROM collections co LEFT JOIN billing_statements b ON b.id=co.billing_id LEFT JOIN clients c ON c.id=co.client_id ORDER BY co.collection_date DESC, co.id DESC"),
+    all(env, "SELECT p.*, e.full_name FROM payroll_entries p LEFT JOIN employees e ON e.id=p.employee_id ORDER BY p.pay_date DESC, p.id DESC"),
+    all(env, "SELECT trip_id FROM billing_lines"),
+    all(env, "SELECT work_entry_id FROM billing_project_lines"),
   ]);
-  const finance = canView(user, "Billing") || canView(user, "Payables");
-  const advanceTotal = Number(vale?.total || 0) + Number(cash?.total || 0);
-  const dashboardCards = finance
-    ? [["Ongoing Trips", data.ongoing], ["Active Projects", activeProjects?.total || 0], ["Completed Trips", data.completed], ["Receivables", peso(data.receivables)], ["Open Payables", peso(payables?.total || 0)], ["Open Advances", peso(advanceTotal)]]
-    : [["Total Trips", data.trips], ["Ongoing Trips", data.ongoing], ["Active Projects", activeProjects?.total || 0], ["Completed Trips", data.completed], ["Active Employees", data.employees], ["Open Repairs", repairs?.total || 0]];
-  const tripsBody = recentTrips.map((row) => `<tr><td><a href="/trips/${row.id}">${esc(row.trip_ticket_no)}</a></td><td>${esc(row.trip_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.status)}</td></tr>`);
-  const projectBody = recentProjects.map((row) => `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.start_date)}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.status)}</td></tr>`);
-  const billingBody = recentBillings.map((row) => `<tr><td><a href="/billing/${row.id}">${esc(row.billing_no)}</a></td><td>${esc(row.client_name || "")}</td>${moneyCell(row.grand_total)}${moneyCell(outstandingBalance(row.grand_total, row.paid_amount))}</tr>`);
-  const collectionBody = recentCollections.map((row) => `<tr><td>${esc(row.collection_date)}</td><td>${esc(row.billing_no || "")}</td><td>${esc(row.client_name || "")}</td><td>${esc(row.reference_no || "")}</td>${moneyCell(row.amount_paid)}</tr>`);
-  const payrollBody = recentPayroll.map((row) => `<tr><td><a href="/payroll/${row.id}">${esc(row.pay_date)}</a></td><td>${esc(row.full_name || "")}</td><td>${esc(row.employee_type || "")}</td>${moneyCell(row.net_pay)}</tr>`);
-  const activityTabs = [
-    ["trips", "Trips", table(["Trip Ticket / Waybill", "Date", "Client", "Status"], tripsBody, { empty: "No recent trips.", bare: true })],
-    ...(canView(user, "Projects") ? [["projects", "Projects", table(["Project No.", "Start", "Client", "Asset", "Status"], projectBody, { empty: "No recent projects.", bare: true })]] : []),
-    ...(canView(user, "Billing") ? [["billing", "Billing", table(["Billing No.", "Client", "Grand Total", "Balance"], billingBody, { empty: "No recent billings.", bare: true })]] : []),
-    ...(canView(user, "Collections") ? [["collections", "Collections", table(["Date", "Billing No.", "Client", "Ref. No.", "Amount"], collectionBody, { empty: "No recent collections.", bare: true })]] : []),
-    ...(canView(user, "Payroll") ? [["payroll", "Payroll", table(["Pay Date", "Employee", "Type", "Net Pay"], payrollBody, { empty: "No recent payroll entries.", bare: true })]] : []),
+  return {
+    trips: dashboardRange(trips, "trip_date", filters),
+    allTrips,
+    projectWork: dashboardRange(projectWork, "work_date", filters),
+    projects,
+    assets,
+    employees,
+    repairs,
+    payables,
+    vale,
+    cash,
+    billings,
+    collections,
+    payroll: dashboardRange(payroll, "pay_date", filters),
+    billingLines,
+    billingProjectLines,
+  };
+}
+
+function dashboardModel(data, filters) {
+  const billedTripIds = new Set(data.billingLines.map((row) => Number(row.trip_id)));
+  const billedProjectIds = new Set(data.billingProjectLines.map((row) => Number(row.work_entry_id)));
+  const periodBillings = dashboardRange(data.billings, "billing_date", filters);
+  const periodCollections = dashboardRange(data.collections, "collection_date", filters);
+  const paidByBilling = new Map();
+  for (const collection of data.collections) {
+    paidByBilling.set(Number(collection.billing_id), (paidByBilling.get(Number(collection.billing_id)) || 0) + numeric(collection.amount_paid));
+  }
+  const billingBalances = data.billings.map((billing) => ({ ...billing, paid_amount: paidByBilling.get(Number(billing.id)) || 0, balance: outstandingBalance(billing.grand_total, paidByBilling.get(Number(billing.id)) || 0) }));
+  const completedTrips = data.trips.filter((row) => ["Completed", "Billed", "Paid"].includes(row.status));
+  const completedProjectWork = data.projectWork.filter((row) => ["Completed", "Billed"].includes(row.status));
+  const unbilledTrips = data.trips.filter((row) => row.status === "Completed" && !billedTripIds.has(Number(row.id)));
+  const unbilledProjectWork = data.projectWork.filter((row) => row.status === "Completed" && !billedProjectIds.has(Number(row.id)));
+  const openPayables = data.payables.filter((row) => ["Open", "Partial"].includes(row.status));
+  const openVale = dashboardCurrent(data.vale);
+  const openCash = dashboardCurrent(data.cash);
+  const activeProjects = data.projects.filter((row) => row.status === "Active");
+  const activeEmployees = data.employees.filter((row) => Number(row.active) !== 0 && row.employment_status !== "Inactive");
+  const assetsInMaintenance = data.assets.filter((row) => /maintenance|repair/i.test(String(row.status || "")));
+  const linkedRepairIds = new Set(data.payables.filter((row) => row.linked_repair_id).map((row) => Number(row.linked_repair_id)));
+  const completedWork = [...completedTrips, ...completedProjectWork];
+  return {
+    ...data,
+    filters,
+    periodBillings,
+    periodCollections,
+    billingBalances,
+    completedTrips,
+    completedProjectWork,
+    completedWork,
+    unbilledTrips,
+    unbilledProjectWork,
+    unbilledWork: [...unbilledTrips, ...unbilledProjectWork],
+    openPayables,
+    openVale,
+    openCash,
+    ongoingTrips: data.allTrips.filter((row) => row.status === "Ongoing"),
+    periodRepairs: dashboardRange(data.repairs, "repair_date", filters),
+    openRepairs: data.repairs.filter((row) => row.status === "Open"),
+    activeProjects,
+    activeEmployees,
+    assetsInMaintenance,
+    linkedRepairIds,
+  };
+}
+
+function dashboardOperations(model, user) {
+  const operationalStatus = dashboardCountBy([
+    ...model.trips.map((row) => ({ status: row.status })),
+    ...model.projectWork.map((row) => ({ status: row.status })),
+  ], "status");
+  const topClients = dashboardCountBy([
+    ...model.trips.map((row) => ({ client_name: row.client_name })),
+    ...model.projectWork.map((row) => ({ client_name: row.client_name })),
+  ], "client_name");
+  const aging = model.trips.filter((row) => ["Planned", "Ongoing"].includes(row.status) && row.trip_date < model.filters.date_to);
+  const kpis = [
+    { label: "Total Work", value: String(model.trips.length + model.projectWork.length), detail: "Selected period", href: "/trips" },
+    { label: "Ongoing Trips", value: String(model.ongoingTrips.length), detail: "Current", href: "/trips?status=Ongoing", tone: "gold" },
+    { label: "Completed Work", value: String(model.completedWork.length), detail: "Selected period", href: "/trips?status=Completed", tone: "green" },
+    { label: "Active Projects", value: String(model.activeProjects.length), detail: "Current", href: "/projects", tone: "purple" },
+    { label: "Unbilled Work", value: String(model.unbilledWork.length), detail: "Ready for billing", href: canView(user, "Billing") ? "/billing/new" : "", tone: "red" },
+    { label: "Utilized Units", value: String(new Set([...model.trips.map((row) => row.asset_id), ...model.projectWork.map((row) => row.asset_id_snapshot)].filter(Boolean)).size), detail: "Selected period", href: "/fleet" },
   ];
-  const content = `<section class="panel">${cards(dashboardCards)}</section><section class="panel activity-panel" data-tabs><div class="activity-header"><h3>Recent Activity</h3></div><div class="tab-list" role="tablist">${activityTabs.map(([key, label]) => `<button type="button" class="tab-button" data-tab="${key}" role="tab">${esc(label)}</button>`).join("")}</div>${activityTabs.map(([key, , markup]) => `<div class="tab-panel" data-tab-panel="${key}" role="tabpanel">${markup}</div>`).join("")}</section>`;
+  const visuals = `<div class="dashboard-visual-grid"><div>${dashboardTrend("Work Activity", "Trips and project entries by date", [
+    { label: "Trips", color: "blue", points: dashboardWorkPoints(model.trips, "trip_date") },
+    { label: "Project entries", color: "purple", points: dashboardWorkPoints(model.projectWork, "work_date") },
+  ], "/trips")}</div><div>${dashboardStatusChart("Work Status", "Selected period", operationalStatus, (status) => `/trips?status=${encodeURIComponent(status)}`)}</div><div>${dashboardBarChart("Top Clients", "Work volume in the selected period", topClients, { hrefFor: (entry) => `/trips?q=${encodeURIComponent(entry.label)}` })}</div><div>${dashboardAttention("Attention Needed", [
+    { label: "Completed work not yet billed", value: `${model.unbilledWork.length}`, detail: "Open Billing to process eligible work", href: canView(user, "Billing") ? "/billing/new" : "/trips?status=Completed", tone: "warning" },
+    { label: "Planned or ongoing trips before this period end", value: `${aging.length}`, detail: "Review and update the trip status", href: "/trips?status=Ongoing", tone: aging.length ? "warning" : "success" },
+  ])}</div></div>`;
+  return `${dashboardKpis(kpis)}${visuals}`;
+}
+
+function dashboardFinance(model, user) {
+  const receivables = model.billingBalances.filter((row) => numeric(row.balance) > 0);
+  const financeStatus = dashboardCountBy(model.billingBalances, "status");
+  const clients = model.billingBalances.map((row) => ({ ...row, client_name: row.client_name || "Unspecified", outstanding: row.balance })).filter((row) => numeric(row.outstanding) > 0);
+  const canSeeAdvances = canView(user, "Vale / Cash Advance");
+  const kpis = [
+    { label: "Billed", value: peso(dashboardSum(model.periodBillings, "grand_total")), detail: "Selected period", href: "/billing" },
+    { label: "Collections", value: peso(dashboardSum(model.periodCollections, "amount_paid")), detail: "Selected period", href: "/collections", tone: "green" },
+    { label: "Receivables", value: peso(dashboardSum(receivables, "balance")), detail: "Current", href: "/billing/soa", tone: "gold" },
+    { label: "Payroll", value: peso(dashboardSum(model.payroll, "net_pay")), detail: "Selected period", href: "/payroll", tone: "purple" },
+    { label: "Open Payables", value: peso(dashboardSum(model.openPayables, "amount")), detail: "Current", href: "/payables", tone: "red" },
+    canSeeAdvances
+      ? { label: "Open Advances", value: peso(dashboardSum(model.openVale, "balance") + dashboardSum(model.openCash, "balance")), detail: "Current", href: "/advances", tone: "blue" }
+      : { label: "Outstanding Billings", value: String(receivables.length), detail: "Current", href: "/billing/soa", tone: "blue" },
+  ];
+  const alerts = [
+    { label: "Outstanding client billings", value: `${receivables.length}`, detail: "Review Statement of Account balances", href: "/billing/soa", tone: receivables.length ? "warning" : "success" },
+    { label: "Open or partial payables", value: `${model.openPayables.length}`, detail: "Review supplier obligations", href: "/payables", tone: model.openPayables.length ? "warning" : "success" },
+    { label: "Completed work waiting for billing", value: `${model.unbilledWork.length}`, detail: "Create a billing statement", href: "/billing/new", tone: model.unbilledWork.length ? "warning" : "success" },
+  ];
+  return `${dashboardKpis(kpis)}<div class="dashboard-visual-grid"><div>${dashboardTrend("Billed vs Collected", "Amounts by date in the selected period", [
+    { label: "Billed", color: "blue", points: dashboardWorkPoints(model.periodBillings, "billing_date", (row) => row.grand_total) },
+    { label: "Collected", color: "green", points: dashboardWorkPoints(model.periodCollections, "collection_date", (row) => row.amount_paid) },
+  ], "/billing")}</div><div>${dashboardStatusChart("Billing Status", "Current billing statements", financeStatus, (status) => `/billing?status=${encodeURIComponent(status)}`)}</div><div>${dashboardBarChart("Receivables by Client", "Current outstanding balances", dashboardMoneyBy(clients, "client_name", "outstanding"), { moneyValues: true, hrefFor: () => "/billing/soa" })}</div><div>${dashboardAttention("Attention Needed", alerts)}</div></div>`;
+}
+
+function dashboardMaintenance(model) {
+  const repairStatus = dashboardCountBy(model.periodRepairs, "status");
+  const repairsByAsset = dashboardMoneyBy(model.periodRepairs, "asset_code", "total_cost");
+  const openRepairs = model.openRepairs;
+  const linked = model.periodRepairs.filter((row) => model.linkedRepairIds.has(Number(row.id))).length;
+  const kpis = [
+    { label: "Open Repairs", value: String(openRepairs.length), detail: "Current period", href: "/repairs?status=Open", tone: "gold" },
+    { label: "Repair Cost", value: peso(dashboardSum(model.periodRepairs, "total_cost")), detail: "Selected period", href: "/repairs", tone: "red" },
+    { label: "Repaired Units", value: String(new Set(model.periodRepairs.map((row) => row.asset_id).filter(Boolean)).size), detail: "Selected period", href: "/fleet" },
+    { label: "Assets in Maintenance", value: String(model.assetsInMaintenance.length), detail: "Current", href: "/fleet", tone: "gold" },
+    { label: "Payable-linked Repairs", value: String(linked), detail: "Selected period", href: "/payables", tone: "purple" },
+  ];
+  return `${dashboardKpis(kpis)}<div class="dashboard-visual-grid"><div>${dashboardTrend("Repair Cost Trend", "Repair cost by date", [{ label: "Repair cost", color: "red", points: dashboardWorkPoints(model.periodRepairs, "repair_date", (row) => row.total_cost) }], "/repairs")}</div><div>${dashboardStatusChart("Repair Status", "Selected period", repairStatus, (status) => `/repairs?status=${encodeURIComponent(status)}`)}</div><div>${dashboardBarChart("Cost by Unit", "Highest repair cost in the selected period", repairsByAsset, { moneyValues: true, hrefFor: () => "/repairs" })}</div><div>${dashboardAttention("Attention Needed", [
+    { label: "Open repairs", value: `${openRepairs.length}`, detail: "Review repair progress and status", href: "/repairs?status=Open", tone: openRepairs.length ? "warning" : "success" },
+    { label: "Assets marked for maintenance", value: `${model.assetsInMaintenance.length}`, detail: "Check fleet availability", href: "/fleet", tone: model.assetsInMaintenance.length ? "warning" : "success" },
+  ])}</div></div>`;
+}
+
+function dashboardWorkforce(model, user) {
+  const canPayroll = canView(user, "Payroll");
+  const canAdvances = canView(user, "Vale / Cash Advance");
+  const employeeTypes = dashboardCountBy(canView(user, "Employees") ? model.activeEmployees : model.payroll, "employee_type");
+  const recentRows = canPayroll
+    ? model.payroll.map((row) => ({ date: row.pay_date, type: "Payroll", reference: row.full_name || "Payroll entry", detail: row.employee_type || "", status: peso(row.net_pay), href: `/payroll/${row.id}` }))
+    : [...model.openVale.map((row) => ({ date: row.date_granted, type: "Vale", reference: row.full_name || row.employee_code || "Employee", detail: "Open balance", status: peso(row.balance), href: "/advances" })), ...model.openCash.map((row) => ({ date: row.date_granted, type: "Cash Advance", reference: row.full_name || row.employee_code || "Employee", detail: "Open balance", status: peso(row.balance), href: "/advances" }))];
+  const kpis = [
+    ...(canView(user, "Employees") ? [{ label: "Active Employees", value: String(model.activeEmployees.length), detail: "Current", href: "/employees" }] : []),
+    ...(canPayroll ? [{ label: "Payroll Total", value: peso(dashboardSum(model.payroll, "net_pay")), detail: "Selected period", href: "/payroll", tone: "purple" }, { label: "Payroll Entries", value: String(model.payroll.length), detail: "Selected period", href: "/payroll" }] : []),
+    ...(canAdvances ? [{ label: "Open Vale", value: peso(dashboardSum(model.openVale, "balance")), detail: "Current", href: "/advances", tone: "gold" }, { label: "Open Cash Advance", value: peso(dashboardSum(model.openCash, "balance")), detail: "Current", href: "/advances", tone: "red" }] : []),
+  ];
+  const primaryVisual = canPayroll
+    ? dashboardTrend("Payroll Trend", "Net pay by pay date", [{ label: "Net pay", color: "purple", points: dashboardWorkPoints(model.payroll, "pay_date", (row) => row.net_pay) }], "/payroll")
+    : dashboardBarChart("Employees by Designation", "Current active employees", employeeTypes, { hrefFor: () => "/employees" });
+  const secondaryVisual = canAdvances
+    ? dashboardBarChart("Open Advances", "Current employee balances", [{ label: "Vale", value: dashboardSum(model.openVale, "balance") }, { label: "Cash Advance", value: dashboardSum(model.openCash, "balance") }], { moneyValues: true, hrefFor: () => "/advances" })
+    : dashboardBarChart("Employees Paid", "Payroll entries by employee type", dashboardCountBy(model.payroll, "employee_type"), { hrefFor: () => "/payroll" });
+  return `${dashboardKpis(kpis)}<div class="dashboard-visual-grid"><div>${primaryVisual}</div><div>${dashboardStatusChart(canView(user, "Employees") ? "Employee Distribution" : "Payroll by Employee Type", canView(user, "Employees") ? "Current active workforce" : "Selected period", employeeTypes, () => canView(user, "Employees") ? "/employees" : "/payroll")}</div><div>${secondaryVisual}</div><div>${dashboardRecentActivity(recentRows)}</div></div>`;
+}
+
+function dashboardOverview(model, user) {
+  const finance = canView(user, "Billing");
+  const recent = [
+    ...model.trips.map((row) => ({ date: row.trip_date, type: "Trip", reference: row.trip_ticket_no, detail: row.client_name || row.origin || "", status: row.status, href: `/trips/${row.id}` })),
+    ...model.projectWork.map((row) => ({ date: row.work_date, type: "Project Work", reference: row.project_no || row.work_no, detail: row.client_name || "", status: row.status, href: `/projects/${row.project_id}` })),
+    ...(finance ? model.periodBillings.map((row) => ({ date: row.billing_date, type: "Billing", reference: row.billing_no, detail: row.client_name || "", status: row.status, href: `/billing/${row.id}` })) : []),
+    ...(canView(user, "Collections") ? model.periodCollections.map((row) => ({ date: row.collection_date, type: "Collection", reference: row.billing_no || row.reference_no || "Collection", detail: row.client_name || "", status: peso(row.amount_paid), href: "/collections" })) : []),
+    ...(canView(user, "Payroll") ? model.payroll.map((row) => ({ date: row.pay_date, type: "Payroll", reference: row.full_name || "Payroll entry", detail: row.employee_type || "", status: peso(row.net_pay), href: `/payroll/${row.id}` })) : []),
+  ];
+  const kpis = finance
+    ? [
+      { label: "Ongoing Trips", value: String(model.ongoingTrips.length), detail: "Current", href: "/trips?status=Ongoing", tone: "gold" },
+      { label: "Completed Work", value: String(model.completedWork.length), detail: "Selected period", href: "/trips?status=Completed", tone: "green" },
+      { label: "Active Projects", value: String(model.activeProjects.length), detail: "Current", href: "/projects", tone: "purple" },
+      { label: "Receivables", value: peso(dashboardSum(model.billingBalances.filter((row) => numeric(row.balance) > 0), "balance")), detail: "Current", href: "/billing/soa", tone: "gold" },
+      { label: "Open Payables", value: peso(dashboardSum(model.openPayables, "amount")), detail: "Current", href: "/payables", tone: "red" },
+      { label: "Open Advances", value: peso(dashboardSum(model.openVale, "balance") + dashboardSum(model.openCash, "balance")), detail: "Current", href: canView(user, "Vale / Cash Advance") ? "/advances" : "", tone: "blue" },
+    ]
+    : [
+      { label: "Total Work", value: String(model.trips.length + model.projectWork.length), detail: "Selected period", href: "/trips" },
+      { label: "Ongoing Trips", value: String(model.trips.filter((row) => row.status === "Ongoing").length), detail: "Current", href: "/trips?status=Ongoing", tone: "gold" },
+      { label: "Active Projects", value: String(model.activeProjects.length), detail: "Current", href: "/projects", tone: "purple" },
+      { label: "Completed Work", value: String(model.completedWork.length), detail: "Selected period", href: "/trips?status=Completed", tone: "green" },
+      { label: "Active Employees", value: String(model.activeEmployees.length), detail: "Current", href: "/employees" },
+      { label: "Open Repairs", value: String(model.openRepairs.length), detail: "Current", href: "/repairs?status=Open", tone: "red" },
+    ];
+  return `${dashboardKpis(kpis)}<div class="dashboard-visual-grid dashboard-overview-grid"><div>${dashboardTrend("Work Activity", "Trips and project entries by date", [
+    { label: "Trips", color: "blue", points: dashboardWorkPoints(model.trips, "trip_date") },
+    { label: "Project entries", color: "purple", points: dashboardWorkPoints(model.projectWork, "work_date") },
+  ], "/trips")}</div><div>${dashboardStatusChart("Work Status", "Selected period", dashboardCountBy([...model.trips, ...model.projectWork], "status"), (status) => `/trips?status=${encodeURIComponent(status)}`)}</div><div>${dashboardRecentActivity(recent)}</div><div>${dashboardAttention("Attention Needed", [
+    { label: "Completed work waiting for billing", value: `${model.unbilledWork.length}`, detail: "Open Billing to process eligible work", href: finance ? "/billing/new" : "/trips?status=Completed", tone: model.unbilledWork.length ? "warning" : "success" },
+    { label: "Open repairs", value: `${model.openRepairs.length}`, detail: "Review maintenance progress", href: "/repairs?status=Open", tone: model.openRepairs.length ? "warning" : "success" },
+  ])}</div></div>`;
+}
+
+function dashboardFilterBar(filters, department, departments) {
+  const tabs = departments.map((item) => `<a class="dashboard-tab${department === item.key ? " active" : ""}" href="${esc(dashboardHref(filters, item.key))}"${department === item.key ? ' aria-current="page"' : ""}>${esc(item.label)}</a>`).join("");
+  const rangeMessage = filters.invalidDateRange ? `<p class="error dashboard-filter-error">Date From must not be after Date To. The current month is displayed instead.</p>` : "";
+  return `<section class="dashboard-controls"><div class="dashboard-tabs" aria-label="Dashboard departments">${tabs}</div><form method="get" class="dashboard-filter-form"><input type="hidden" name="tab" value="${esc(department)}"><label>From<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>To<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Apply</button><a class="button secondary" href="${esc(dashboardHref({ ...filters, ...currentMonthBounds() }, department))}">Current Month</a><a class="button quiet" href="/">Clear</a></form>${rangeMessage}</section>`;
+}
+
+async function dashboardPage(request, env, user, path) {
+  const url = new URL(request.url);
+  const filters = dashboardFilters(url);
+  const department = dashboardDepartment(user, filters);
+  filters.requested_tab = department;
+  const model = dashboardModel(await dashboardData(env, filters), filters);
+  const body = department === "operations"
+    ? dashboardOperations(model, user)
+    : department === "finance"
+      ? dashboardFinance(model, user)
+      : department === "maintenance"
+        ? dashboardMaintenance(model, user)
+        : department === "workforce"
+          ? dashboardWorkforce(model, user)
+          : dashboardOverview(model, user);
+  const content = `${dashboardFilterBar(filters, department, dashboardDepartmentsFor(user))}<section class="dashboard-canvas"><header class="dashboard-heading"><div><span>Department Dashboard</span><h2>${esc(DASHBOARD_DEPARTMENTS.find((item) => item.key === department)?.label || "Overview")}</h2></div><p>${esc(`${filters.date_from} to ${filters.date_to}`)}</p></header>${body}</section>`;
   return html(layout({ title: "Dashboard", user, path, content }));
 }
 
@@ -3279,7 +3648,7 @@ async function handleApplicationRequest(request, env) {
   if (!user) return redirect("/login");
   user.appName = env.GMT_APP_NAME || "GMT Trucking";
 
-  if (path === "/") return dashboardPage(env, user, path);
+  if (path === "/") return dashboardPage(request, env, user, path);
   for (const [base, spec] of Object.entries(MASTER)) {
     if (path === base) return masterList(request, env, user, path, spec);
     if (path === `${base}/new`) return masterForm(request, env, user, base, spec);
