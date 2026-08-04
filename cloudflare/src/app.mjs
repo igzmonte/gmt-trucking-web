@@ -2461,7 +2461,7 @@ function payrollTripTable(preview) {
 
 function payrollProjectTable(preview) {
   const rows = (preview?.projectRows || []).map((row) => `<tr><td>${esc(row.work_date)}</td><td><a href="/projects/${row.project_id}">${esc(row.project_no)}</a></td><td>${esc(row.asset_code || "")}</td><td>${esc(row.billing_quantity)} ${esc(row.billing_unit)}</td><td>${esc(row.project_role)}</td><td>${esc(row.job_description_snapshot || "")}</td>${moneyCell(row.payroll_amount)}</tr>`);
-  return table(["Date", "Project No.", "Unit", "Quantity", "Role", "Item / Job", "Base Pay"], rows, { empty: "No eligible completed project work entries." });
+  return table(["Date", "Project No.", "Unit", "Quantity", "Role", "Item / Job", "Base Pay"], rows, { empty: "No eligible completed project work entries. Open the Project, record Daily Work, then Mark Complete. The work date must be within this payroll period and the employee must be the Primary or a Helper." });
 }
 
 function payrollFormContent(employees, selection, preview, values = {}, errors = []) {
@@ -2854,7 +2854,7 @@ function billingTripRows(trips) {
 
 function billingProjectRows(entries) {
   const rows = entries.map((entry) => `<tr><td>${esc(entry.work_date)}</td><td><a href="/projects/${entry.project_id}">${esc(entry.project_no)}</a><small class="cell-detail">Ref. No.: ${esc(entry.reference_no || "—")}</small></td><td>${esc(entry.job_description_snapshot || "")}</td><td>${esc(`${entry.billing_quantity} ${entry.billing_unit}`)}</td><td>${esc(entry.asset_code || "")}</td>${moneyCell(entry.client_unit_rate)}${moneyCell(entry.base_charge)}${moneyCell(entry.extra_total)}${moneyCell(entry.total_charge)}</tr>`);
-  return table(["Work Date", "Project No.", "Item / Job", "Quantity", "Unit", "Rate", "Base", "Extras", "Total"], rows, { empty: "No eligible completed project work for this client and period." });
+  return table(["Work Date", "Project No.", "Item / Job", "Quantity", "Unit", "Rate", "Base", "Extras", "Total"], rows, { empty: "No eligible completed project work for this client and period. Open the Project, record Daily Work, then Mark Complete. The work date and client must match this billing period." });
 }
 
 function billingFormContent(clients, selection, trips, projectEntries = [], values = {}, errors = []) {

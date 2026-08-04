@@ -2844,6 +2844,77 @@ test("project create generates PRJ number and saves ordered helpers and pay defa
   assert.ok(runs.some((item) => item.sql.includes("INSERT INTO project_pay_item_defaults") && item.params.includes("Operator allowance")));
 });
 
+test("projects need recorded daily work before they can be completed", async () => {
+  const newRuns = [];
+  let response = await handleRequest(await authedRequest("https://example.test/projects/new", "encoder", {
+    method: "POST",
+    body: projectPost({ status: "Completed" }),
+  }), envWithRows({
+    clients: [{ id: 1, client_name: "Sample Client", active: 1 }],
+    assets: [{ id: 2, asset_code: "UNIT-002", asset_type: "Cargo Truck" }],
+    employees: [{ id: 3, full_name: "Driver One", employee_type: "Driver", active: 1 }, { id: 4, full_name: "Helper One", employee_type: "Helper", active: 1 }],
+    runs: newRuns,
+  }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Record at least one daily work entry before completing this Project\./);
+  assert.ok(!newRuns.some((item) => item.sql.includes("INSERT INTO projects")));
+
+  const editRuns = [];
+  response = await handleRequest(await authedRequest("https://example.test/projects/81/edit", "admin", {
+    method: "POST",
+    body: projectPost({ project_no: "PRJ-2026-000001", status: "Completed" }),
+  }), envWithRows({
+    projects: [projectFixture({ status: "Active" })],
+    clients: [{ id: 1, client_name: "Sample Client", active: 1 }],
+    assets: [{ id: 2, asset_code: "UNIT-002", asset_type: "Cargo Truck" }],
+    employees: [{ id: 3, full_name: "Driver One", employee_type: "Driver", active: 1 }, { id: 4, full_name: "Helper One", employee_type: "Helper", active: 1 }],
+    runs: editRuns,
+  }));
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Record at least one daily work entry before completing this Project\./);
+  assert.ok(!editRuns.some((item) => item.sql.startsWith("UPDATE projects SET")));
+});
+
+test("new projects can save as Active and immediately record actual daily work", async () => {
+  const runs = [];
+  const response = await handleRequest(await authedRequest("https://example.test/projects/new", "encoder", {
+    method: "POST",
+    body: projectPost({ after_save: "record_work", status: "Draft" }),
+  }), envWithRows({
+    clients: [{ id: 1, client_name: "Sample Client", active: 1 }],
+    assets: [{ id: 2, asset_code: "UNIT-002", asset_type: "Cargo Truck" }],
+    employees: [{ id: 3, full_name: "Driver One", employee_type: "Driver", active: 1 }, { id: 4, full_name: "Helper One", employee_type: "Helper", active: 1 }],
+    runs,
+  }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/projects\/81\/work\/new\?ok=/);
+  const insert = runs.find((item) => item.sql.includes("INSERT INTO projects"));
+  const columns = insert.sql.match(/\((.+)\) VALUES/)?.[1].split(",");
+  const values = Object.fromEntries(columns.map((column, index) => [column.trim(), insert.params[index]]));
+  assert.equal(values.status, "Active");
+});
+
+test("zero-entry projects guide work recording and completed legacy projects can reopen", async () => {
+  const completedProject = projectFixture({ status: "Completed", work_count: 0 });
+  let response = await handleRequest(await authedRequest("https://example.test/projects", "admin"), envWithRows({ projects: [completedProject] }));
+  let body = await response.text();
+  assert.match(body, /No work recorded/);
+  assert.match(body, /Reopen &amp; Record Work/);
+
+  response = await handleRequest(await authedRequest("https://example.test/projects/81", "admin"), envWithRows({ projects: [completedProject], projectWork: [] }));
+  body = await response.text();
+  assert.match(body, /Project values are reusable defaults only/);
+  assert.match(body, /Reopen &amp; Record Work/);
+  assert.match(body, /not included in Billing or Payroll/);
+
+  const runs = [];
+  response = await handleRequest(await authedRequest("https://example.test/projects/81/reopen-and-record-work", "admin", { method: "POST" }), envWithRows({ projects: [completedProject], projectWork: [], runs }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/projects\/81\/work\/new\?ok=/);
+  assert.ok(runs.some((item) => item.sql.includes("UPDATE projects SET status='Active'")));
+  assert.ok(!runs.some((item) => item.sql.includes("INSERT INTO project_work_entries")));
+});
+
 test("daily project work multiplies quantity while keeping extras flat and snapshots crew", async () => {
   const runs = [];
   const project = projectFixture();

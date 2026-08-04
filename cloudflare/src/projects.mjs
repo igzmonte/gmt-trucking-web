@@ -295,6 +295,14 @@ async function validateProject(env, values, helperIds, payItems, id = null) {
   if (payItems.some((item) => item.employee_type === "Helper") && !selected.length) {
     errors.push("Assign a helper before adding Helper pay items.");
   }
+  // Project headers are reusable defaults. Financial eligibility begins only
+  // after actual Daily Work has been recorded and completed.
+  if (values.status === "Completed") {
+    const count = id
+      ? await first(env, "SELECT COUNT(*) AS total FROM project_work_entries WHERE project_id=?", [id])
+      : { total: 0 };
+    if (!numeric(count?.total)) errors.push("Record at least one daily work entry before completing this Project.");
+  }
   return errors;
 }
 
@@ -349,7 +357,7 @@ async function projectForm(env, row = {}, id = null, errors = []) {
     </div>
     ${payItemsBlock(row)}
     <section class="workspace-card project-notes">${textareaInput("notes", "Notes", row.notes || "", 'rows="2"')}</section>
-    <div class="sticky-actions"><a class="button secondary" href="${id ? `/projects/${id}` : "/projects"}">Cancel</a><button>Save Project</button></div>
+    <div class="sticky-actions"><a class="button secondary" href="${id ? `/projects/${id}` : "/projects"}">Cancel</a>${id ? `<button>Save Project</button>` : `<button name="after_save" value="record_work">Save &amp; Record Daily Work</button><button class="button secondary" name="after_save" value="list">Save Project</button>`}</div>
   </form></section><script id="project-form-data" type="application/json">${browserJson(data)}</script>`;
 }
 
@@ -417,7 +425,16 @@ async function projectList(request, env, user, path) {
   const rows = await all(env, `SELECT p.*, c.client_name, a.asset_code, e.full_name AS primary_name, (SELECT COUNT(*) FROM project_work_entries w WHERE w.project_id=p.id) AS work_count FROM projects p LEFT JOIN clients c ON c.id=p.client_id LEFT JOIN assets a ON a.id=p.asset_id LEFT JOIN employees e ON e.id=p.primary_employee_id${where} ORDER BY ${sort.order},p.id DESC LIMIT 25 OFFSET ?`, [...params, (page - 1) * 25]);
   const searchParams = listParams(url, ["q", "status", "client_id", "asset_id", "billing_basis", "start_date_from", "start_date_to"], sort);
   const [clients, assets] = await choices(env);
-  const listRows = rows.map((row) => `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.client_name || "")}</td><td>${esc(row.job_description)}</td><td>${esc(row.start_date)}${row.end_date ? ` – ${esc(row.end_date)}` : ""}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.primary_name || "")}</td><td>${esc(`${row.default_billing_quantity} ${row.billing_basis}${Number(row.default_billing_quantity) === 1 ? "" : "s"}`)}</td><td>${esc(row.work_count || 0)}</td><td>${badge(row.status)}</td><td><a href="/projects/${row.id}">View</a>${canEdit(user, PAGE) ? ` <a href="/projects/${row.id}/edit">Edit</a>` : ""}</td></tr>`);
+  const listRows = rows.map((row) => {
+    const noWork = !numeric(row.work_count);
+    const recordAction = canEdit(user, PAGE) && ["Draft", "Active"].includes(row.status)
+      ? ` <a class="status-action" href="/projects/${row.id}/work/new">Record Work</a>`
+      : "";
+    const reopenAction = canEdit(user, PAGE) && row.status === "Completed" && noWork
+      ? ` <form method="post" action="/projects/${row.id}/reopen-and-record-work" class="inline-status-form" onsubmit="return confirm('Reopen this project and record its actual daily work? No financial record will be created automatically.');"><button class="status-action">Reopen &amp; Record Work</button></form>`
+      : "";
+    return `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.client_name || "")}</td><td>${esc(row.job_description)}</td><td>${esc(row.start_date)}${row.end_date ? ` – ${esc(row.end_date)}` : ""}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.primary_name || "")}</td><td>${esc(`${row.default_billing_quantity} ${row.billing_basis}${Number(row.default_billing_quantity) === 1 ? "" : "s"}`)}</td><td>${esc(row.work_count || 0)}${noWork ? `<small class="cell-detail no-work-recorded">No work recorded</small>` : ""}</td><td>${badge(row.status)}</td><td><a href="/projects/${row.id}">View</a>${canEdit(user, PAGE) ? ` <a href="/projects/${row.id}/edit">Edit</a>` : ""}${recordAction}${reopenAction}</td></tr>`;
+  });
   const controls = `<section class="panel toolbar list-toolbar"><form method="get" class="list-query-form"><div class="list-search-row"><input name="q" value="${esc(query)}" placeholder="Search projects"><button>Apply</button><a class="button secondary" href="/projects">Clear</a></div><details class="list-filters" open><summary>Filters</summary><div class="list-filter-grid">${selectFilter("status", "Status", PROJECT_STATUSES.map((value) => [value, value]), status)}${selectFilter("client_id", "Client", clients.map((row) => [row.id, `${row.client_code || ""}, ${row.client_name}`]), clientId)}${selectFilter("asset_id", "Asset", assets.map((row) => [row.id, `${row.asset_code || ""}, ${row.plate_no || row.asset_type || ""}`]), assetId)}${selectFilter("billing_basis", "Billing basis", BASES.map((value) => [value, value]), billingBasis)}${dateFilter("start_date_from", "Start from", dateFrom)}${dateFilter("start_date_to", "Start to", dateTo)}</div></details></form><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button" href="/projects/new">New Project</a>` : ""}<a class="button secondary" href="/projects/export.csv${searchParams.toString() ? `?${searchParams}` : ""}">Export CSV</a></div></section>`;
   const headers = sortableHeaders([{ key: "project_no", label: "Project No." }, { key: "client", label: "Client" }, { key: "item_job", label: "Item / Job" }, { key: "start_date", label: "Dates" }, { key: "asset", label: "Asset" }, { key: "primary", label: "Primary" }, { key: "billing_basis", label: "Default Work" }, { key: "entries", label: "Entries" }, { key: "status", label: "Status" }, { label: "Actions" }], sort, searchParams);
   return html(layout({ title: "Projects List", user, path, content: `${messages(url)}${controls}${table(headers, listRows, { empty: "No projects found." })}${pagination("/projects", searchParams, page, count?.total)}` }));
@@ -433,6 +450,8 @@ async function projectFormPage(request, env, user, path, id = null) {
   }
   const data = await parseForm(request);
   const values = projectValues(data);
+  const saveAndRecord = !id && data.after_save === "record_work";
+  if (saveAndRecord) values.status = "Active";
   if (!values.project_no && values.start_date) values.project_no = await nextProjectNumber(env, values.start_date);
   const helperIds = [data.helper_1, data.helper_2, data.helper_3].map((value) => value || "");
   const primary = parseItems(data.primary_pay_items, "Primary");
@@ -444,6 +463,9 @@ async function projectFormPage(request, env, user, path, id = null) {
     return html(layout({ title: id ? "Edit Project Details" : "New Project Details", user, path, content: await projectForm(env, row, id, errors) }), 400);
   }
   const projectId = await saveProject(env, values, helperIds, payItems, id);
+  if (saveAndRecord) {
+    return redirect(`/projects/${projectId}/work/new?ok=${encodeURIComponent(`Project ${values.project_no} saved as Active. Record the actual daily work before Billing or Payroll.`)}`);
+  }
   return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`Project ${values.project_no} saved.`)}`);
 }
 
@@ -587,7 +609,7 @@ async function workFormPage(request, env, user, path, projectId, entryId = null)
     if (lock || row.status !== "Draft") return redirect(`/projects/${projectId}?error=${encodeURIComponent(lock || "Only Draft work entries can be edited.")}`);
   }
   if (request.method === "GET") {
-    return html(layout({ title: entryId ? "Edit Daily Work" : "New Daily Work", user, path, content: await workForm(env, project, row, entryId) }));
+    return html(layout({ title: entryId ? "Edit Daily Work" : "New Daily Work", user, path, content: `${messages(new URL(request.url))}${await workForm(env, project, row, entryId)}` }));
   }
   const data = await parseForm(request);
   const values = workValues(data, project, row);
@@ -662,9 +684,17 @@ async function projectDetail(request, env, user, path, id) {
   });
   const hero = `<section class="panel detail-hero"><div><span class="dialog-kicker">Equipment Project</span><h3>${esc(project.project_no)}</h3><p>${esc(project.client_name || "")} · ${esc(project.start_date)}${project.end_date ? ` to ${esc(project.end_date)}` : " onward"}</p></div>${badge(project.status)}</section>`;
   const details = `<div class="detail-grid"><section class="panel"><h3>Client &amp; Scope</h3><dl class="detail-list"><dt>Ref. No.</dt><dd>${esc(project.reference_no || "—")}</dd><dt>Item / Job</dt><dd>${esc(project.job_description)}</dd><dt>Location</dt><dd>${esc(project.project_location || "—")}</dd><dt>Route</dt><dd>${esc([project.origin, project.destination].filter(Boolean).join(" → ") || "—")}</dd></dl></section><section class="panel"><h3>Unit &amp; Crew</h3><dl class="detail-list"><dt>Asset</dt><dd>${esc([project.asset_code, project.plate_no, project.asset_type].filter(Boolean).join(", "))}</dd><dt>Primary</dt><dd>${esc([project.primary_code, project.primary_name, project.primary_type].filter(Boolean).join(", "))}</dd><dt>Helpers</dt><dd>${esc(helperNames)}</dd></dl></section><section class="panel"><h3>Default Client Billing</h3><dl class="detail-list"><dt>Quantity</dt><dd>${esc(`${project.default_billing_quantity} ${project.billing_basis}`)}</dd><dt>Unit rate</dt><dd>${esc(peso(project.client_unit_rate))}</dd><dt>Default extras</dt><dd>${esc(peso(projectExtraTotal(project)))}</dd></dl></section><section class="panel"><h3>Employee Pay Defaults</h3><dl class="detail-list"><dt>Primary</dt><dd>${esc(`${project.primary_pay_basis}, ${peso(project.primary_pay_rate)}`)}</dd><dt>Helper pool</dt><dd>${esc(`${project.helper_pay_basis}, ${peso(project.helper_pay_rate)}`)}</dd></dl></section></div>`;
-  const toolbar = `<div class="detail-toolbar project-detail-toolbar"><a class="button secondary" href="/projects">← Projects List</a><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button secondary" href="/projects/${id}/edit">Edit Project</a>${["Draft", "Active"].includes(project.status) ? `<a class="button" href="/projects/${id}/work/new">New Daily Work</a>` : ""}` : ""}</div></div>
+  const noWork = entries.length === 0;
+  const recordWork = canEdit(user, PAGE) && ["Draft", "Active"].includes(project.status)
+    ? `<a class="button" href="/projects/${id}/work/new">Record Daily Work</a>`
+    : "";
+  const reopenAndRecord = canEdit(user, PAGE) && project.status === "Completed" && noWork
+    ? `<form method="post" action="/projects/${id}/reopen-and-record-work" class="inline-status-form" onsubmit="return confirm('Reopen this project and record its actual daily work? No financial record will be created automatically.');"><button>Reopen &amp; Record Work</button></form>`
+    : "";
+  const toolbar = `<div class="detail-toolbar project-detail-toolbar"><a class="button secondary" href="/projects">← Projects List</a><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button secondary" href="/projects/${id}/edit">Edit Project</a>${recordWork}${reopenAndRecord}` : ""}</div></div>
     <section class="panel project-print-filter"><form method="get" action="/projects/${id}/print" target="_blank"><label>Date From<input type="date" name="date_from" value="${esc(project.start_date)}"></label><label>Date To<input type="date" name="date_to" value="${esc(project.end_date || todayISO())}"></label><button class="button secondary">Print Project Summary</button></form></section>`;
-  const work = `<section class="panel"><div class="section-header"><h3>Daily Work Entries</h3><span>${entries.length} entries</span></div>${table(["Work No.", "Date", "Ref. No.", "Unit", "Quantity", "Rate", "Extras", "Total", "Status", "Actions"], rows, { bare: true, empty: "No daily work entries yet." })}</section>`;
+  const emptyWork = `<div class="empty-state project-work-empty"><h4>No daily work recorded</h4><p>Project values are reusable defaults only. They are not included in Billing or Payroll until you record actual daily work and mark that entry Completed.</p>${recordWork || reopenAndRecord || ""}<p class="muted">You may record multiple entries for different dates, shifts, trips, hours, or days.</p></div>`;
+  const work = `<section class="panel"><div class="section-header"><h3>Daily Work Entries</h3><span>${entries.length} entries</span></div>${noWork ? emptyWork : table(["Work No.", "Date", "Ref. No.", "Unit", "Quantity", "Rate", "Extras", "Total", "Status", "Actions"], rows, { bare: true })}</section>`;
   const danger = canEdit(user, PAGE) ? `<section class="detail-danger"><form method="post" action="/projects/${id}/delete" onsubmit="return confirm('Delete this project? Projects with work entries cannot be deleted.');"><button class="danger-button">Delete Project</button></form></section>` : "";
   return html(layout({ title: "Project Details", user, path, content: `${messages(url)}${toolbar}${hero}${details}${project.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(project.notes)}</p></section>` : ""}${work}${danger}` }));
 }
@@ -679,6 +709,20 @@ async function projectDelete(request, env, user, path, id) {
   if (numeric(count?.total)) return redirect(`/projects/${id}?error=${encodeURIComponent("Projects with daily work entries cannot be deleted. Complete or cancel the project instead.")}`);
   await run(env, "DELETE FROM projects WHERE id=?", [id]);
   return redirect(`/projects?ok=${encodeURIComponent(`${project.project_no} deleted.`)}`);
+}
+
+async function projectReopenAndRecordWork(request, env, user, path, id) {
+  const access = requireEdit(user, PAGE);
+  if (access) return fail(access, user, path);
+  if (request.method !== "POST") return html("Reopen requires POST.", 405);
+  const project = await loadProject(env, id);
+  if (!project) return redirect("/projects?error=Project%20not%20found.");
+  const count = await first(env, "SELECT COUNT(*) AS total FROM project_work_entries WHERE project_id=?", [id]);
+  if (project.status !== "Completed" || numeric(count?.total)) {
+    return redirect(`/projects/${id}?error=${encodeURIComponent("Only completed projects with no daily work entries can be reopened this way.")}`);
+  }
+  await run(env, "UPDATE projects SET status='Active' WHERE id=?", [id]);
+  return redirect(`/projects/${id}/work/new?ok=${encodeURIComponent("Project reopened as Active. Record the actual daily work before Billing or Payroll.")}`);
 }
 
 async function projectExport(request, env, user, path) {
@@ -752,6 +796,8 @@ export async function handleProjects({ request, env, user, path }) {
   if (match) return projectFormPage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/projects\/(\d+)\/delete$/);
   if (match) return projectDelete(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/projects\/(\d+)\/reopen-and-record-work$/);
+  if (match) return projectReopenAndRecordWork(request, env, user, path, Number(match[1]));
   match = path.match(/^\/projects\/(\d+)\/work\/new$/);
   if (match) return workFormPage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/projects\/(\d+)\/work\/(\d+)\/edit$/);
