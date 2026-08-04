@@ -4,6 +4,7 @@ import fs from "node:fs";
 
 import { handleRequest } from "../src/app.mjs";
 import { createSession, verifyPassword } from "../src/auth.mjs";
+import { layout, loginPage, table } from "../src/html.mjs";
 
 function envWithRows(rows = {}) {
   return {
@@ -2496,6 +2497,8 @@ test("database setup failures return a safe 503 page instead of a Worker excepti
   assert.equal(response.status, 503);
   assert.match(text, /Application setup required/);
   assert.match(text, /Cloudflare D1 database binding and setup/);
+  assert.match(text, /href="\/favicon\.svg\?v=1"/);
+  assert.match(text, /rel="apple-touch-icon"/);
   assert.doesNotMatch(text, /TypeError|prepare|stack|undefined/);
 });
 
@@ -2922,10 +2925,19 @@ test("quick create shows supported controls, preserves role restrictions, and cr
   assert.match(tripBody, /data-quick-create-kind="client"/);
   assert.match(tripBody, /data-quick-create-kind="recurring"/);
   assert.match(tripBody, /data-quick-create-kind="employee" data-quick-create-context="driver"/);
+  assert.doesNotMatch(tripBody, /quick-create-slot|quick-create-button/);
 
   let response = await handleRequest(await authedRequest("https://example.test/quick-create/employee?context=driver", "admin"), envWithRows());
   assert.equal(response.status, 200);
   assert.match(await response.text(), /Add Driver/);
+  response = await handleRequest(await authedRequest("https://example.test/quick-create/client?prefill=New%20Client", "admin"), envWithRows());
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /name="client_name" value="New Client"/);
+  for (const [kind, field] of [["employee", "full_name"], ["asset", "asset_code"], ["supplier", "supplier_name"], ["recurring", "master_code"]]) {
+    response = await handleRequest(await authedRequest(`https://example.test/quick-create/${kind}?prefill=Typed%20Value`, "admin"), envWithRows());
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), new RegExp(`name="${field}" value="Typed Value"`));
+  }
   assert.match(await (await handleRequest(await authedRequest("https://example.test/quick-create/client", "viewer"), envWithRows())).text(), /not have permission/i);
 
   response = await handleRequest(await authedRequest("https://example.test/quick-create/client", "admin", {
@@ -2949,6 +2961,67 @@ test("quick create shows supported controls, preserves role restrictions, and cr
   assert.ok(runs.some((row) => row.sql.includes("INSERT INTO clients")));
 
   const browser = fs.readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(browser, /\+ Add \$\{label\}/);
+  assert.match(browser, /combobox-quick-create-option/);
+  assert.match(browser, /Create “\$\{queryText\}” as \$\{quickCreate\.label\}/);
+  assert.doesNotMatch(browser, /quick-create-button/);
   assert.match(browser, /Your current form is still unchanged/);
+});
+
+test("shared pages expose GMT icons and the role-aware mobile navigation shell", () => {
+  const page = layout({
+    title: "Trips List",
+    user: { username: "encoder", role: "encoder", appName: "GMT Trucking" },
+    path: "/trips",
+    content: "<p>Trips</p>",
+  });
+  const login = loginPage("", "GMT Trucking");
+  for (const markup of [page, login]) {
+    assert.match(markup, /rel="icon" type="image\/svg\+xml" href="\/favicon\.svg\?v=1"/);
+    assert.match(markup, /rel="icon" type="image\/png" sizes="32x32"/);
+    assert.match(markup, /rel="apple-touch-icon" sizes="180x180"/);
+    assert.match(markup, /name="theme-color" content="#0e2f4c"/);
+  }
+  assert.match(page, /class="mobile-header"/);
+  assert.match(page, /data-nav-open/);
+  assert.match(page, /id="app-navigation"/);
+  assert.match(page, /data-mobile-nav/);
+  assert.match(page, /data-nav-backdrop/);
+  assert.match(page, /Trips List/);
+  assert.doesNotMatch(page, /User Management/);
+});
+
+test("responsive tables carry mobile labels without changing cell contents", () => {
+  const markup = table(
+    [{ mobileLabel: "Code", html: '<a href="?sort=code">Code</a>' }, "Status", "Actions"],
+    ['<tr><td>EMP-001</td><td><span class="status">Active</span></td><td><a href="/employees/1/edit">Edit</a></td></tr>'],
+  );
+  assert.match(markup, /class="table-scroll responsive-table/);
+  assert.match(markup, /data-label="Code">EMP-001/);
+  assert.match(markup, /data-label="Status"><span class="status">Active/);
+  assert.match(markup, /data-label="Actions"><a href="\/employees\/1\/edit">Edit/);
+});
+
+test("mobile assets and interaction hooks are present", () => {
+  const publicUrl = new URL("../public/", import.meta.url);
+  const svg = fs.readFileSync(new URL("favicon.svg", publicUrl), "utf8");
+  const favicon = fs.readFileSync(new URL("favicon-32.png", publicUrl));
+  const touchIcon = fs.readFileSync(new URL("apple-touch-icon.png", publicUrl));
+  const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+  assert.match(svg, /#0e2f4c/);
+  assert.match(svg, /#2f80ed/);
+  assert.deepEqual(favicon.subarray(0, 4), pngSignature);
+  assert.deepEqual(touchIcon.subarray(0, 4), pngSignature);
+
+  const css = fs.readFileSync(new URL("app.css", publicUrl), "utf8");
+  const browser = fs.readFileSync(new URL("app.js", publicUrl), "utf8");
+  assert.match(css, /\.mobile-header/);
+  assert.match(css, /body\.nav-open/);
+  assert.match(css, /\.responsive-table tbody td::before/);
+  assert.match(css, /\.mobile-accordion-toggle/);
+  assert.match(css, /safe-area-inset-bottom/);
+  assert.match(css, /100dvh/);
+  assert.match(browser, /function setupMobileNavigation/);
+  assert.match(browser, /function setupMobileAccordions/);
+  assert.match(browser, /function setupMobileFilters/);
+  assert.match(browser, /keepFocusInside/);
 });

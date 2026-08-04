@@ -10,6 +10,10 @@ const nav = [
   ["System", [["User Management", "/users"], ["Settings", "/settings"], ["Data Tools", "/data-tools"]]],
 ];
 
+export function appHead(title, { script = true } = {}) {
+  return `<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0e2f4c"><title>${esc(title)}</title><link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1"><link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=1"><link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=1"><link rel="stylesheet" href="/app.css">${script ? `<script>document.documentElement.classList.add('js')</script><script defer src="/app.js"></script>` : ""}`;
+}
+
 export function layout({ title, user, path = "/", content, appName = "GMT Trucking" }) {
   const brand = user?.appName || appName;
   const menu = nav.map(([group, items]) => {
@@ -25,11 +29,12 @@ export function layout({ title, user, path = "/", content, appName = "GMT Trucki
     }).join("");
     return links ? `<section class="nav-group"><h2>${esc(group)}</h2>${links}</section>` : "";
   }).join("");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · ${esc(brand)}</title><link rel="stylesheet" href="/app.css"><script>document.documentElement.classList.add('js')</script><script defer src="/app.js"></script></head><body><div class="app-shell"><aside class="sidebar"><div class="sidebar-brand"><h1>${esc(brand)}</h1><p>${esc(user?.username || "")} · ${esc(user?.role || "")}</p></div><div class="sidebar-scroll"><nav>${menu}</nav></div><form class="sidebar-footer" method="post" action="/logout"><button class="button secondary">Sign out</button></form></aside><main class="app-main"><header class="page-header"><h1>${esc(title)}</h1><span>${esc(brand)}</span></header><div class="page-content">${content}</div></main></div></body></html>`;
+  const identity = `${user?.username || ""} · ${user?.role || ""}`;
+  return `<!doctype html><html lang="en"><head>${appHead(`${title} · ${brand}`)}</head><body><header class="mobile-header"><button class="mobile-menu-button" type="button" data-nav-open aria-controls="app-navigation" aria-expanded="false"><span aria-hidden="true">☰</span><span class="sr-only">Open navigation</span></button><div class="mobile-header-title"><strong>${esc(brand)}</strong><span>${esc(title)}</span></div><span class="mobile-user">${esc(identity)}</span></header><div class="mobile-nav-backdrop" data-nav-backdrop hidden></div><div class="app-shell"><aside class="sidebar" id="app-navigation" aria-label="Application navigation" data-mobile-nav><div class="sidebar-brand"><div><h1>${esc(brand)}</h1><p>${esc(identity)}</p></div><button class="mobile-nav-close" type="button" data-nav-close aria-label="Close navigation">×</button></div><div class="sidebar-scroll"><nav>${menu}</nav></div><form class="sidebar-footer" method="post" action="/logout"><button class="button secondary">Sign out</button></form></aside><main class="app-main"><header class="page-header"><h1>${esc(title)}</h1><span>${esc(brand)}</span></header><div class="page-content">${content}</div></main></div></body></html>`;
 }
 
 export function loginPage(error = "", appName = "GMT Trucking") {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · ${esc(appName)}</title><link rel="stylesheet" href="/app.css"></head><body class="login"><form method="post" class="login-card"><h1>${esc(appName)}</h1><p class="muted">Sign in to continue.</p>${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}<label>Username<input name="username" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form></body></html>`;
+  return `<!doctype html><html lang="en"><head>${appHead(`Sign in · ${appName}`, { script: false })}</head><body class="login"><form method="post" class="login-card"><h1>${esc(appName)}</h1><p class="muted">Sign in to continue.</p>${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}<label>Username<input name="username" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form></body></html>`;
 }
 
 export function cards(items) {
@@ -37,16 +42,30 @@ export function cards(items) {
 }
 
 export function table(headers, rows, { empty = "No records found.", bare = false, className = "" } = {}) {
+  const mobileLabels = headers.map((header) => {
+    if (typeof header === "string") return header;
+    if (header?.mobileLabel) return header.mobileLabel;
+    return String(header?.html || "").replace(/<[^>]+>/g, "").replace(/[▲▼△▽]/g, "").trim();
+  });
   const headerMarkup = headers.map((header) => {
     if (header && typeof header === "object" && "html" in header) return `<th${header.className ? ` class="${esc(header.className)}"` : ""}>${header.html}</th>`;
     return `<th>${esc(header)}</th>`;
   }).join("");
-  const markup = `<div class="table-scroll ${esc(className)}"><table><thead><tr>${headerMarkup}</tr></thead><tbody>${rows.length ? rows.join("") : `<tr><td class="empty-state" colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+  const responsiveRows = rows.map((row) => {
+    let cell = 0;
+    return row.replace(/<td([^>]*)>/g, (match, attrs = "") => {
+      const label = mobileLabels[cell++] || "";
+      if (/data-label=/.test(attrs) || /empty-state/.test(attrs)) return match;
+      return `<td${attrs} data-label="${esc(label)}">`;
+    });
+  });
+  const markup = `<div class="table-scroll responsive-table ${esc(className)}"><table><thead><tr>${headerMarkup}</tr></thead><tbody>${rows.length ? responsiveRows.join("") : `<tr><td class="empty-state" colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
   return bare ? markup : `<section class="panel table-panel">${markup}</section>`;
 }
 
 export function textInput(name, label, value = "", attrs = "") {
-  return `<label>${esc(label)}<input name="${esc(name)}" value="${esc(value)}" ${attrs}></label>`;
+  const inferred = attrs.includes("type=") ? "" : /email/i.test(name) ? 'type="email" inputmode="email"' : /(contact|phone|mobile|telephone)/i.test(name) ? 'type="tel" inputmode="tel"' : "";
+  return `<label>${esc(label)}<input name="${esc(name)}" value="${esc(value)}" ${inferred} ${attrs}></label>`;
 }
 
 export function numberInput(name, label, value = "0") {
@@ -63,8 +82,7 @@ export function selectInput(name, label, rows, selected = "", labeler = (row) =>
   const selectedRow = rows.find((row) => String(row.id) === String(selected));
   const selectedLabel = selectedRow ? labeler(selectedRow) : "";
   if (quickCreate) {
-    const quick = `<span class="quick-create-slot" data-quick-create data-quick-create-kind="${esc(quickCreate.kind)}" data-quick-create-context="${esc(quickCreate.context || "")}" data-quick-create-label="${esc(quickCreate.label || label)}" data-quick-create-empty="${rows.length ? "0" : "1"}"></span>`;
-    return `<label class="combobox-field">${esc(label)}<span class="combobox-row"><span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" title="${esc(selectedLabel)}" placeholder="Search or select" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>v</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span>${quick}</span></label>`;
+    return `<label class="combobox-field">${esc(label)}<span class="combobox" data-combobox data-quick-create data-quick-create-kind="${esc(quickCreate.kind)}" data-quick-create-context="${esc(quickCreate.context || "")}" data-quick-create-label="${esc(quickCreate.label || label)}"><input type="text" class="combobox-input" value="${esc(selectedLabel)}" title="${esc(selectedLabel)}" placeholder="Search or select" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>v</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span></label>`;
   }
   return `<label class="combobox-field">${esc(label)}<span class="combobox" data-combobox><input type="text" class="combobox-input" value="${esc(selectedLabel)}" title="${esc(selectedLabel)}" placeholder="Search or select…" role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off" data-combobox-input><button class="combobox-toggle" type="button" tabindex="-1" aria-label="Show options" data-combobox-toggle>▾</button><span class="combobox-options" role="listbox" data-combobox-options></span><select name="${esc(name)}" data-searchable-select${attrs ? ` ${attrs}` : ""}>${options}</select></span></label>`;
 }

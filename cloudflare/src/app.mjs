@@ -1,7 +1,7 @@
 import { canEdit, canView, requireEdit, requireView } from "./access.mjs";
 import { createSession, clearSessionHeaders, hashPassword, readSession, sessionHeaders, verifyPassword } from "./auth.mjs";
 import { all, first, run } from "./db.mjs";
-import { cards, dialogShell, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
+import { appHead, cards, dialogShell, formPanel, layout, loginPage, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
 import { EXTRA_FIELDS, HELPER_LIMITS, applyVat, billingStatus, calculateNet, choiceLabel, nextTripTicketNo, outstandingBalance, projectEmployeeBasePay, projectExtraTotal, tripBillableTotal, tripExtraTotal } from "./services.mjs";
 import { handleProjects } from "./projects.mjs";
 import { csv, esc, html, json, money, parseForm, peso, redirect, todayISO } from "./utils.mjs";
@@ -641,7 +641,7 @@ function dashboardOverview(model, user) {
 function dashboardFilterBar(filters, department, departments) {
   const tabs = departments.map((item) => `<a class="dashboard-tab${department === item.key ? " active" : ""}" href="${esc(dashboardHref(filters, item.key))}"${department === item.key ? ' aria-current="page"' : ""}>${esc(item.label)}</a>`).join("");
   const rangeMessage = filters.invalidDateRange ? `<p class="error dashboard-filter-error">Date From must not be after Date To. The current month is displayed instead.</p>` : "";
-  return `<section class="dashboard-controls"><div class="dashboard-tabs" aria-label="Dashboard departments">${tabs}</div><form method="get" class="dashboard-filter-form"><input type="hidden" name="tab" value="${esc(department)}"><label>From<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>To<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Apply</button><a class="button secondary" href="${esc(dashboardHref({ ...filters, ...currentMonthBounds() }, department))}">Current Month</a><a class="button quiet" href="/">Clear</a></form>${rangeMessage}</section>`;
+  return `<section class="dashboard-controls"><div class="dashboard-tabs" aria-label="Dashboard departments">${tabs}</div><details class="dashboard-mobile-filters" open><summary>Period filters</summary><form method="get" class="dashboard-filter-form"><input type="hidden" name="tab" value="${esc(department)}"><label>From<input type="date" name="date_from" value="${esc(filters.date_from)}"></label><label>To<input type="date" name="date_to" value="${esc(filters.date_to)}"></label><button>Apply</button><a class="button secondary" href="${esc(dashboardHref({ ...filters, ...currentMonthBounds() }, department))}">Current Month</a><a class="button quiet" href="/">Clear</a></form></details>${rangeMessage}</section>`;
 }
 
 async function dashboardPage(request, env, user, path) {
@@ -726,7 +726,7 @@ function sortableHeaders(columns, sort, params, { sortName = "sort", dirName = "
     next.delete("page");
     const indicator = selected ? (sort.dir === "asc" ? " ▲" : " ▼") : "";
     const state = selected ? `, sorted ${sort.dir === "asc" ? "ascending" : "descending"}` : "";
-    return { html: `<a class="sort-link${selected ? " is-sorted" : ""}" href="?${esc(next.toString())}" aria-label="Sort by ${esc(column.label)}${state}">${esc(column.label)}<span aria-hidden="true">${indicator}</span></a>` };
+    return { mobileLabel: column.label, html: `<a class="sort-link${selected ? " is-sorted" : ""}" href="?${esc(next.toString())}" aria-label="Sort by ${esc(column.label)}${state}">${esc(column.label)}<span aria-hidden="true">${indicator}</span></a>` };
   });
 }
 
@@ -1042,6 +1042,17 @@ function quickEmployeeType(context, data = {}) {
   return ["Driver", "Helper", "Operator", "Mechanic"].includes(data.employee_type) ? data.employee_type : "Driver";
 }
 
+function quickCreatePrefill(kind, text) {
+  const value = String(text || "").trim().slice(0, 100);
+  if (!value) return {};
+  if (kind === "client") return { client_name: value };
+  if (kind === "employee") return { full_name: value };
+  if (kind === "asset") return { asset_code: value };
+  if (kind === "supplier") return { supplier_name: value };
+  if (kind === "recurring") return { master_code: value };
+  return {};
+}
+
 function quickCreateValues(kind, data, context = "") {
   if (kind === "recurring") return recurringValues(data);
   const path = { client: "/clients", employee: "/employees", asset: "/fleet", supplier: "/suppliers" }[kind];
@@ -1091,7 +1102,10 @@ async function quickCreatePage(request, env, user, kind, context = "") {
   if (!QUICK_CREATE_PAGES[kind]) return json({ ok: false, error: "Unsupported quick-create record." }, 404);
   const normalizedContext = ["driver", "helper", "primary", "employee"].includes(context) ? context : "";
   const choices = kind === "recurring" ? await quickCreateChoices(env) : {};
-  if (request.method === "GET") return html(quickCreateDialog(kind, normalizedContext, {}, [], choices));
+  if (request.method === "GET") {
+    const prefill = new URL(request.url).searchParams.get("prefill") || "";
+    return html(quickCreateDialog(kind, normalizedContext, quickCreatePrefill(kind, prefill), [], choices));
+  }
   if (request.method !== "POST") return json({ ok: false, error: "Quick create requires POST." }, 405);
   const data = await parseForm(request);
   const values = quickCreateValues(kind, data, normalizedContext);
@@ -4026,7 +4040,7 @@ async function placeholder(title, user, path, page) {
 }
 
 function unavailablePage() {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GMT Trucking temporarily unavailable</title><link rel="stylesheet" href="/app.css"></head><body class="login"><section class="login-card"><h1>GMT Trucking</h1><h2>Application setup required</h2><p>The application could not reach its required setup data. No data was changed.</p><p class="muted">An administrator should verify the Cloudflare D1 database binding and setup, then sign in and open Data Tools for the staged live-use checklist.</p><p><a class="button" href="/login">Return to sign in</a></p></section></body></html>`;
+  return `<!doctype html><html lang="en"><head>${appHead("GMT Trucking temporarily unavailable", { script: false })}</head><body class="login"><section class="login-card"><h1>GMT Trucking</h1><h2>Application setup required</h2><p>The application could not reach its required setup data. No data was changed.</p><p class="muted">An administrator should verify the Cloudflare D1 database binding and setup, then sign in and open Data Tools for the staged live-use checklist.</p><p><a class="button" href="/login">Return to sign in</a></p></section></body></html>`;
 }
 
 export async function handleRequest(request, env) {

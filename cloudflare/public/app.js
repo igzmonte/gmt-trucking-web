@@ -1,6 +1,61 @@
 (() => {
   const moneyFields = ["fuel_surcharge", "loading_fee", "unloading_fee", "waiting_fee", "tolls", "additional_stop_charge", "special_handling_fee", "other_charges"];
 
+  function focusable(root) {
+    return [...root.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]):not([type="hidden"]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter((element) => !element.hidden && element.getClientRects().length);
+  }
+
+  function keepFocusInside(event, root) {
+    if (event.key !== "Tab") return;
+    const items = focusable(root);
+    if (!items.length) return;
+    const first = items[0]; const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+
+  function setupMobileNavigation() {
+    const nav = document.querySelector("[data-mobile-nav]");
+    const openButton = document.querySelector("[data-nav-open]");
+    const closeButton = document.querySelector("[data-nav-close]");
+    const backdrop = document.querySelector("[data-nav-backdrop]");
+    if (!nav || !openButton || !backdrop) return;
+    const media = matchMedia("(max-width: 760px)");
+    let returnFocus = openButton;
+    const isOpen = () => document.body.classList.contains("nav-open");
+    function close({ restore = true } = {}) {
+      document.body.classList.remove("nav-open");
+      openButton.setAttribute("aria-expanded", "false");
+      backdrop.hidden = true;
+      if (media.matches) nav.inert = true;
+      if (restore) returnFocus?.focus();
+    }
+    function open() {
+      if (!media.matches) return;
+      returnFocus = document.activeElement;
+      nav.inert = false;
+      backdrop.hidden = false;
+      document.body.classList.add("nav-open");
+      openButton.setAttribute("aria-expanded", "true");
+      requestAnimationFrame(() => focusable(nav)[0]?.focus());
+    }
+    function sync() {
+      if (media.matches) close({ restore: false });
+      else { document.body.classList.remove("nav-open"); backdrop.hidden = true; nav.inert = false; openButton.setAttribute("aria-expanded", "false"); }
+    }
+    openButton.addEventListener("click", open);
+    closeButton?.addEventListener("click", () => close());
+    backdrop.addEventListener("click", () => close());
+    nav.querySelectorAll("a[href]").forEach((link) => link.addEventListener("click", () => { if (media.matches) close({ restore: false }); }));
+    document.addEventListener("keydown", (event) => {
+      if (!media.matches || !isOpen()) return;
+      if (event.key === "Escape") { event.preventDefault(); close(); }
+      else keepFocusInside(event, nav);
+    });
+    media.addEventListener?.("change", sync);
+    sync();
+  }
+
   function setSelectValue(form, name, value) {
     const select = form.querySelector(`select[name="${name}"]`);
     if (!select || value === undefined || value === null || value === "") return;
@@ -29,6 +84,10 @@
       const select = box.querySelector("select[data-searchable-select]");
       if (!input || !list || !select) return;
       let active = -1;
+      const quickCreate = box.hasAttribute("data-quick-create")
+        && /admin|encoder/.test(document.querySelector(".sidebar-brand p")?.textContent?.toLowerCase() || "")
+        ? { kind: box.dataset.quickCreateKind || "", context: box.dataset.quickCreateContext || "", label: box.dataset.quickCreateLabel || "record" }
+        : null;
 
       function choices(query = "") {
         const text = query.trim().toLocaleLowerCase();
@@ -36,17 +95,50 @@
       }
       function render(query = "") {
         const options = choices(query);
-        active = Math.min(active, options.length - 1);
-        list.innerHTML = options.map((option, index) => `<button type="button" class="combobox-option${index === active ? " active" : ""}" role="option" data-value="${option.value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${option.textContent.replaceAll("&", "&amp;").replaceAll("<", "&lt;")}</button>`).join("");
-        list.querySelectorAll(".combobox-option").forEach((button) => button.addEventListener("mousedown", (event) => {
-          event.preventDefault();
-          choose(button.dataset.value);
-        }));
+        const queryText = query.trim();
+        const canCreate = Boolean(quickCreate && queryText && !options.length);
+        const total = options.length + (canCreate ? 1 : 0);
+        active = total && active >= 0 ? Math.min(active, total - 1) : -1;
+        list.replaceChildren();
+        options.forEach((option, index) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = `combobox-option${index === active ? " active" : ""}`;
+          button.setAttribute("role", "option");
+          button.dataset.value = option.value;
+          button.textContent = option.textContent;
+          button.addEventListener("mousedown", (event) => { event.preventDefault(); choose(button.dataset.value); });
+          list.append(button);
+        });
+        if (canCreate) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = `combobox-option combobox-quick-create-option${active === options.length ? " active" : ""}`;
+          button.setAttribute("role", "option");
+          button.dataset.quickCreateQuery = queryText;
+          button.textContent = `Create “${queryText}” as ${quickCreate.label}`;
+          button.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            requestQuickCreate(queryText);
+          });
+          list.append(button);
+        } else if (!options.length) {
+          const empty = document.createElement("span");
+          empty.className = "combobox-empty";
+          empty.setAttribute("role", "option");
+          empty.setAttribute("aria-disabled", "true");
+          empty.textContent = quickCreate && !queryText ? "No records yet — type a name or code to create one" : queryText ? "No matching records" : "No options available";
+          list.append(empty);
+        }
       }
       function open(query = input.value) {
         box.classList.add("open"); input.setAttribute("aria-expanded", "true"); render(query);
       }
       function close() { box.classList.remove("open"); input.setAttribute("aria-expanded", "false"); active = -1; }
+      function requestQuickCreate(query) {
+        close();
+        box.dispatchEvent(new CustomEvent("quick-create-request", { bubbles: true, detail: { box, query } }));
+      }
       function choose(value) {
         select.value = value;
         input.value = select.selectedOptions[0]?.textContent || "";
@@ -58,9 +150,16 @@
       input.addEventListener("input", () => open(input.value));
       input.addEventListener("keydown", (event) => {
         const options = choices(input.value);
+        const queryText = input.value.trim();
+        const canCreate = Boolean(quickCreate && queryText && !options.length);
+        const total = options.length + (canCreate ? 1 : 0);
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-          event.preventDefault(); active = Math.max(0, Math.min(options.length - 1, active + (event.key === "ArrowDown" ? 1 : -1))); render(input.value);
-        } else if (event.key === "Enter" && active >= 0) { event.preventDefault(); choose(options[active].value); }
+          event.preventDefault(); active = total ? Math.max(0, Math.min(total - 1, active + (event.key === "ArrowDown" ? 1 : -1))) : -1; render(input.value);
+        } else if (event.key === "Enter" && active >= 0) {
+          event.preventDefault();
+          if (canCreate && active === options.length) requestQuickCreate(queryText);
+          else if (options[active]) choose(options[active].value);
+        }
         else if (event.key === "Escape") close();
       });
       toggle?.addEventListener("click", () => box.classList.contains("open") ? close() : (input.focus(), open("")));
@@ -93,7 +192,10 @@
     const close = dialog.querySelector(".dialog-close");
     const href = close?.getAttribute("href") || "/";
     document.querySelector("[data-dialog-backdrop]")?.addEventListener("click", () => location.assign(href));
-    document.addEventListener("keydown", (event) => { if (event.key === "Escape") location.assign(href); });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") location.assign(href);
+      else keepFocusInside(event, dialog);
+    });
     requestAnimationFrame(() => dialog.querySelector("input:not([type=hidden]),select,textarea,button")?.focus());
   }
 
@@ -105,16 +207,28 @@
       if (!box) { box = document.createElement("section"); box.className = "quick-create-errors"; overlay.querySelector(".dialog-body")?.prepend(box); }
       box.textContent = message;
     }
-    function mount(markup, trigger) {
+    function mount(markup, trigger, query = "") {
       const holder = document.createElement("div"); holder.innerHTML = markup;
       const overlay = holder.firstElementChild;
       if (!overlay) return;
       document.body.append(overlay);
       setupComboboxes(overlay);
-      const close = () => { overlay.remove(); trigger?.focus(); };
+      let keydown;
+      const close = ({ preserveQuery = true } = {}) => {
+        if (keydown) document.removeEventListener("keydown", keydown);
+        overlay.remove();
+        const input = trigger?.querySelector("[data-combobox-input]");
+        if (input) {
+          if (preserveQuery) { input.value = query; input.title = query; }
+          input.focus();
+        }
+      };
       overlay.querySelectorAll("[data-quick-create-close]").forEach((button) => button.addEventListener("click", close));
       overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
-      const keydown = (event) => { if (event.key === "Escape") { event.preventDefault(); document.removeEventListener("keydown", keydown); close(); } };
+      keydown = (event) => {
+        if (event.key === "Escape") { event.preventDefault(); close(); }
+        else keepFocusInside(event, overlay.querySelector("[data-quick-create-dialog]") || overlay);
+      };
       document.addEventListener("keydown", keydown);
       const form = overlay.querySelector("[data-quick-create-form]");
       form?.addEventListener("submit", async (event) => {
@@ -125,12 +239,11 @@
           const response = await fetch(form.action, { method: "POST", body: new FormData(form), headers: { Accept: "application/json" } });
           const payload = await response.json();
           if (!payload.ok) {
-            if (payload.dialog) { document.removeEventListener("keydown", keydown); overlay.remove(); mount(payload.dialog, trigger); }
+            if (payload.dialog) { document.removeEventListener("keydown", keydown); overlay.remove(); mount(payload.dialog, trigger, query); }
             else formError(overlay, payload.error || "Could not create the record.");
             return;
           }
-          const slot = trigger.closest("[data-quick-create]");
-          const select = slot?.closest("label")?.querySelector("select[data-searchable-select]");
+          const select = trigger?.querySelector("select[data-searchable-select]");
           if (!select) throw new Error("The related selection could not be updated.");
           const old = [...select.options].find((option) => String(option.value) === String(payload.record.id));
           if (old) old.textContent = payload.record.label;
@@ -145,29 +258,31 @@
             }
           }
           select.dispatchEvent(new Event("change", { bubbles: true }));
-          document.removeEventListener("keydown", keydown); close();
+          close({ preserveQuery: false });
         } catch (error) {
           formError(overlay, error?.message || "Network error. Your current form is still unchanged.");
         } finally { if (submit) submit.disabled = false; }
       });
       requestAnimationFrame(() => overlay.querySelector("input:not([type=hidden]), select, textarea, button")?.focus());
     }
-    document.querySelectorAll("[data-quick-create]").forEach((slot) => {
-      const label = slot.dataset.quickCreateLabel || slot.closest("label")?.firstChild?.textContent || "record";
-      const button = document.createElement("button");
-      button.type = "button"; button.className = "quick-create-button";
-      button.textContent = slot.dataset.quickCreateEmpty === "1" ? `+ Add ${label} (no records yet)` : `+ Add ${label}`;
-      button.addEventListener("click", async () => {
-        button.disabled = true;
-        try {
-          const params = new URLSearchParams(); if (slot.dataset.quickCreateContext) params.set("context", slot.dataset.quickCreateContext);
-          const response = await fetch(`/quick-create/${encodeURIComponent(slot.dataset.quickCreateKind)}${params.toString() ? `?${params}` : ""}`, { headers: { Accept: "text/html" } });
-          if (!response.ok) throw new Error("Quick create is not available.");
-          mount(await response.text(), button);
-        } catch (error) { button.insertAdjacentText("afterend", ` ${error?.message || "Could not open quick create."}`); }
-        finally { button.disabled = false; }
-      });
-      slot.append(button);
+    document.addEventListener("quick-create-request", async (event) => {
+      const trigger = event.detail?.box;
+      const query = String(event.detail?.query || "").trim();
+      if (!trigger || !query) return;
+      const params = new URLSearchParams({ prefill: query });
+      if (trigger.dataset.quickCreateContext) params.set("context", trigger.dataset.quickCreateContext);
+      try {
+        const response = await fetch(`/quick-create/${encodeURIComponent(trigger.dataset.quickCreateKind)}?${params}`, { headers: { Accept: "text/html" } });
+        if (!response.ok) throw new Error("Quick create is not available.");
+        mount(await response.text(), trigger, query);
+      } catch (error) {
+        const message = document.createElement("span");
+        message.className = "quick-create-message error";
+        message.textContent = error?.message || "Could not open quick create.";
+        trigger.parentElement?.append(message);
+        setTimeout(() => message.remove(), 5000);
+        trigger.querySelector("[data-combobox-input]")?.focus();
+      }
     });
   }
 
@@ -277,5 +392,59 @@
     update();
   }
 
-  setupComboboxes(); setupTabs(); setupDialogs(); setupQuickCreate(); setupTripForm(); setupProjectForms(); setupRepairTotal();
+  function setupMobileAccordions() {
+    const media = matchMedia("(max-width: 760px)");
+    const roots = document.querySelectorAll("[data-trip-form], [data-project-form], [data-project-work-form]");
+    roots.forEach((root) => {
+      const sections = [...root.querySelectorAll(".workspace-card")].filter((section) => section.querySelector(":scope > h3"));
+      sections.forEach((section, index) => {
+        const title = section.querySelector(":scope > h3");
+        if (!title || section.dataset.mobileAccordionReady) return;
+        section.dataset.mobileAccordionReady = "1";
+        section.classList.add("mobile-accordion-section");
+        title.classList.add("mobile-accordion-title");
+        const button = document.createElement("button");
+        button.type = "button"; button.className = "mobile-accordion-toggle";
+        button.innerHTML = `<span>${title.textContent}</span><span aria-hidden="true" data-accordion-icon>⌄</span>`;
+        title.after(button);
+        const hasError = Boolean(section.querySelector(".error,[aria-invalid='true']"));
+        const setOpen = (open) => {
+          section.classList.toggle("is-collapsed", !open);
+          button.setAttribute("aria-expanded", String(open));
+          button.querySelector("[data-accordion-icon]").textContent = open ? "⌃" : "⌄";
+        };
+        button.addEventListener("click", () => setOpen(section.classList.contains("is-collapsed")));
+        section._mobileSetOpen = setOpen;
+        setOpen(index === 0 || hasError);
+      });
+      const sync = () => sections.forEach((section, index) => section._mobileSetOpen?.(!media.matches || index === 0 || Boolean(section.querySelector(".error,[aria-invalid='true']"))));
+      media.addEventListener?.("change", sync);
+      sync();
+    });
+  }
+
+  function setupMobileFilters() {
+    document.querySelectorAll("details.list-filters").forEach((details) => {
+      const summary = details.querySelector("summary");
+      const controls = [...details.querySelectorAll("input,select")];
+      if (!summary) return;
+      const label = summary.textContent.trim() || "Filters";
+      const update = () => {
+        const active = controls.filter((control) => control.value && control.value !== "all").length;
+        summary.textContent = active ? `${label} (${active})` : label;
+        if (matchMedia("(max-width: 760px)").matches && active) details.open = true;
+      };
+      controls.forEach((control) => control.addEventListener("change", update));
+      if (matchMedia("(max-width: 760px)").matches && !controls.some((control) => control.value && control.value !== "all")) details.open = false;
+      update();
+    });
+    document.querySelectorAll("details.dashboard-mobile-filters").forEach((details) => {
+      const media = matchMedia("(max-width: 760px)");
+      const sync = () => { details.open = !media.matches; };
+      media.addEventListener?.("change", sync);
+      sync();
+    });
+  }
+
+  setupMobileNavigation(); setupComboboxes(); setupTabs(); setupDialogs(); setupQuickCreate(); setupTripForm(); setupProjectForms(); setupRepairTotal(); setupMobileAccordions(); setupMobileFilters();
 })();

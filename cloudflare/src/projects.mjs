@@ -105,7 +105,7 @@ function sortableHeaders(columns, sort, params) {
     next.set("dir", current && sort.dir === "asc" ? "desc" : "asc");
     next.delete("page");
     const indicator = current ? ` <span class="sort-indicator" aria-hidden="true">${sort.dir === "asc" ? "▲" : "▼"}</span>` : "";
-    return { html: `<a class="sort-link${current ? " is-sorted" : ""}" href="?${next.toString()}" aria-label="Sort by ${esc(column.label)}${current ? `, currently ${sort.dir === "asc" ? "ascending" : "descending"}` : ""}">${esc(column.label)}${indicator}</a>` };
+    return { mobileLabel: column.label, html: `<a class="sort-link${current ? " is-sorted" : ""}" href="?${next.toString()}" aria-label="Sort by ${esc(column.label)}${current ? `, currently ${sort.dir === "asc" ? "ascending" : "descending"}` : ""}">${esc(column.label)}${indicator}</a>` };
   });
 }
 
