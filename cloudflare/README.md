@@ -47,6 +47,7 @@ npx wrangler d1 execute gmt-trucking --file=./migrations/0002_seed_preview.sql
 ```bash
 npx wrangler d1 execute gmt-trucking --remote --file=./migrations/0003_fix_preview_password_hashes.sql
 npx wrangler d1 execute gmt-trucking --remote --file=./migrations/0004_equipment_projects.sql
+npx wrangler d1 execute gmt-trucking --remote --file=./migrations/0005_project_recording_modes.sql
 ```
 
 Preview login:

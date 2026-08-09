@@ -11,6 +11,10 @@ function envWithRows(rows = {}) {
     GMT_SESSION_SECRET: "test-secret",
     __runs: [],
     DB: {
+      async batch(statements) {
+        rows.batches?.push(statements);
+        return await Promise.all(statements.map((statement) => statement.run()));
+      },
       prepare(sql) {
         const state = { sql, params: [] };
         const rowKey = (table) => ({
@@ -2651,12 +2655,17 @@ function projectFixture(overrides = {}) {
     primary_code: "EMP-003",
     primary_type: "Driver",
     billing_basis: "Trip",
+    work_recording_mode: "Repeating",
     default_billing_quantity: 4,
     client_unit_rate: 1000,
     primary_pay_basis: "Per Trip",
+    default_primary_pay_quantity: 4,
     primary_pay_rate: 300,
+    default_primary_manual_pay: 0,
     helper_pay_basis: "Per Trip",
+    default_helper_pay_quantity: 4,
     helper_pay_rate: 200,
+    default_helper_manual_pay: 0,
     fuel_surcharge: 50,
     loading_fee: 0,
     unloading_fee: 0,
@@ -2688,12 +2697,17 @@ function projectPost(overrides = {}) {
     helper_2: "",
     helper_3: "",
     billing_basis: "Trip",
+    work_recording_mode: "Single",
     default_billing_quantity: "4",
     client_unit_rate: "1000",
     primary_pay_basis: "Per Trip",
+    default_primary_pay_quantity: "4",
     primary_pay_rate: "300",
+    default_primary_manual_pay: "0",
     helper_pay_basis: "Per Trip",
+    default_helper_pay_quantity: "4",
     helper_pay_rate: "200",
+    default_helper_manual_pay: "0",
     fuel_surcharge: "50",
     loading_fee: "0",
     unloading_fee: "0",
@@ -2844,7 +2858,7 @@ test("project create generates PRJ number and saves ordered helpers and pay defa
   assert.ok(runs.some((item) => item.sql.includes("INSERT INTO project_pay_item_defaults") && item.params.includes("Operator allowance")));
 });
 
-test("projects need recorded daily work before they can be completed", async () => {
+test("projects cannot be marked complete through the header before their work is recorded", async () => {
   const newRuns = [];
   let response = await handleRequest(await authedRequest("https://example.test/projects/new", "encoder", {
     method: "POST",
@@ -2856,13 +2870,13 @@ test("projects need recorded daily work before they can be completed", async () 
     runs: newRuns,
   }));
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /Record at least one daily work entry before completing this Project\./);
+  assert.match(await response.text(), /Use Complete Project &amp; Record Work to create the single financial work record\./);
   assert.ok(!newRuns.some((item) => item.sql.includes("INSERT INTO projects")));
 
   const editRuns = [];
   response = await handleRequest(await authedRequest("https://example.test/projects/81/edit", "admin", {
     method: "POST",
-    body: projectPost({ project_no: "PRJ-2026-000001", status: "Completed" }),
+    body: projectPost({ project_no: "PRJ-2026-000001", work_recording_mode: "Repeating", status: "Completed" }),
   }), envWithRows({
     projects: [projectFixture({ status: "Active" })],
     clients: [{ id: 1, client_name: "Sample Client", active: 1 }],
@@ -2871,11 +2885,11 @@ test("projects need recorded daily work before they can be completed", async () 
     runs: editRuns,
   }));
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /Record at least one daily work entry before completing this Project\./);
+  assert.match(await response.text(), /Record and complete at least one Daily Work entry before completing this Project\./);
   assert.ok(!editRuns.some((item) => item.sql.startsWith("UPDATE projects SET")));
 });
 
-test("new projects can save as Active and immediately record actual daily work", async () => {
+test("new Single Work Total projects save as Active and open the one-work confirmation", async () => {
   const runs = [];
   const response = await handleRequest(await authedRequest("https://example.test/projects/new", "encoder", {
     method: "POST",
@@ -2887,31 +2901,78 @@ test("new projects can save as Active and immediately record actual daily work",
     runs,
   }));
   assert.equal(response.status, 303);
-  assert.match(response.headers.get("location"), /\/projects\/81\/work\/new\?ok=/);
+  assert.match(response.headers.get("location"), /\/projects\/81\/complete\?ok=/);
   const insert = runs.find((item) => item.sql.includes("INSERT INTO projects"));
   const columns = insert.sql.match(/\((.+)\) VALUES/)?.[1].split(",");
   const values = Object.fromEntries(columns.map((column, index) => [column.trim(), insert.params[index]]));
   assert.equal(values.status, "Active");
 });
 
-test("zero-entry projects guide work recording and completed legacy projects can reopen", async () => {
+test("Single Work Total confirms once and atomically creates a completed finance-ready work entry", async () => {
+  const project = projectFixture({ work_recording_mode: "Single", status: "Active" });
+  const rows = {
+    projects: [project],
+    projectHelpers: [{ id: 1, project_id: 81, employee_id: 4, helper_order: 1, full_name: "Helper One" }],
+    projectPayDefaults: [{ id: 1, project_id: 81, employee_type: "Primary", label: "Meal", amount: 100, sort_order: 1 }],
+    runs: [],
+    batches: [],
+  };
+  let response = await handleRequest(await authedRequest("https://example.test/projects/81/complete", "admin"), envWithRows(rows));
+  assert.equal(response.status, 200);
+  let body = await response.text();
+  assert.match(body, /Complete Project &amp; Record Work/);
+  assert.match(body, /₱ 4,050\.00/);
+  assert.match(body, /₱ 1,200\.00/);
+
+  response = await handleRequest(await authedRequest("https://example.test/projects/81/complete", "admin", { method: "POST" }), envWithRows(rows));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /completed_work=91/);
+  assert.equal(rows.batches.length, 1);
+  assert.ok(rows.batches[0].length >= 4);
+  const insert = rows.runs.find((item) => item.sql.includes("INSERT INTO project_work_entries"));
+  assert.ok(insert);
+  assert.ok(insert.params.includes("Completed"));
+  assert.ok(rows.runs.some((item) => item.sql.includes("INSERT INTO project_work_helpers")));
+  assert.ok(rows.runs.some((item) => item.sql.includes("INSERT INTO project_work_pay_items") && item.params.includes("Meal")));
+  assert.ok(rows.runs.some((item) => item.sql.includes("UPDATE projects SET status='Completed'")));
+});
+
+test("Single Work Total requires explicit defaults when its pay unit differs from billing", async () => {
+  const project = projectFixture({
+    work_recording_mode: "Single",
+    billing_basis: "Hour",
+    primary_pay_basis: "Per Trip",
+    default_primary_pay_quantity: 0,
+    default_helper_pay_quantity: 0,
+  });
+  const response = await handleRequest(await authedRequest("https://example.test/projects/81/complete", "admin"), envWithRows({
+    projects: [project],
+    projectHelpers: [{ id: 1, project_id: 81, employee_id: 4, helper_order: 1, full_name: "Helper One" }],
+  }));
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /Set a Primary pay quantity default before completing this Project\./);
+  assert.match(body, /Set a Helper pay quantity default before completing this Project\./);
+});
+
+test("zero-entry legacy projects can explicitly switch to one completed work record", async () => {
   const completedProject = projectFixture({ status: "Completed", work_count: 0 });
   let response = await handleRequest(await authedRequest("https://example.test/projects", "admin"), envWithRows({ projects: [completedProject] }));
   let body = await response.text();
   assert.match(body, /No work recorded/);
-  assert.match(body, /Reopen &amp; Record Work/);
+  assert.match(body, /Create Work/);
 
   response = await handleRequest(await authedRequest("https://example.test/projects/81", "admin"), envWithRows({ projects: [completedProject], projectWork: [] }));
   body = await response.text();
-  assert.match(body, /Project values are reusable defaults only/);
-  assert.match(body, /Reopen &amp; Record Work/);
-  assert.match(body, /not included in Billing or Payroll/);
+  assert.match(body, /No work record was created/);
+  assert.match(body, /Create Completed Work from Defaults/);
+  assert.match(body, /not available to Billing or Payroll/);
 
   const runs = [];
-  response = await handleRequest(await authedRequest("https://example.test/projects/81/reopen-and-record-work", "admin", { method: "POST" }), envWithRows({ projects: [completedProject], projectWork: [], runs }));
+  response = await handleRequest(await authedRequest("https://example.test/projects/81/use-single-work", "admin", { method: "POST" }), envWithRows({ projects: [completedProject], projectWork: [], runs }));
   assert.equal(response.status, 303);
-  assert.match(response.headers.get("location"), /\/projects\/81\/work\/new\?ok=/);
-  assert.ok(runs.some((item) => item.sql.includes("UPDATE projects SET status='Active'")));
+  assert.match(response.headers.get("location"), /\/projects\/81\/complete\?ok=/);
+  assert.ok(runs.some((item) => item.sql.includes("UPDATE projects SET work_recording_mode='Single',status='Active'")));
   assert.ok(!runs.some((item) => item.sql.includes("INSERT INTO project_work_entries")));
 });
 

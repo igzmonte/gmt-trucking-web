@@ -11,6 +11,14 @@ export async function run(env, sql, params = []) {
   return await env.DB.prepare(sql).bind(...params).run();
 }
 
+// D1 executes a batch as one transaction.  Keeping the fallback makes the
+// lightweight test database usable; the deployed Worker always uses D1.batch.
+export async function batch(env, statements = []) {
+  const prepared = statements.map(({ sql, params = [] }) => env.DB.prepare(sql).bind(...params));
+  if (typeof env.DB.batch === "function") return await env.DB.batch(prepared);
+  return await Promise.all(prepared.map((statement) => statement.run()));
+}
+
 export async function count(env, table) {
   const row = await first(env, `SELECT COUNT(*) AS total FROM ${table}`);
   return Number(row?.total || 0);

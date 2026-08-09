@@ -1,5 +1,5 @@
 import { canEdit, requireEdit, requireView } from "./access.mjs";
-import { all, first, run } from "./db.mjs";
+import { all, batch, first, run } from "./db.mjs";
 import { layout, moneyCell, numberInput, selectInput, table, textareaInput, textInput } from "./html.mjs";
 import {
   EXTRA_FIELDS,
@@ -19,6 +19,7 @@ const PROJECT_STATUSES = ["Draft", "Active", "Completed", "Cancelled"];
 const WORK_STATUSES = ["Draft", "Completed", "Cancelled"];
 const BASES = ["Trip", "Hour", "Day"];
 const PAY_BASES = ["Per Trip", "Per Hour", "Per Day", "Manual"];
+const RECORDING_MODES = ["Single", "Repeating"];
 const SEARCHABLE = { searchable: true };
 function quick(kind, context = "") {
   return { searchable: true, quickCreate: { kind, context } };
@@ -250,12 +251,17 @@ function projectValues(data) {
     asset_id: data.asset_id || null,
     primary_employee_id: data.primary_employee_id || null,
     billing_basis: BASES.includes(data.billing_basis) ? data.billing_basis : "Trip",
+    work_recording_mode: RECORDING_MODES.includes(data.work_recording_mode) ? data.work_recording_mode : "Single",
     default_billing_quantity: numeric(data.default_billing_quantity),
     client_unit_rate: numeric(data.client_unit_rate),
     primary_pay_basis: PAY_BASES.includes(data.primary_pay_basis) ? data.primary_pay_basis : "Per Trip",
+    default_primary_pay_quantity: numeric(data.default_primary_pay_quantity),
     primary_pay_rate: numeric(data.primary_pay_rate),
+    default_primary_manual_pay: numeric(data.default_primary_manual_pay),
     helper_pay_basis: PAY_BASES.includes(data.helper_pay_basis) ? data.helper_pay_basis : "Per Trip",
+    default_helper_pay_quantity: numeric(data.default_helper_pay_quantity),
     helper_pay_rate: numeric(data.helper_pay_rate),
+    default_helper_manual_pay: numeric(data.default_helper_manual_pay),
     status: PROJECT_STATUSES.includes(data.status) ? data.status : "Draft",
     notes: String(data.notes || "").trim(),
   };
@@ -272,7 +278,7 @@ async function validateProject(env, values, helperIds, payItems, id = null) {
   if (!values.primary_employee_id) errors.push("Primary Driver / Operator is required.");
   if (!values.job_description) errors.push("Item / Job is required.");
   if (values.default_billing_quantity <= 0) errors.push("Default daily quantity must be greater than zero.");
-  for (const field of ["client_unit_rate", "primary_pay_rate", "helper_pay_rate", ...EXTRA_FIELDS]) {
+  for (const field of ["client_unit_rate", "default_primary_pay_quantity", "primary_pay_rate", "default_primary_manual_pay", "default_helper_pay_quantity", "helper_pay_rate", "default_helper_manual_pay", ...EXTRA_FIELDS]) {
     if (values[field] < 0) errors.push(`${field.replaceAll("_", " ")} cannot be negative.`);
   }
   const selected = helperIds.filter(Boolean);
@@ -295,13 +301,11 @@ async function validateProject(env, values, helperIds, payItems, id = null) {
   if (payItems.some((item) => item.employee_type === "Helper") && !selected.length) {
     errors.push("Assign a helper before adding Helper pay items.");
   }
-  // Project headers are reusable defaults. Financial eligibility begins only
-  // after actual Daily Work has been recorded and completed.
   if (values.status === "Completed") {
-    const count = id
-      ? await first(env, "SELECT COUNT(*) AS total FROM project_work_entries WHERE project_id=?", [id])
-      : { total: 0 };
-    if (!numeric(count?.total)) errors.push("Record at least one daily work entry before completing this Project.");
+    const summary = id ? await first(env, "SELECT COUNT(*) AS total, SUM(CASE WHEN status IN ('Completed','Billed') THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status='Draft' THEN 1 ELSE 0 END) AS drafts FROM project_work_entries WHERE project_id=?", [id]) : { total: 0, completed: 0, drafts: 0 };
+    if (values.work_recording_mode === "Single" && !numeric(summary?.total)) errors.push("Use Complete Project & Record Work to create the single financial work record.");
+    if (values.work_recording_mode === "Repeating" && !numeric(summary?.completed)) errors.push("Record and complete at least one Daily Work entry before completing this Project.");
+    if (values.work_recording_mode === "Repeating" && numeric(summary?.drafts)) errors.push("Complete or cancel all Draft work entries before completing this Project.");
   }
   return errors;
 }
@@ -312,6 +316,20 @@ function selectChoices(name, label, values, selected) {
     label,
     values.map((value) => ({ id: value, name: value })),
     selected,
+    (row) => row.name,
+    "",
+  );
+}
+
+function recordingModeChoices(selected) {
+  return selectInput(
+    "work_recording_mode",
+    "Work recording mode",
+    [
+      { id: "Single", name: "Single Work Total" },
+      { id: "Repeating", name: "Repeating Daily Work" },
+    ],
+    selected || "Single",
     (row) => row.name,
     "",
   );
@@ -333,12 +351,13 @@ function payItemsBlock(row, prefix = "") {
 async function projectForm(env, row = {}, id = null, errors = []) {
   const [clients, assets, primaryEmployees, helpers] = await choices(env);
   const selectedHelpers = row.helpers || [];
-  const overview = `${textInput("project_no", "Project No.", row.project_no || "")}${textInput("reference_no", "Ref. No.", row.reference_no || "")}${textInput("start_date", "Start date", row.start_date || todayISO(), 'type="date" required')}${textInput("end_date", "End date", row.end_date || "", 'type="date"')}${selectChoices("status", "Status", PROJECT_STATUSES, row.status || "Draft")}`;
+  const statusOptions = row.status === "Completed" ? PROJECT_STATUSES : PROJECT_STATUSES.filter((status) => status !== "Completed");
+  const overview = `${textInput("project_no", "Project No.", row.project_no || "")}${textInput("reference_no", "Ref. No.", row.reference_no || "")}${textInput("start_date", "Start date", row.start_date || todayISO(), 'type="date" required')}${textInput("end_date", "End date", row.end_date || "", 'type="date"')}${recordingModeChoices(row.work_recording_mode)}${selectChoices("status", "Status", statusOptions, row.status || "Draft")}`;
   const scope = `${selectInput("client_id", "Client", clients, row.client_id || "", (item) => choiceLabel("client", item), "---------", quick("client"))}${textareaInput("job_description", "Item / Job", row.job_description || "", 'rows="2" required')}${textInput("project_location", "Project location", row.project_location || "")}`;
   const route = `${textInput("origin", "Origin", row.origin || "")}${textInput("destination", "Destination", row.destination || "")}`;
   const crew = `${selectInput("asset_id", "Asset", assets, row.asset_id || "", (item) => choiceLabel("asset", item), "---------", quick("asset"))}${selectInput("primary_employee_id", "Primary Driver / Operator", primaryEmployees, row.primary_employee_id || "", (item) => choiceLabel("employee", item), "---------", quick("employee", "primary"))}${[0, 1, 2].map((index) => selectInput(`helper_${index + 1}`, `Helper ${index + 1}`, helpers, selectedHelpers[index]?.employee_id || row[`helper_${index + 1}`] || "", (item) => choiceLabel("employee", item), "---------", quick("employee", "helper"))).join("")}<p class="trip-crew-guidance muted">Helper allowance follows the selected asset type.</p>`;
-  const billing = `${selectChoices("billing_basis", "Billing basis", BASES, row.billing_basis || "Trip")}${numberInput("default_billing_quantity", "Default daily quantity", row.default_billing_quantity ?? 1)}${numberInput("client_unit_rate", "Client unit rate", row.client_unit_rate ?? 0)}`;
-  const pay = `${selectChoices("primary_pay_basis", "Primary pay basis", PAY_BASES, row.primary_pay_basis || "Per Trip")}${numberInput("primary_pay_rate", "Primary pay rate", row.primary_pay_rate ?? 0)}${selectChoices("helper_pay_basis", "Helper pay basis", PAY_BASES, row.helper_pay_basis || "Per Trip")}${numberInput("helper_pay_rate", "Helper pay pool rate", row.helper_pay_rate ?? 0)}`;
+  const billing = `${selectChoices("billing_basis", "Billing basis", BASES, row.billing_basis || "Trip")}${numberInput("default_billing_quantity", "Default quantity", row.default_billing_quantity ?? 1)}${numberInput("client_unit_rate", "Client unit rate", row.client_unit_rate ?? 0)}`;
+  const pay = `${selectChoices("primary_pay_basis", "Primary pay basis", PAY_BASES, row.primary_pay_basis || "Per Trip")}${numberInput("default_primary_pay_quantity", "Primary pay quantity default", row.default_primary_pay_quantity ?? "")}${numberInput("primary_pay_rate", "Primary pay rate", row.primary_pay_rate ?? 0)}${numberInput("default_primary_manual_pay", "Primary manual pay default", row.default_primary_manual_pay ?? 0)}${selectChoices("helper_pay_basis", "Helper pay basis", PAY_BASES, row.helper_pay_basis || "Per Trip")}${numberInput("default_helper_pay_quantity", "Helper pay quantity default", row.default_helper_pay_quantity ?? "")}${numberInput("helper_pay_rate", "Helper pay pool rate", row.helper_pay_rate ?? 0)}${numberInput("default_helper_manual_pay", "Helper manual pay default", row.default_helper_manual_pay ?? 0)}`;
   const extras = EXTRA_FIELDS.map((field) => numberInput(field, field.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()), row[field] ?? 0)).join("");
   const data = {
     assets: assets.map((asset) => ({ id: asset.id, asset_type: asset.asset_type, helper_limit: HELPER_LIMITS[asset.asset_type] ?? 3 })),
@@ -357,7 +376,7 @@ async function projectForm(env, row = {}, id = null, errors = []) {
     </div>
     ${payItemsBlock(row)}
     <section class="workspace-card project-notes">${textareaInput("notes", "Notes", row.notes || "", 'rows="2"')}</section>
-    <div class="sticky-actions"><a class="button secondary" href="${id ? `/projects/${id}` : "/projects"}">Cancel</a>${id ? `<button>Save Project</button>` : `<button name="after_save" value="record_work">Save &amp; Record Daily Work</button><button class="button secondary" name="after_save" value="list">Save Project</button>`}</div>
+    <div class="sticky-actions"><a class="button secondary" href="${id ? `/projects/${id}` : "/projects"}">Cancel</a>${id ? `<button>Save Project</button>` : `<button name="after_save" value="record_work">Save &amp; ${row.work_recording_mode === "Repeating" ? "Record Daily Work" : "Record Work"}</button><button class="button secondary" name="after_save" value="list">Save Project</button>`}</div>
   </form></section><script id="project-form-data" type="application/json">${browserJson(data)}</script>`;
 }
 
@@ -365,8 +384,8 @@ async function saveProject(env, values, helpers, payItems, id = null) {
   const fields = [
     "project_no", "reference_no", "start_date", "end_date", "client_id", "job_description",
     "origin", "destination", "project_location", "asset_id", "primary_employee_id",
-    "billing_basis", "default_billing_quantity", "client_unit_rate", "primary_pay_basis",
-    "primary_pay_rate", "helper_pay_basis", "helper_pay_rate", ...EXTRA_FIELDS, "status", "notes",
+    "billing_basis", "work_recording_mode", "default_billing_quantity", "client_unit_rate", "primary_pay_basis",
+    "default_primary_pay_quantity", "primary_pay_rate", "default_primary_manual_pay", "helper_pay_basis", "default_helper_pay_quantity", "helper_pay_rate", "default_helper_manual_pay", ...EXTRA_FIELDS, "status", "notes",
   ];
   let projectId = id;
   if (id) {
@@ -427,13 +446,16 @@ async function projectList(request, env, user, path) {
   const [clients, assets] = await choices(env);
   const listRows = rows.map((row) => {
     const noWork = !numeric(row.work_count);
-    const recordAction = canEdit(user, PAGE) && ["Draft", "Active"].includes(row.status)
+    const recordAction = canEdit(user, PAGE) && row.work_recording_mode === "Repeating" && ["Draft", "Active"].includes(row.status)
       ? ` <a class="status-action" href="/projects/${row.id}/work/new">Record Work</a>`
       : "";
-    const reopenAction = canEdit(user, PAGE) && row.status === "Completed" && noWork
-      ? ` <form method="post" action="/projects/${row.id}/reopen-and-record-work" class="inline-status-form" onsubmit="return confirm('Reopen this project and record its actual daily work? No financial record will be created automatically.');"><button class="status-action">Reopen &amp; Record Work</button></form>`
+    const singleAction = canEdit(user, PAGE) && row.work_recording_mode === "Single" && noWork && ["Draft", "Active", "Completed"].includes(row.status)
+      ? ` <a class="status-action" href="/projects/${row.id}/complete">${row.status === "Completed" ? "Create Work" : "Complete &amp; Record"}</a>`
       : "";
-    return `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.client_name || "")}</td><td>${esc(row.job_description)}</td><td>${esc(row.start_date)}${row.end_date ? ` – ${esc(row.end_date)}` : ""}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.primary_name || "")}</td><td>${esc(`${row.default_billing_quantity} ${row.billing_basis}${Number(row.default_billing_quantity) === 1 ? "" : "s"}`)}</td><td>${esc(row.work_count || 0)}${noWork ? `<small class="cell-detail no-work-recorded">No work recorded</small>` : ""}</td><td>${badge(row.status)}</td><td><a href="/projects/${row.id}">View</a>${canEdit(user, PAGE) ? ` <a href="/projects/${row.id}/edit">Edit</a>` : ""}${recordAction}${reopenAction}</td></tr>`;
+    const legacySingleAction = canEdit(user, PAGE) && row.work_recording_mode === "Repeating" && noWork && row.status === "Completed"
+      ? ` <a class="status-action" href="/projects/${row.id}">Create Work</a>`
+      : "";
+    return `<tr><td><a href="/projects/${row.id}">${esc(row.project_no)}</a></td><td>${esc(row.client_name || "")}</td><td>${esc(row.job_description)}</td><td>${esc(row.start_date)}${row.end_date ? ` – ${esc(row.end_date)}` : ""}</td><td>${esc(row.asset_code || "")}</td><td>${esc(row.primary_name || "")}</td><td>${esc(`${row.default_billing_quantity} ${row.billing_basis}${Number(row.default_billing_quantity) === 1 ? "" : "s"}`)}<small class="cell-detail">${esc(row.work_recording_mode === "Single" ? "Single total" : "Repeating")}</small></td><td>${esc(row.work_count || 0)}${noWork ? `<small class="cell-detail no-work-recorded">No work recorded</small>` : ""}</td><td>${badge(row.status)}</td><td><a href="/projects/${row.id}">View</a>${canEdit(user, PAGE) ? ` <a href="/projects/${row.id}/edit">Edit</a>` : ""}${recordAction}${singleAction}${legacySingleAction}</td></tr>`;
   });
   const controls = `<section class="panel toolbar list-toolbar"><form method="get" class="list-query-form"><div class="list-search-row"><input name="q" value="${esc(query)}" placeholder="Search projects"><button>Apply</button><a class="button secondary" href="/projects">Clear</a></div><details class="list-filters" open><summary>Filters</summary><div class="list-filter-grid">${selectFilter("status", "Status", PROJECT_STATUSES.map((value) => [value, value]), status)}${selectFilter("client_id", "Client", clients.map((row) => [row.id, `${row.client_code || ""}, ${row.client_name}`]), clientId)}${selectFilter("asset_id", "Asset", assets.map((row) => [row.id, `${row.asset_code || ""}, ${row.plate_no || row.asset_type || ""}`]), assetId)}${selectFilter("billing_basis", "Billing basis", BASES.map((value) => [value, value]), billingBasis)}${dateFilter("start_date_from", "Start from", dateFrom)}${dateFilter("start_date_to", "Start to", dateTo)}</div></details></form><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button" href="/projects/new">New Project</a>` : ""}<a class="button secondary" href="/projects/export.csv${searchParams.toString() ? `?${searchParams}` : ""}">Export CSV</a></div></section>`;
   const headers = sortableHeaders([{ key: "project_no", label: "Project No." }, { key: "client", label: "Client" }, { key: "item_job", label: "Item / Job" }, { key: "start_date", label: "Dates" }, { key: "asset", label: "Asset" }, { key: "primary", label: "Primary" }, { key: "billing_basis", label: "Default Work" }, { key: "entries", label: "Entries" }, { key: "status", label: "Status" }, { label: "Actions" }], sort, searchParams);
@@ -443,7 +465,7 @@ async function projectList(request, env, user, path) {
 async function projectFormPage(request, env, user, path, id = null) {
   const access = requireEdit(user, PAGE);
   if (access) return fail(access, user, path);
-  let row = id ? await loadProject(env, id) : { status: "Draft", start_date: todayISO(), default_billing_quantity: 1 };
+  let row = id ? await loadProject(env, id) : { status: "Draft", work_recording_mode: "Single", start_date: todayISO(), default_billing_quantity: 1 };
   if (id && !row) return html("Not found", 404);
   if (request.method === "GET") {
     return html(layout({ title: id ? "Edit Project Details" : "New Project Details", user, path, content: await projectForm(env, row, id) }));
@@ -464,6 +486,9 @@ async function projectFormPage(request, env, user, path, id = null) {
   }
   const projectId = await saveProject(env, values, helperIds, payItems, id);
   if (saveAndRecord) {
+    if (values.work_recording_mode === "Single") {
+      return redirect(`/projects/${projectId}/complete?ok=${encodeURIComponent(`Project ${values.project_no} saved. Confirm its one completed work record.`)}`);
+    }
     return redirect(`/projects/${projectId}/work/new?ok=${encodeURIComponent(`Project ${values.project_no} saved as Active. Record the actual daily work before Billing or Payroll.`)}`);
   }
   return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`Project ${values.project_no} saved.`)}`);
@@ -474,7 +499,7 @@ function workValues(data, project, existing = {}) {
   const billingQuantity = numeric(data.billing_quantity ?? project.default_billing_quantity);
   const primaryBasis = PAY_BASES.includes(data.primary_pay_basis) ? data.primary_pay_basis : project.primary_pay_basis;
   const helperBasis = PAY_BASES.includes(data.helper_pay_basis) ? data.helper_pay_basis : project.helper_pay_basis;
-  const defaultPayQuantity = (basis) => basis === "Per Day" ? 1 : basis.replace("Per ", "") === billingUnit ? billingQuantity : 0;
+  const defaultPayQuantity = (basis, stored) => numeric(stored) || (basis === "Per Day" ? 1 : basis.replace("Per ", "") === billingUnit ? billingQuantity : 0);
   const values = {
     work_no: String(data.work_no || existing.work_no || "").trim(),
     work_date: String(data.work_date || "").trim(),
@@ -483,13 +508,13 @@ function workValues(data, project, existing = {}) {
     billing_quantity: billingQuantity,
     client_unit_rate: numeric(data.client_unit_rate ?? project.client_unit_rate),
     primary_pay_basis: primaryBasis,
-    primary_pay_quantity: numeric(data.primary_pay_quantity || defaultPayQuantity(primaryBasis)),
+    primary_pay_quantity: numeric(data.primary_pay_quantity || defaultPayQuantity(primaryBasis, project.default_primary_pay_quantity)),
     primary_pay_rate: numeric(data.primary_pay_rate ?? project.primary_pay_rate),
-    primary_manual_pay: numeric(data.primary_manual_pay),
+    primary_manual_pay: numeric(data.primary_manual_pay ?? project.default_primary_manual_pay),
     helper_pay_basis: helperBasis,
-    helper_pay_quantity: numeric(data.helper_pay_quantity || defaultPayQuantity(helperBasis)),
+    helper_pay_quantity: numeric(data.helper_pay_quantity || defaultPayQuantity(helperBasis, project.default_helper_pay_quantity)),
     helper_pay_rate: numeric(data.helper_pay_rate ?? project.helper_pay_rate),
-    helper_manual_pay: numeric(data.helper_manual_pay),
+    helper_manual_pay: numeric(data.helper_manual_pay ?? project.default_helper_manual_pay),
     start_time: data.start_time || null,
     end_time: data.end_time || null,
     meter_start: data.meter_start === "" || data.meter_start == null ? null : numeric(data.meter_start),
@@ -529,9 +554,13 @@ async function workForm(env, project, row = {}, entryId = null, errors = []) {
     billing_quantity: project.default_billing_quantity,
     client_unit_rate: project.client_unit_rate,
     primary_pay_basis: project.primary_pay_basis,
+    primary_pay_quantity: project.default_primary_pay_quantity,
     primary_pay_rate: project.primary_pay_rate,
+    primary_manual_pay: project.default_primary_manual_pay,
     helper_pay_basis: project.helper_pay_basis,
+    helper_pay_quantity: project.default_helper_pay_quantity,
     helper_pay_rate: project.helper_pay_rate,
+    helper_manual_pay: project.default_helper_manual_pay,
     work_date: todayISO(),
     pay_items: project.pay_items,
     ...Object.fromEntries(EXTRA_FIELDS.map((field) => [field, project[field]])),
@@ -543,15 +572,15 @@ async function workForm(env, project, row = {}, entryId = null, errors = []) {
   const total = projectBillableTotal({ ...base, billing_quantity: base.billing_quantity || 0 });
   return `${errorsPanel(errors)}<section data-project-work-form><form method="post" action="${entryId ? `/projects/${project.id}/work/${entryId}/edit` : `/projects/${project.id}/work/new`}" class="app-form project-work-entry">
     <section class="panel detail-hero"><div><span class="dialog-kicker">Daily Work Entry</span><h3>${esc(project.project_no)}</h3><p>${esc(project.client_name || "")} · ${esc(project.job_description)}</p></div>${badge(base.status || "Draft")}</section>
-    <div class="workspace-grid work-entry-grid">
-      <section class="workspace-card"><h3>Work Record</h3><div class="field-grid">${textInput("work_no", "Work entry no.", base.work_no || "")}${textInput("work_date", "Work date", base.work_date, 'type="date" required')}${textInput("reference_no", "Ref. No.", base.reference_no || "")}${textInput("start_time", "Start time", base.start_time || "", 'type="time"')}${textInput("end_time", "End time", base.end_time || "", 'type="time"')}${numberInput("meter_start", "Hour-meter start", base.meter_start ?? "")}${numberInput("meter_end", "Hour-meter end", base.meter_end ?? "")}</div></section>
-      <section class="workspace-card"><h3>Actual Client Work</h3><div class="field-grid">${billing}</div><div class="trip-summary-bar"><div><span>Base</span><strong data-project-base>${esc(projectBaseAmount(base).toFixed(2))}</strong></div><div><span>Extras</span><strong data-project-extras>${esc(projectExtraTotal(base).toFixed(2))}</strong></div><div><span>Total</span><strong data-project-total>${esc(total.toFixed(2))}</strong></div></div></section>
-      <section class="workspace-card"><h3>Employee Pay</h3><div class="field-grid">${pay}</div><p class="field-help">When pay units differ from billing, review the quantity. Per-Day defaults to one day. Manual uses the explicit amount.</p></section>
-      <section class="workspace-card"><h3>Flat Daily Extra Charges</h3><div class="charge-grid">${extras}</div></section>
+    <div class="workspace-grid work-entry-grid compact-work-entry">
+      <section class="workspace-card"><h3>Actual Work</h3><div class="field-grid">${textInput("work_no", "Work entry no.", base.work_no || "", entryId ? 'readonly' : 'placeholder="Generated when saved" readonly')}${textInput("work_date", "Work date", base.work_date, 'type="date" required')}${textInput("reference_no", "Ref. No.", base.reference_no || "")}${selectChoices("billing_unit", "Billing unit", BASES, base.billing_unit)}${numberInput("billing_quantity", "Actual quantity", base.billing_quantity ?? 1)}</div></section>
+      <section class="workspace-card"><h3>Client Total</h3><div class="field-grid">${numberInput("client_unit_rate", "Client unit rate", base.client_unit_rate ?? 0)}</div><div class="trip-summary-bar"><div><span>Base</span><strong data-project-base>${esc(projectBaseAmount(base).toFixed(2))}</strong></div><div><span>Extras</span><strong data-project-extras>${esc(projectExtraTotal(base).toFixed(2))}</strong></div><div><span>Total</span><strong data-project-total>${esc(total.toFixed(2))}</strong></div></div></section>
+      <section class="workspace-card"><h3>Optional readings</h3><div class="field-grid">${textInput("start_time", "Start time", base.start_time || "", 'type="time"')}${textInput("end_time", "End time", base.end_time || "", 'type="time"')}${numberInput("meter_start", "Hour-meter start", base.meter_start ?? "")}${numberInput("meter_end", "Hour-meter end", base.meter_end ?? "")}</div></section>
     </div>
-    ${payItemsBlock(base)}
+    <details class="workspace-card work-overrides"><summary>Adjust Rates &amp; Charges</summary><div class="workspace-grid"><section><h3>Employee Pay</h3><div class="field-grid">${pay}</div><p class="field-help">Per-Day defaults to one day. Review quantities when pay units differ from billing.</p></section><section><h3>Flat Extra Charges</h3><div class="charge-grid">${extras}</div></section></div></details>
+    <details class="workspace-card work-overrides"><summary>Pay Items</summary>${payItemsBlock(base)}</details>
     <section class="workspace-card project-notes">${textareaInput("notes", "Entry notes", base.notes || "", 'rows="2"')}</section>
-    <div class="sticky-actions"><a class="button secondary" href="/projects/${project.id}">Cancel</a><button>Save Work Entry</button></div>
+    <div class="sticky-actions"><a class="button secondary" href="/projects/${project.id}">Cancel</a><button name="after_save" value="draft">Save Draft</button><button class="button secondary" name="after_save" value="another">Save &amp; Add Another</button><button name="after_save" value="complete">Save &amp; Complete</button></div>
   </form></section>`;
 }
 
@@ -594,15 +623,162 @@ async function saveWork(env, project, values, payItems, entryId = null) {
   return workId;
 }
 
+function projectWorkRecord(project, values) {
+  return {
+    ...values,
+    project_id: project.id,
+    primary_employee_id: project.primary_employee_id,
+    client_id_snapshot: project.client_id,
+    asset_id_snapshot: project.asset_id,
+    job_description_snapshot: project.job_description,
+    origin_snapshot: project.origin,
+    destination_snapshot: project.destination,
+    project_location_snapshot: project.project_location,
+  };
+}
+
+function singleWorkErrors(values, project, payItems) {
+  const errors = validateWork(values, project, project.helpers.length, payItems);
+  if (values.primary_pay_basis === "Manual" && values.primary_manual_pay <= 0) errors.push("Set a Primary manual pay default before completing this Project.");
+  if (values.primary_pay_basis !== "Manual" && values.primary_pay_quantity <= 0) errors.push("Set a Primary pay quantity default before completing this Project.");
+  if (project.helpers.length && values.helper_pay_basis === "Manual" && values.helper_manual_pay <= 0) errors.push("Set a Helper manual pay pool default before completing this Project.");
+  if (project.helpers.length && values.helper_pay_basis !== "Manual" && values.helper_pay_quantity <= 0) errors.push("Set a Helper pay quantity default before completing this Project.");
+  return [...new Set(errors)];
+}
+
+async function singleWorkPreview(env, project) {
+  const values = workValues({ work_date: project.start_date, reference_no: project.reference_no || "" }, project);
+  values.work_no = await nextWorkNumber(env, values.work_date);
+  values.status = "Completed";
+  const payItems = project.pay_items || [];
+  return { values, payItems, errors: singleWorkErrors(values, project, payItems) };
+}
+
+async function saveSingleWorkCompletion(env, project, preview) {
+  const values = preview.values;
+  const fields = [
+    "work_no", "project_id", "work_date", "reference_no", "billing_unit", "billing_quantity",
+    "client_unit_rate", "base_charge", "primary_employee_id", "primary_pay_basis",
+    "primary_pay_quantity", "primary_pay_rate", "primary_manual_pay", "helper_pay_basis",
+    "helper_pay_quantity", "helper_pay_rate", "helper_manual_pay", "client_id_snapshot",
+    "asset_id_snapshot", "job_description_snapshot", "origin_snapshot", "destination_snapshot",
+    "project_location_snapshot", "start_time", "end_time", "meter_start", "meter_end",
+    ...EXTRA_FIELDS, "extra_total", "total_charge", "status", "notes",
+  ];
+  const record = projectWorkRecord(project, values);
+  const statements = [
+    {
+      sql: `INSERT INTO project_work_entries (${fields.join(",")}) VALUES (${fields.map(() => "?").join(",")})`,
+      params: fields.map((field) => record[field]),
+    },
+    ...project.helpers.map((helper) => ({
+      sql: "INSERT INTO project_work_helpers (work_entry_id,employee_id,helper_order) VALUES ((SELECT id FROM project_work_entries WHERE work_no=?),?,?)",
+      params: [values.work_no, helper.employee_id, helper.helper_order],
+    })),
+    ...preview.payItems.map((item) => ({
+      sql: "INSERT INTO project_work_pay_items (work_entry_id,employee_type,label,amount,sort_order) VALUES ((SELECT id FROM project_work_entries WHERE work_no=?),?,?,?,?)",
+      params: [values.work_no, item.employee_type, item.label, item.amount, item.sort_order],
+    })),
+    { sql: "UPDATE projects SET status='Completed' WHERE id=?", params: [project.id] },
+  ];
+  await batch(env, statements);
+  const work = await first(env, "SELECT id FROM project_work_entries WHERE work_no=?", [values.work_no]);
+  return { id: work?.id, values };
+}
+
+function financeActions(project, entry, user) {
+  if (!entry || entry.status !== "Completed") return "";
+  const dateParams = `period_from=${encodeURIComponent(entry.work_date)}&period_to=${encodeURIComponent(entry.work_date)}`;
+  const billing = canEdit(user, "Billing") ? `<a class="button" href="/billing/new?client=${encodeURIComponent(project.client_id)}&${dateParams}">Create Billing for This Work</a>` : "";
+  const employees = [
+    { id: entry.primary_employee_id, label: "Primary" },
+    ...(entry.helpers || []).map((helper) => ({ id: helper.employee_id, label: helper.full_name || "Helper" })),
+  ];
+  const payroll = canEdit(user, "Payroll")
+    ? employees.map((employee) => `<a class="button secondary" href="/payroll/new?employee=${encodeURIComponent(employee.id)}&${dateParams}">Create ${esc(employee.label)} Payroll</a>`).join(" ")
+    : "";
+  return billing || payroll ? `<section class="panel project-finance-next"><h3>Ready for Finance</h3><p>${esc(entry.work_no)} is completed and can now be included once in Billing and Payroll.</p><div class="toolbar-actions">${billing}${payroll}</div></section>` : "";
+}
+
+async function projectCompletePage(request, env, user, path, projectId) {
+  const access = requireEdit(user, PAGE);
+  if (access) return fail(access, user, path);
+  const project = await loadProject(env, projectId);
+  if (!project) return html("Project not found", 404);
+  if (project.work_recording_mode !== "Single") return redirect(`/projects/${projectId}?error=${encodeURIComponent("Repeating Daily Work projects must be closed after their work entries are completed.")}`);
+  const count = await first(env, "SELECT COUNT(*) AS total FROM project_work_entries WHERE project_id=?", [projectId]);
+  if (numeric(count?.total)) return redirect(`/projects/${projectId}?error=${encodeURIComponent("This Single Work Total project already has a recorded work entry.")}`);
+  const preview = await singleWorkPreview(env, project);
+  if (request.method === "GET") {
+    const primary = projectEmployeeBasePay(preview.values, "primary", project.helpers.length);
+    const helper = project.helpers.length ? projectEmployeeBasePay(preview.values, "helper", project.helpers.length) * project.helpers.length : 0;
+    const content = `${errorsPanel(preview.errors)}<section class="panel project-complete-preview"><h3>Complete Project &amp; Record Work</h3><p>This creates one completed Work Entry from the saved Project defaults. It will immediately be eligible for Billing and Payroll.</p><dl class="detail-list"><dt>Work date</dt><dd>${esc(preview.values.work_date)}</dd><dt>Quantity</dt><dd>${esc(`${preview.values.billing_quantity} ${preview.values.billing_unit}`)}</dd><dt>Client rate</dt><dd>${esc(peso(preview.values.client_unit_rate))}</dd><dt>Base charge</dt><dd>${esc(peso(preview.values.base_charge))}</dd><dt>Extra charges</dt><dd>${esc(peso(preview.values.extra_total))}</dd><dt>Client total</dt><dd><strong>${esc(peso(preview.values.total_charge))}</strong></dd><dt>Primary pay</dt><dd>${esc(peso(primary))}</dd><dt>Helper pool</dt><dd>${esc(peso(helper))}</dd></dl>${preview.errors.length ? `<p><a class="button" href="/projects/${projectId}/edit">Edit Project Defaults</a> <a class="button secondary" href="/projects/${projectId}">Cancel</a></p>` : `<form method="post"><p class="status-warning">Confirm that the date, quantity, rates, crew, and pay defaults are correct. This financial snapshot cannot be edited after Billing or Payroll uses it.</p><div class="form-actions"><button>Complete Project &amp; Record Work</button><a class="button secondary" href="/projects/${projectId}">Cancel</a></div></form>`}</section>`;
+    return html(layout({ title: "Complete Project", user, path, content }));
+  }
+  if (preview.errors.length) return redirect(`/projects/${projectId}/edit?error=${encodeURIComponent("Complete the Project pay defaults before recording this work.")}`);
+  try {
+    const saved = await saveSingleWorkCompletion(env, project, preview);
+    return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`Project completed and ${saved.values.work_no} was recorded.`)}&completed_work=${saved.id || ""}`);
+  } catch {
+    return redirect(`/projects/${projectId}?error=${encodeURIComponent("The Project was not completed because its work record could not be saved. Review the defaults and try again.")}`);
+  }
+}
+
+async function projectCloseRepeating(request, env, user, path, projectId) {
+  const access = requireEdit(user, PAGE);
+  if (access) return fail(access, user, path);
+  if (request.method !== "POST") return html("Closing a Project requires POST.", 405);
+  const project = await loadProject(env, projectId);
+  if (!project) return html("Project not found", 404);
+  const summary = await first(env, "SELECT SUM(CASE WHEN status IN ('Completed','Billed') THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status='Draft' THEN 1 ELSE 0 END) AS drafts FROM project_work_entries WHERE project_id=?", [projectId]);
+  if (project.work_recording_mode !== "Repeating" || !numeric(summary?.completed) || numeric(summary?.drafts)) return redirect(`/projects/${projectId}?error=${encodeURIComponent("Complete or cancel all Draft work entries and ensure at least one work entry is Completed before closing this Project.")}`);
+  await run(env, "UPDATE projects SET status='Completed' WHERE id=?", [projectId]);
+  return redirect(`/projects/${projectId}?ok=${encodeURIComponent("Project completed. Its completed work entries remain available to Billing and Payroll.")}`);
+}
+
+async function projectUseSingleWork(request, env, user, path, projectId) {
+  const access = requireEdit(user, PAGE);
+  if (access) return fail(access, user, path);
+  if (request.method !== "POST") return html("Choosing a work recording mode requires POST.", 405);
+  const project = await loadProject(env, projectId);
+  if (!project) return html("Project not found", 404);
+  const count = await first(env, "SELECT COUNT(*) AS total FROM project_work_entries WHERE project_id=?", [projectId]);
+  if (project.work_recording_mode !== "Repeating" || project.status !== "Completed" || numeric(count?.total)) {
+    return redirect(`/projects/${projectId}?error=${encodeURIComponent("Only completed zero-entry Projects can be changed to Single Work Total.")}`);
+  }
+  await run(env, "UPDATE projects SET work_recording_mode='Single',status='Active' WHERE id=?", [projectId]);
+  return redirect(`/projects/${projectId}/complete?ok=${encodeURIComponent("Project is ready to create its one completed work record from the saved defaults.")}`);
+}
+
 async function workFormPage(request, env, user, path, projectId, entryId = null) {
   const access = requireEdit(user, PAGE);
   if (access) return fail(access, user, path);
   const project = await loadProject(env, projectId);
   if (!project) return html("Project not found", 404);
+  if (project.work_recording_mode === "Single" && !entryId) {
+    return redirect(`/projects/${projectId}/complete?error=${encodeURIComponent("Single Work Total projects record their one work entry when you complete the Project.")}`);
+  }
   if (!entryId && !["Draft", "Active"].includes(project.status)) {
     return redirect(`/projects/${projectId}?error=${encodeURIComponent("Completed or cancelled projects cannot accept new work entries.")}`);
   }
   let row = entryId ? await loadWork(env, entryId) : {};
+  if (!entryId && request.method === "GET") {
+    const copyId = Number(new URL(request.url).searchParams.get("copy")) || 0;
+    if (copyId) {
+      const source = await loadWork(env, copyId);
+      if (!source || Number(source.project_id) !== Number(projectId)) return redirect(`/projects/${projectId}?error=${encodeURIComponent("The selected work entry could not be duplicated.")}`);
+      const nextDate = new Date(`${source.work_date}T00:00:00Z`);
+      nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+      const candidate = nextDate.toISOString().slice(0, 10);
+      row = {
+        ...source,
+        work_no: "", reference_no: "", start_time: "", end_time: "", meter_start: "", meter_end: "", notes: "", status: "Draft",
+        work_date: !project.end_date || candidate <= project.end_date ? candidate : "",
+        primary_pay_items: itemsJson(source.pay_items, "Primary"),
+        helper_pay_items: itemsJson(source.pay_items, "Helper"),
+      };
+    }
+  }
   if (entryId && (!row || Number(row.project_id) !== Number(projectId))) return html("Work entry not found", 404);
   if (entryId) {
     const lock = await workLock(env, row);
@@ -622,8 +798,13 @@ async function workFormPage(request, env, user, path, projectId, entryId = null)
     row = { ...row, ...data, ...values, primary_pay_items: data.primary_pay_items, helper_pay_items: data.helper_pay_items };
     return html(layout({ title: entryId ? "Edit Daily Work" : "New Daily Work", user, path, content: await workForm(env, project, row, entryId, errors) }), 400);
   }
+  const action = data.after_save || "draft";
+  if (action === "complete") values.status = "Completed";
   const workId = await saveWork(env, project, values, payItems, entryId);
-  return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`Work entry ${values.work_no} saved.`)}#work-${workId}`);
+  if (project.status === "Draft") await run(env, "UPDATE projects SET status='Active' WHERE id=?", [projectId]);
+  if (action === "another") return redirect(`/projects/${projectId}/work/new?copy=${workId}&ok=${encodeURIComponent(`Work entry ${values.work_no} saved. Add the next work record.`)}`);
+  const completed = action === "complete" ? `&completed_work=${workId}` : "";
+  return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`Work entry ${values.work_no} ${action === "complete" ? "saved and marked Completed" : "saved"}.`)}${completed}#work-${workId}`);
 }
 
 async function workLock(env, entry) {
@@ -652,7 +833,8 @@ async function workStatusPage(request, env, user, path, projectId, entryId) {
   const data = await parseForm(request);
   if (!WORK_STATUSES.includes(data.status)) return redirect(`/projects/${projectId}?error=${encodeURIComponent("Invalid work status.")}`);
   await run(env, "UPDATE project_work_entries SET status=? WHERE id=?", [data.status, entryId]);
-  return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`${entry.work_no} marked ${data.status}.`)}`);
+  const completed = data.status === "Completed" ? `&completed_work=${entryId}` : "";
+  return redirect(`/projects/${projectId}?ok=${encodeURIComponent(`${entry.work_no} marked ${data.status}.`)}${completed}`);
 }
 
 async function workDeletePage(request, env, user, path, projectId, entryId) {
@@ -683,20 +865,36 @@ async function projectDetail(request, env, user, path, id) {
     return `<tr id="work-${entry.id}"><td>${esc(entry.work_no)}</td><td>${esc(entry.work_date)}</td><td>${esc(entry.reference_no || "—")}</td><td>${esc(entry.billing_unit)}</td><td class="num">${esc(entry.billing_quantity)}</td>${moneyCell(entry.client_unit_rate)}${moneyCell(entry.extra_total)}${moneyCell(entry.total_charge)}<td>${badge(entry.status)}${quick}</td><td>${canEdit(user, PAGE) && entry.status === "Draft" && !locked ? `<a href="/projects/${id}/work/${entry.id}/edit">Edit</a> ` : ""}${canEdit(user, PAGE) && entry.status !== "Billed" && !locked ? `<a href="/projects/${id}/work/${entry.id}/status">Status</a>` : ""}</td></tr>`;
   });
   const hero = `<section class="panel detail-hero"><div><span class="dialog-kicker">Equipment Project</span><h3>${esc(project.project_no)}</h3><p>${esc(project.client_name || "")} · ${esc(project.start_date)}${project.end_date ? ` to ${esc(project.end_date)}` : " onward"}</p></div>${badge(project.status)}</section>`;
-  const details = `<div class="detail-grid"><section class="panel"><h3>Client &amp; Scope</h3><dl class="detail-list"><dt>Ref. No.</dt><dd>${esc(project.reference_no || "—")}</dd><dt>Item / Job</dt><dd>${esc(project.job_description)}</dd><dt>Location</dt><dd>${esc(project.project_location || "—")}</dd><dt>Route</dt><dd>${esc([project.origin, project.destination].filter(Boolean).join(" → ") || "—")}</dd></dl></section><section class="panel"><h3>Unit &amp; Crew</h3><dl class="detail-list"><dt>Asset</dt><dd>${esc([project.asset_code, project.plate_no, project.asset_type].filter(Boolean).join(", "))}</dd><dt>Primary</dt><dd>${esc([project.primary_code, project.primary_name, project.primary_type].filter(Boolean).join(", "))}</dd><dt>Helpers</dt><dd>${esc(helperNames)}</dd></dl></section><section class="panel"><h3>Default Client Billing</h3><dl class="detail-list"><dt>Quantity</dt><dd>${esc(`${project.default_billing_quantity} ${project.billing_basis}`)}</dd><dt>Unit rate</dt><dd>${esc(peso(project.client_unit_rate))}</dd><dt>Default extras</dt><dd>${esc(peso(projectExtraTotal(project)))}</dd></dl></section><section class="panel"><h3>Employee Pay Defaults</h3><dl class="detail-list"><dt>Primary</dt><dd>${esc(`${project.primary_pay_basis}, ${peso(project.primary_pay_rate)}`)}</dd><dt>Helper pool</dt><dd>${esc(`${project.helper_pay_basis}, ${peso(project.helper_pay_rate)}`)}</dd></dl></section></div>`;
+  const modeLabel = project.work_recording_mode === "Single" ? "Single Work Total" : "Repeating Daily Work";
+  const details = `<div class="detail-grid"><section class="panel"><h3>Client &amp; Scope</h3><dl class="detail-list"><dt>Ref. No.</dt><dd>${esc(project.reference_no || "—")}</dd><dt>Item / Job</dt><dd>${esc(project.job_description)}</dd><dt>Location</dt><dd>${esc(project.project_location || "—")}</dd><dt>Route</dt><dd>${esc([project.origin, project.destination].filter(Boolean).join(" → ") || "—")}</dd></dl></section><section class="panel"><h3>Unit &amp; Crew</h3><dl class="detail-list"><dt>Asset</dt><dd>${esc([project.asset_code, project.plate_no, project.asset_type].filter(Boolean).join(", "))}</dd><dt>Primary</dt><dd>${esc([project.primary_code, project.primary_name, project.primary_type].filter(Boolean).join(", "))}</dd><dt>Helpers</dt><dd>${esc(helperNames)}</dd></dl></section><section class="panel"><h3>Work Recording</h3><dl class="detail-list"><dt>Mode</dt><dd>${esc(modeLabel)}</dd><dt>Default quantity</dt><dd>${esc(`${project.default_billing_quantity} ${project.billing_basis}`)}</dd><dt>Client unit rate</dt><dd>${esc(peso(project.client_unit_rate))}</dd><dt>Default extras</dt><dd>${esc(peso(projectExtraTotal(project)))}</dd></dl></section><section class="panel"><h3>Employee Pay Defaults</h3><dl class="detail-list"><dt>Primary</dt><dd>${esc(`${project.primary_pay_basis}, ${peso(project.primary_pay_rate)}`)}</dd><dt>Helper pool</dt><dd>${esc(`${project.helper_pay_basis}, ${peso(project.helper_pay_rate)}`)}</dd></dl></section></div>`;
   const noWork = entries.length === 0;
-  const recordWork = canEdit(user, PAGE) && ["Draft", "Active"].includes(project.status)
+  const recordWork = canEdit(user, PAGE) && project.work_recording_mode === "Repeating" && ["Draft", "Active"].includes(project.status)
     ? `<a class="button" href="/projects/${id}/work/new">Record Daily Work</a>`
     : "";
-  const reopenAndRecord = canEdit(user, PAGE) && project.status === "Completed" && noWork
-    ? `<form method="post" action="/projects/${id}/reopen-and-record-work" class="inline-status-form" onsubmit="return confirm('Reopen this project and record its actual daily work? No financial record will be created automatically.');"><button>Reopen &amp; Record Work</button></form>`
+  const duplicateLast = canEdit(user, PAGE) && project.work_recording_mode === "Repeating" && entries.length && ["Draft", "Active"].includes(project.status)
+    ? `<a class="button secondary" href="/projects/${id}/work/new?copy=${entries[0].id}">Duplicate Last Entry</a>`
     : "";
-  const toolbar = `<div class="detail-toolbar project-detail-toolbar"><a class="button secondary" href="/projects">← Projects List</a><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button secondary" href="/projects/${id}/edit">Edit Project</a>${recordWork}${reopenAndRecord}` : ""}</div></div>
+  const completeSingle = canEdit(user, PAGE) && project.work_recording_mode === "Single" && noWork && ["Draft", "Active", "Completed"].includes(project.status)
+    ? `<a class="button" href="/projects/${id}/complete">${project.status === "Completed" ? "Create Completed Work from Defaults" : "Complete Project &amp; Record Work"}</a>`
+    : "";
+  const legacySingle = canEdit(user, PAGE) && project.work_recording_mode === "Repeating" && noWork && project.status === "Completed"
+    ? `<form method="post" action="/projects/${id}/use-single-work" class="inline-status-form" onsubmit="return confirm('Create one completed work record from this Project defaults?');"><button class="button">Create Completed Work from Defaults</button></form>`
+    : "";
+  const closeRepeating = canEdit(user, PAGE) && project.work_recording_mode === "Repeating" && ["Draft", "Active"].includes(project.status)
+    ? `<form method="post" action="/projects/${id}/close" class="inline-status-form" onsubmit="return confirm('Complete this Project after all Daily Work entries are completed or cancelled?');"><button class="button secondary">Complete Project</button></form>`
+    : "";
+  const toolbar = `<div class="detail-toolbar project-detail-toolbar"><a class="button secondary" href="/projects">← Projects List</a><div class="toolbar-actions">${canEdit(user, PAGE) ? `<a class="button secondary" href="/projects/${id}/edit">Edit Project</a>${completeSingle}${legacySingle}${recordWork}${duplicateLast}${closeRepeating}` : ""}</div></div>
     <section class="panel project-print-filter"><form method="get" action="/projects/${id}/print" target="_blank"><label>Date From<input type="date" name="date_from" value="${esc(project.start_date)}"></label><label>Date To<input type="date" name="date_to" value="${esc(project.end_date || todayISO())}"></label><button class="button secondary">Print Project Summary</button></form></section>`;
-  const emptyWork = `<div class="empty-state project-work-empty"><h4>No daily work recorded</h4><p>Project values are reusable defaults only. They are not included in Billing or Payroll until you record actual daily work and mark that entry Completed.</p>${recordWork || reopenAndRecord || ""}<p class="muted">You may record multiple entries for different dates, shifts, trips, hours, or days.</p></div>`;
+  const emptyWork = project.work_recording_mode === "Single"
+    ? `<div class="empty-state project-work-empty"><h4>No work record created yet</h4><p>This Single Work Total project has one financial work record. Complete the Project to create it from the defaults shown above.</p>${completeSingle}</div>`
+    : legacySingle
+      ? `<div class="empty-state project-work-empty"><h4>No work record was created</h4><p>This older Project was marked completed without a work entry, so it is not available to Billing or Payroll. Create one completed work record from its saved defaults, or edit the Project to use repeating work.</p>${legacySingle}</div>`
+      : `<div class="empty-state project-work-empty"><h4>No daily work recorded</h4><p>Project values are reusable defaults only. They are not included in Billing or Payroll until you record actual daily work and mark that entry Completed.</p>${recordWork}<p class="muted">You may record multiple entries for different dates, shifts, trips, hours, or days.</p></div>`;
   const work = `<section class="panel"><div class="section-header"><h3>Daily Work Entries</h3><span>${entries.length} entries</span></div>${noWork ? emptyWork : table(["Work No.", "Date", "Ref. No.", "Unit", "Quantity", "Rate", "Extras", "Total", "Status", "Actions"], rows, { bare: true })}</section>`;
   const danger = canEdit(user, PAGE) ? `<section class="detail-danger"><form method="post" action="/projects/${id}/delete" onsubmit="return confirm('Delete this project? Projects with work entries cannot be deleted.');"><button class="danger-button">Delete Project</button></form></section>` : "";
-  return html(layout({ title: "Project Details", user, path, content: `${messages(url)}${toolbar}${hero}${details}${project.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(project.notes)}</p></section>` : ""}${work}${danger}` }));
+  const completedEntry = entries.find((entry) => Number(entry.id) === Number(url.searchParams.get("completed_work")));
+  if (completedEntry) completedEntry.helpers = await all(env, "SELECT wh.*, e.full_name FROM project_work_helpers wh LEFT JOIN employees e ON e.id=wh.employee_id WHERE wh.work_entry_id=? ORDER BY wh.helper_order", [completedEntry.id]);
+  return html(layout({ title: "Project Details", user, path, content: `${messages(url)}${toolbar}${hero}${details}${project.notes ? `<section class="panel"><h3>Notes</h3><p>${esc(project.notes)}</p></section>` : ""}${financeActions(project, completedEntry, user)}${work}${danger}` }));
 }
 
 async function projectDelete(request, env, user, path, id) {
@@ -792,6 +990,12 @@ export async function handleProjects({ request, env, user, path }) {
   if (path === "/projects/export.csv") return projectExport(request, env, user, path);
   match = path.match(/^\/projects\/(\d+)\/print$/);
   if (match) return projectPrint(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/projects\/(\d+)\/complete$/);
+  if (match) return projectCompletePage(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/projects\/(\d+)\/close$/);
+  if (match) return projectCloseRepeating(request, env, user, path, Number(match[1]));
+  match = path.match(/^\/projects\/(\d+)\/use-single-work$/);
+  if (match) return projectUseSingleWork(request, env, user, path, Number(match[1]));
   match = path.match(/^\/projects\/(\d+)\/edit$/);
   if (match) return projectFormPage(request, env, user, path, Number(match[1]));
   match = path.match(/^\/projects\/(\d+)\/delete$/);
