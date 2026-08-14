@@ -2870,7 +2870,7 @@ test("projects cannot be marked complete through the header before their work is
     runs: newRuns,
   }));
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /Use Complete Project &amp; Record Work to create the single financial work record\./);
+  assert.match(await response.text(), /Record and make ready at least one work row before closing this Project\./);
   assert.ok(!newRuns.some((item) => item.sql.includes("INSERT INTO projects")));
 
   const editRuns = [];
@@ -2885,11 +2885,11 @@ test("projects cannot be marked complete through the header before their work is
     runs: editRuns,
   }));
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /Record and complete at least one Daily Work entry before completing this Project\./);
+  assert.match(await response.text(), /Record and make ready at least one work row before closing this Project\./);
   assert.ok(!editRuns.some((item) => item.sql.startsWith("UPDATE projects SET")));
 });
 
-test("new Single Work Total projects save as Active and open the one-work confirmation", async () => {
+test("new projects save as Active and open their inline Work Ledger", async () => {
   const runs = [];
   const response = await handleRequest(await authedRequest("https://example.test/projects/new", "encoder", {
     method: "POST",
@@ -2901,14 +2901,14 @@ test("new Single Work Total projects save as Active and open the one-work confir
     runs,
   }));
   assert.equal(response.status, 303);
-  assert.match(response.headers.get("location"), /\/projects\/81\/complete\?ok=/);
+  assert.match(response.headers.get("location"), /\/projects\/81\?work=new&ok=/);
   const insert = runs.find((item) => item.sql.includes("INSERT INTO projects"));
   const columns = insert.sql.match(/\((.+)\) VALUES/)?.[1].split(",");
   const values = Object.fromEntries(columns.map((column, index) => [column.trim(), insert.params[index]]));
   assert.equal(values.status, "Active");
 });
 
-test("Single Work Total confirms once and atomically creates a completed finance-ready work entry", async () => {
+test("legacy standalone work URL redirects into the Project Work Ledger", async () => {
   const project = projectFixture({ work_recording_mode: "Single", status: "Active" });
   const rows = {
     projects: [project],
@@ -2918,7 +2918,9 @@ test("Single Work Total confirms once and atomically creates a completed finance
     batches: [],
   };
   let response = await handleRequest(await authedRequest("https://example.test/projects/81/complete", "admin"), envWithRows(rows));
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/projects\/81\?work=new/);
+  return;
   let body = await response.text();
   assert.match(body, /Complete Project &amp; Record Work/);
   assert.match(body, /₱ 4,050\.00/);
@@ -2937,7 +2939,7 @@ test("Single Work Total confirms once and atomically creates a completed finance
   assert.ok(rows.runs.some((item) => item.sql.includes("UPDATE projects SET status='Completed'")));
 });
 
-test("Single Work Total requires explicit defaults when its pay unit differs from billing", async () => {
+test("legacy completion URL redirects to the inline Work Ledger", async () => {
   const project = projectFixture({
     work_recording_mode: "Single",
     billing_basis: "Hour",
@@ -2949,13 +2951,15 @@ test("Single Work Total requires explicit defaults when its pay unit differs fro
     projects: [project],
     projectHelpers: [{ id: 1, project_id: 81, employee_id: 4, helper_order: 1, full_name: "Helper One" }],
   }));
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location"), /\/projects\/81\?work=new/);
+  return;
   const body = await response.text();
   assert.match(body, /Set a Primary pay quantity default before completing this Project\./);
   assert.match(body, /Set a Helper pay quantity default before completing this Project\./);
 });
 
-test("zero-entry legacy projects can explicitly switch to one completed work record", async () => {
+test("zero-entry closed projects can be reopened to add a Work Ledger row", async () => {
   const completedProject = projectFixture({ status: "Completed", work_count: 0 });
   let response = await handleRequest(await authedRequest("https://example.test/projects", "admin"), envWithRows({ projects: [completedProject] }));
   let body = await response.text();
@@ -2964,16 +2968,31 @@ test("zero-entry legacy projects can explicitly switch to one completed work rec
 
   response = await handleRequest(await authedRequest("https://example.test/projects/81", "admin"), envWithRows({ projects: [completedProject], projectWork: [] }));
   body = await response.text();
-  assert.match(body, /No work record was created/);
-  assert.match(body, /Create Completed Work from Defaults/);
-  assert.match(body, /not available to Billing or Payroll/);
+  assert.match(body, /No actual work recorded/);
+  assert.match(body, /Reopen &amp; Add Work/);
+  assert.match(body, /Only rows made Ready for Finance can enter Billing and Payroll/);
 
   const runs = [];
-  response = await handleRequest(await authedRequest("https://example.test/projects/81/use-single-work", "admin", { method: "POST" }), envWithRows({ projects: [completedProject], projectWork: [], runs }));
+  response = await handleRequest(await authedRequest("https://example.test/projects/81/reopen-and-record-work", "admin", { method: "POST" }), envWithRows({ projects: [completedProject], projectWork: [], runs }));
   assert.equal(response.status, 303);
-  assert.match(response.headers.get("location"), /\/projects\/81\/complete\?ok=/);
-  assert.ok(runs.some((item) => item.sql.includes("UPDATE projects SET work_recording_mode='Single',status='Active'")));
+  assert.match(response.headers.get("location"), /\/projects\/81\?work=new/);
+  assert.ok(runs.some((item) => item.sql.includes("UPDATE projects SET status='Active'")));
   assert.ok(!runs.some((item) => item.sql.includes("INSERT INTO project_work_entries")));
+});
+
+test("Project Details uses one inline Work Ledger for recorded and finance-ready totals", async () => {
+  const response = await handleRequest(await authedRequest("https://example.test/projects/81", "admin"), envWithRows({
+    projects: [projectFixture()],
+    projectWork: [projectFinancialWork()],
+  }));
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /Work Ledger/);
+  assert.match(body, /Recorded quantity/);
+  assert.match(body, /Ready for finance/);
+  assert.match(body, /DR-101/);
+  assert.match(body, /Ready for Finance/);
+  assert.doesNotMatch(body, /Single Work Total/);
 });
 
 test("daily project work multiplies quantity while keeping extras flat and snapshots crew", async () => {

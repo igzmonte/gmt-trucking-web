@@ -2854,7 +2854,13 @@ function billingTripRows(trips) {
 
 function billingProjectRows(entries) {
   const rows = entries.map((entry) => `<tr><td>${esc(entry.work_date)}</td><td><a href="/projects/${entry.project_id}">${esc(entry.project_no)}</a><small class="cell-detail">Ref. No.: ${esc(entry.reference_no || "—")}</small></td><td>${esc(entry.job_description_snapshot || "")}</td><td>${esc(`${entry.billing_quantity} ${entry.billing_unit}`)}</td><td>${esc(entry.asset_code || "")}</td>${moneyCell(entry.client_unit_rate)}${moneyCell(entry.base_charge)}${moneyCell(entry.extra_total)}${moneyCell(entry.total_charge)}</tr>`);
-  return table(["Work Date", "Project No.", "Item / Job", "Quantity", "Unit", "Rate", "Base", "Extras", "Total"], rows, { empty: "No eligible completed project work for this client and period. Open the Project, record Daily Work, then Mark Complete. The work date and client must match this billing period." });
+  const groups = new Set();
+  const groupedRows = entries.flatMap((entry, index) => {
+    const heading = groups.has(entry.project_id) ? [] : [`<tr class="project-billing-group"><td colspan="9"><strong>Project ${esc(entry.project_no)}</strong> — ${esc(entry.job_description_snapshot || "")}</td></tr>`];
+    groups.add(entry.project_id);
+    return [...heading, rows[index]];
+  });
+  return table(["Work Date", "Project No.", "Item / Job", "Quantity", "Unit", "Rate", "Base", "Extras", "Total"], groupedRows, { empty: "No eligible ready project work for this client and period. Open the Project, add a Work Ledger row, then make it Ready for Finance. The work date and client must match this billing period." });
 }
 
 function billingFormContent(clients, selection, trips, projectEntries = [], values = {}, errors = []) {
